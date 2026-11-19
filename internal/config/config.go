@@ -22,6 +22,7 @@ const (
 	EnvNodeID          = "GOSSIPGRID_NODE_ID"
 	EnvLogLevel        = "GOSSIPGRID_LOG_LEVEL"
 	EnvShutdownTimeout = "GOSSIPGRID_SHUTDOWN_TIMEOUT"
+	EnvDBPath          = "GOSSIPGRID_DB_PATH"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -30,6 +31,7 @@ type Config struct {
 	NodeID          string
 	LogLevel        string
 	ShutdownTimeout time.Duration
+	DBPath          string
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -82,6 +84,8 @@ func load(lookup envFunc) (*Config, error) {
 	} else {
 		cfg.ShutdownTimeout = duration
 	}
+
+	cfg.DBPath = getEnv(lookup, EnvDBPath, "./data/gossipgrid.db")
 
 	return cfg, errors.Join(errs...)
 }

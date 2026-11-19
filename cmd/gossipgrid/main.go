@@ -21,6 +21,7 @@ import (
 
 	"gossipgrid/internal/config"
 	"gossipgrid/internal/server"
+	"gossipgrid/internal/store"
 )
 
 // Version is the build version injected by the linker (see Makefile/Dockerfile
@@ -47,7 +48,11 @@ func main() {
 	}
 }
 
-func run() error {
+// run returns a named error so that deferred functions can modify the return
+// value after the function body has set it. Without a named return, a deferred
+// function that sets a close error would run after the return value is already
+// determined, and that error would be silently lost.
+func run() (retErr error) {
 	cfg, err := config.Load()
 	if err != nil {
 		// The slog handler is not yet configured, so the error is returned to
@@ -71,16 +76,36 @@ func run() error {
 		return fmt.Errorf("FIPS 140-3 is required (module %s) but is disabled at runtime; refusing to start", fipsModule)
 	}
 
+	// Initialize local message storage before reporting readiness.
+	// Storage must be ready before the HTTP listener starts accepting traffic.
+	st, err := store.New(cfg.DBPath)
+	if err != nil {
+		return fmt.Errorf("initializing local storage at %q: %w", cfg.DBPath, err)
+	}
+	// Close the store exactly once on every exit path (listener failure,
+	// signal shutdown, or return). The deferred function captures the *Store
+	// pointer at defer time so it calls st.Close() with the live value, not a
+	// stale one. A close error is joined into retErr (a named return) so that
+	// it propagates to the caller without masking any earlier startup or
+	// shutdown error.
+	defer func() {
+		if cerr := st.Close(); cerr != nil {
+			logger.Error("closing database failed", slog.Any("error", cerr))
+			retErr = errors.Join(retErr, cerr)
+		}
+	}()
+
 	logger.Info("starting gossipgrid",
 		slog.String("version", Version),
 		slog.String("node", cfg.NodeID),
 		slog.String("http_addr", cfg.HTTPAddr),
+		slog.String("db_path", cfg.DBPath),
 		slog.String("log_level", cfg.LogLevel),
 		slog.Bool("fips_enabled", fipsEnabled),
 		slog.String("fips_module", fipsModule),
 	)
 
-	srv := server.NewServer(cfg.HTTPAddr, server.New(server.Node{ID: cfg.NodeID}))
+	srv := server.NewServer(cfg.HTTPAddr, server.NewWithStore(server.Node{ID: cfg.NodeID}, st))
 
 	// Start listening in a goroutine so we can watch for OS signals on the
 	// main goroutine. ListenAndServe returns nil when Shutdown has been called.
@@ -101,7 +126,7 @@ func run() error {
 		// The server failed to start (e.g. address in use) before a signal
 		// was received.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
+			retErr = err
 		}
 	case <-ctx.Done():
 		logger.Info("shutdown initiated",
@@ -113,11 +138,14 @@ func run() error {
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			logger.Error("graceful shutdown failed", slog.Any("error", err))
-			return err
+			retErr = err
 		}
 		logger.Info("shutdown complete", slog.String("node", cfg.NodeID))
 	}
-	return nil
+	// retErr is returned implicitly. The deferred close function above may
+	// modify it after this point, so a close error is propagated to the caller
+	// without masking any earlier startup or shutdown error.
+	return
 }
 
 func levelFromName(name string) slog.Level {

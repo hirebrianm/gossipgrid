@@ -10,9 +10,11 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"html/template"
 	"net/http"
 	"time"
+
+	"gossipgrid/internal/store"
 )
 
 // Node identifies the serving replica to the browser.
@@ -24,6 +26,13 @@ type Node struct {
 // identity. Timeouts are applied by the caller (see cmd/gossipgrid/main.go) so
 // this stays focused on routing and responses.
 func New(node Node) http.Handler {
+	return NewWithStore(node, nil)
+}
+
+// NewWithStore constructs an http.Handler with the given node identity and
+// optional local message store. When store is nil, message endpoints are not
+// registered.
+func NewWithStore(node Node, s *store.Store) http.Handler {
 	mux := http.NewServeMux()
 	// "GET /{$}" matches the root path exactly ({$} = end-of-path), so
 	// unrecognized paths fall through to 404 rather than serving the root page.
@@ -32,6 +41,15 @@ func New(node Node) http.Handler {
 	mux.HandleFunc("GET /{$}", rootHandler(node))
 	mux.HandleFunc("GET /healthz", healthHandler)
 	mux.HandleFunc("GET /readyz", readyHandler)
+
+	if s != nil {
+		mh := newMessageHandler(s)
+		mh.nodeID = node.ID
+		mux.HandleFunc("POST /api/messages", mh.postMessages)
+		mux.HandleFunc("GET /api/messages", mh.getMessages)
+		mux.HandleFunc("GET /api/messages/{id}", mh.getMessage)
+	}
+
 	return mux
 }
 
@@ -55,13 +73,17 @@ func readyHandler(w http.ResponseWriter, _ *http.Request) {
 }
 
 // rootHandler returns a small HTML page identifying the service and node.
+// The node ID is rendered through html/template, which escapes dynamic
+// values, so a node ID containing HTML/script markup is neutralised.
 func rootHandler(node Node) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		// Fprintf error is unlikely (write to a valid ResponseWriter) but
-		// must be checked to satisfy errcheck; the error is ignored because
-		// there is no useful recovery for a broken client connection.
-		if _, err := fmt.Fprintf(w, rootTemplate, node.ID); err != nil {
+		// Write error is unlikely (write to a valid ResponseWriter) but must
+		// be checked; the error is ignored because there is no useful
+		// recovery for a broken client connection.
+		if err := rootTmpl.Execute(w, struct {
+			NodeID string
+		}{NodeID: node.ID}); err != nil {
 			return
 		}
 	}
@@ -77,7 +99,7 @@ type readyResponse struct {
 	Ready   bool   `json:"ready"`
 }
 
-const rootTemplate = `<!doctype html>
+var rootTmpl = template.Must(template.New("root").Parse(`<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -86,11 +108,11 @@ const rootTemplate = `<!doctype html>
 </head>
 <body>
   <h1>GossipGrid</h1>
-  <p>Serving node: <code>%s</code></p>
+  <p>Serving node: <code>{{.NodeID}}</code></p>
   <p>Endpoints: <a href="/healthz">/healthz</a> · <a href="/readyz">/readyz</a></p>
 </body>
 </html>
-`
+`))
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

@@ -1,0 +1,22 @@
+# goldmark-lint configuration for GossipGrid.
+#
+# Standard markdownlint syntax: rules appear at the top level (no `config:`
+# wrapper). goldmark-lint auto-discovers this file, and the Makefile also
+# passes it explicitly via --config. The default rule set is enabled for every
+# rule not listed here.
+#
+# A few rules are tuned for technical documentation (tables, fenced code,
+# long links/URLs). Every tuned rule below carries a stated justification;
+# rules are not disabled merely to force a green build.
+
+# MD013 line-length: relaxed to 120, with tables, fenced code blocks, and long
+# URLs/links exempted. Prose stays readable without penalising table rows,
+# long links, or fenced code.
+MD013:
+  line_length: 120
+  heading_line_length: 120
+  code_block_line_length: 120
+  strict: false
+  stern: false
+  tables: false
+  code_blocks: false

@@ -7,6 +7,9 @@ dist/
 *.test
 coverage.*
 
+# goldmark-lint cache (written by `make docs-fix`; `docs-lint` uses --no-cache)
+.goldmark-lint-cache
+
 # Editor/OS noise
 .DS_Store
 *.swp

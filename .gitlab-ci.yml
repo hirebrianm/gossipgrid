@@ -1,0 +1,89 @@
+# GitLab CI — GossipGrid
+#
+# Pipeline: QA (fmt, vet, lint, security, tests, race detection) + build.
+# FIPS-enabled builds by default (FIPS_MODULE=v1.0.0).
+#
+# Tool versions are pinned here, not in the Makefile.
+# The Makefile's check_tool targets report missing tools; CI installs them.
+
+variables:
+  GO_VERSION: "1.27"
+  GOLANGCI_LINT_VERSION: "v2.15.0"
+  GOSEC_VERSION: "v2.30.0"
+  GOLDMARK_LINT_VERSION: "v0.6.3"
+  FIPS_MODULE: "v1.0.0"
+
+stages:
+  - qa
+  - build
+
+# Pipeline triggers: merge requests, branch pushes, and tag pushes.
+# Per GitLab's documentation, tag pushes use CI_PIPELINE_SOURCE == "push"
+# (NOT "tag_push"); tag pipelines are identified by a non-empty CI_COMMIT_TAG.
+# Branch pushes are suppressed when a merge request is open for the same
+# commit (GitLab does not guarantee automatic suppression in all configurations,
+# so CI_OPEN_MERGE_REQUESTS is used explicitly) to avoid duplicate branch/MR
+# pipelines. Tag pipelines and merge request pipelines always run.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG
+      when: always
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "push"
+      when: always
+    - when: never
+
+# Base image: golang on alpine provides the CGO toolchain and SQLite deps.
+# build-base + sqlite-static + sqlite-dev are needed for CGO SQLite linking.
+image: golang:1.27-alpine
+
+before_script:
+  - apk add --no-cache build-base sqlite-static sqlite-dev bash git
+  - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}
+  - go install github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}
+  - go install github.com/mrueg/goldmark-lint/cmd/goldmark-lint@${GOLDMARK_LINT_VERSION}
+
+qa:
+  stage: qa
+  script:
+    - make qa
+  artifacts:
+    when: on_failure
+    paths:
+      - bin/
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+build:
+  stage: build
+  script:
+    - make build
+  artifacts:
+    paths:
+      - bin/gossipgrid
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+# Optional: Docker image build (manual trigger only).
+# Requires a runner with Docker access (Docker-in-Docker or the kaniko build
+# approach). Not included in the default pipeline to avoid requiring
+# privileged runners.
+#
+# allow_failure: true ensures that if the job is manually triggered and fails,
+# it cannot mark the pipeline as failed. This is distinct from rules-level
+# when: manual (which only controls whether the job runs automatically);
+# without allow_failure, a manual job failure would still fail the pipeline.
+docker-image:
+  stage: build
+  script:
+    - make image
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual

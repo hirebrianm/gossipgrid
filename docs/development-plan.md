@@ -1,6 +1,8 @@
 # Incremental development plan
 
-**Working agreement:** The architecture is written first. Only **one prompt at a time** is given to the locally hosted AI. After every prompt the developer shares the result (code, logs, diffs, tests); architecture and QA are reviewed before continuing. This repository's initial commit intentionally contains documentation only.
+**Working agreement:** The architecture is written first. Implementation proceeds one milestone at a time. After every
+milestone the developer shares the result (code, logs, diffs, tests); architecture and QA are reviewed before
+continuing.
 
 ## Milestones
 
@@ -17,7 +19,8 @@
 | 8. GitLab CI/CD | QA, image registry, lint, manual Helm deploy | Repeatable delivery with immutably tagged image |
 | 9. Resilience/security lab | Fault injection, pod loss, reset authorization, metrics, FIPS profile | Logged and reproducible experiments |
 
-The sequence is intentionally flexible: the exact bootstrap/recovery control path may need prototype tests before Kubernetes packaging. No phase should compromise secure peer authentication merely to simplify debugging.
+The sequence is intentionally flexible: the exact bootstrap/recovery control path may need prototype tests before
+Kubernetes packaging. No phase should compromise secure peer authentication merely to simplify debugging.
 
 ## Rules for local-AI implementation reviews
 
@@ -30,13 +33,21 @@ The sequence is intentionally flexible: the exact bootstrap/recovery control pat
 
 ## Open items to resolve before implementation
 
-1. Exact first-install genesis protocol and reset authorization/locking contract, including scale-down and lost metadata behavior.
+1. Exact first-install genesis protocol and reset authorization/locking contract, including scale-down and lost
+   metadata behavior.
 2. Final pod certificate identity SAN conventions and Go-side authorization logic.
 3. Snapshot page boundaries, handling messages arriving while scanning, queue and retry caps.
 4. Pinned Go toolchain/FIPS module version and static build validation for chosen architectures.
 5. Helm values and the local cluster's actual Cilium and certificate-management capabilities.
 6. License and repository visibility.
 
-## Why this project is useful professionally
+## Purpose
 
-It makes familiar infrastructure concepts tangible: Kubernetes DNS, EndpointSlices, readiness, pod scheduling, internal PKI, cert rotation, LB/Gateway, ephemeral storage, CI/CD, security testing, and eventual consistency. It also creates a deliberately honest example of where availability, identity, and data durability are different problems.
+GossipGrid is a distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip
+protocols, mTLS, fault tolerance, and automated deployments. It provides a real, minimal application for
+infrastructure testing and Kubernetes validation — not a synthetic collection of infrastructure components, and not a
+production service.
+
+It exercises: Kubernetes DNS, EndpointSlices, readiness, pod scheduling, internal PKI, cert rotation, LB/Gateway,
+ephemeral storage, CI/CD, security testing, and eventual consistency. It is also a deliberately honest example of
+where availability, identity, and data durability are different problems.

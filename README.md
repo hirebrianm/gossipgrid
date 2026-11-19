@@ -1,14 +1,53 @@
 # GossipGrid
 
-**GossipGrid** is an intentionally small, distributed Go application for learning and demonstrating Kubernetes operations, secure service-to-service communication, and eventually consistent data replication.
+**A Kubernetes distributed systems testbed.**
 
-> **Status: Milestone 1 implemented (November 2026).** A locally runnable single-instance Go service with configuration, HTTP health/ready/root endpoints, structured logging, graceful shutdown, a Makefile, a static `scratch` Docker image, and tests. The distributed behaviors (messages, SQLite, gossip, mTLS, synchronization, Kubernetes deployment, CI) are described in the design documents below and are **not yet implemented**. No application-level FIPS or production-readiness claims are made.
+A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
+mTLS, fault tolerance, and automated deployments.
 
-## What it will do
+> **Status: Milestone 2 implemented (November 2026).** A locally runnable single-instance Go service with configuration,
+> HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, structured logging, graceful
+> shutdown, a Makefile, a static `scratch` Docker image, GitLab CI, GitHub Actions, and tests. Gossip replication, peer
+> mTLS, multi-node synchronization, and Kubernetes deployment are **not yet implemented** and remain planned milestones.
+> No application-level FIPS certification or production-readiness claims are made.
 
-Run a configurable number of identical Go replicas (start with five). Each replica stores string messages in a local **GORM + SQLite** database, exposes a minimal web interface and REST API, discovers its peers, and gossips messages to other replicas over **mutually authenticated TLS**. Newly created pods initialize their local databases by synchronizing from a previously synchronized peer. The UI shows the serving pod, cluster membership, message availability, and security diagnostics.
+## What it does (planned)
 
-There is intentionally **no central message broker, no centralized message database, and no consensus-based guarantee of durable writes**. Data is *eventually consistent*, and it is possible to lose messages. Understanding these tradeoffs is part of the project.
+Run a configurable number of identical Go replicas (target: five). Each replica stores string messages in a local
+**GORM + SQLite** database, exposes a minimal web interface and REST API, discovers its peers, and gossips messages to
+other replicas over **mutually authenticated TLS**. Newly created pods initialize their local databases by
+synchronizing from a previously synchronized peer. The UI shows the serving pod, cluster membership, message
+availability, and security diagnostics.
+
+There is intentionally **no central message broker, no centralized message database, and no consensus-based guarantee
+of durable writes**. Data is *eventually consistent*, and it is possible to lose messages. These tradeoffs are a
+deliberate part of the testbed design.
+
+## What is implemented
+
+| Area | Status |
+| --- | --- |
+| Single-replica Go service | ✅ |
+| Environment-based configuration | ✅ |
+| HTTP health/ready/root endpoints | ✅ |
+| GORM + SQLite local message store | ✅ |
+| REST API (POST/GET /api/messages, GET /api/messages/{id}) | ✅ |
+| UUIDv7 message identifiers | ✅ |
+| Idempotent replicated message insertion | ✅ |
+| Structured logging (slog) | ✅ |
+| Graceful shutdown | ✅ |
+| FIPS 140-3 build enforcement | ✅ |
+| Git-based build versioning | ✅ |
+| Static `scratch` Docker image (non-root) | ✅ |
+| Makefile (build, test, QA, image) | ✅ |
+| GitLab CI pipeline | ✅ |
+| GitHub Actions CI | ✅ |
+| Peer mTLS transport | 🔜 Milestone 3 |
+| Gossip replication protocol | 🔜 Milestone 4 |
+| Bootstrap/sync lifecycle | 🔜 Milestone 5 |
+| Web UI and diagnostics | 🔜 Milestone 6 |
+| Kubernetes packaging (Helm) | 🔜 Milestone 7 |
+| Fault injection and resilience lab | 🔜 Milestone 9 |
 
 ## Architecture at a glance
 
@@ -33,25 +72,27 @@ Vault PKI -> cert-manager -> Gateway HTTPS certificate
 Separate workload PKI -> cert-manager CSI -> per-pod mTLS certificates
 ```
 
-The workload is planned as a **StatefulSet without PVCs**: stable ordinal identities, but data stored in pod-lifetime `emptyDir` volumes. The peer Service will publish unready pod addresses to avoid bootstrap deadlock; only ready pods enter the user-facing Service.
+The workload is planned as a **StatefulSet without PVCs**: stable ordinal identities, but data stored in pod-lifetime
+`emptyDir` volumes. The peer Service will publish unready pod addresses to avoid bootstrap deadlock; only ready pods
+enter the user-facing Service.
 
 ## Principal design choices
 
-| Area | Planned approach |
+| Area | Approach |
 | --- | --- |
 | Language | Go, standard library where practical |
 | Database | GORM with the conventional CGO-backed SQLite driver |
 | Local storage | `emptyDir`; survives container restart but not pod replacement |
 | Scaling | StatefulSet, initially five replicas, `podManagementPolicy: Parallel` |
-| Service discovery | Kubernetes headless Service DNS, dynamic refresh; API/EndpointSlice watch may be a later exercise |
+| Service discovery | Kubernetes headless Service DNS, dynamic refresh |
 | Replication | Small custom epidemic gossip protocol plus periodic anti-entropy |
 | Bootstrap | Explicit `STARTING -> DISCOVERING -> SYNCING -> READY` lifecycle |
 | Security | Separate Vault-managed browser and workload PKI; peer mTLS required |
 | Certificate delivery | cert-manager Vault issuers, CSI per-pod keys/certs, trust bundle distribution |
-| Network entry | Cilium Gateway API and LAN LoadBalancer, configured separately |
-| Container | Multi-stage static build using Alpine/musl; final image `scratch` |
-| FIPS | Pin a supported Go native FIPS module for the FIPS build profile; verify, don't assert app certification |
-| Delivery | Makefile-based QA, GitLab CI, Helm deployment later |
+| Network entry | Cilium Gateway API and LAN LoadBalancer |
+| Container | Multi-stage static build; final image `scratch`, non-root user |
+| FIPS | Go native FIPS 140-3 module; verify, don't assert app certification |
+| CI/CD | GitLab CI (primary), GitHub Actions (public mirror) |
 
 ## Project documentation
 
@@ -61,15 +102,14 @@ The workload is planned as a **StatefulSet without PVCs**: stable ordinal identi
 - [Security, certificates and FIPS](docs/security.md)
 - [Kubernetes and delivery design](docs/kubernetes-deployment.md)
 - [Implementation milestones and review protocol](docs/development-plan.md)
-- Architecture decision records: [ephemeral storage](docs/decisions/0001-ephemeral-storage.md), [peer discovery](docs/decisions/0002-native-peer-discovery.md), [static/FIPS build](docs/decisions/0003-static-and-fips.md).
-
-## Development approach
-
-Development is **incremental and reviewed**. One implementation prompt at a time will be sent to a locally running AI; its code and test results will be reviewed before the next prompt. Do not generate full application scaffolding or unreviewed deployment manifests as part of this documentation-only first commit.
+- Architecture decision records: [ephemeral storage](docs/decisions/0001-ephemeral-storage.md),
+  [peer discovery](docs/decisions/0002-native-peer-discovery.md),
+  [static/FIPS build](docs/decisions/0003-static-and-fips.md).
 
 ## Local development
 
-Prerequisites: a Go 1.27+ toolchain, `golangci-lint` v2, `gosec` v2, and (for the Docker image) Docker with a working daemon. Install compatible versions of the linters on `PATH`; `make qa` will fail with an installation message if a required tool is missing.
+Prerequisites: a Go 1.27+ toolchain, `golangci-lint` v2, `gosec` v2, and (for the Docker image) Docker with a working
+daemon.
 
 ```sh
 make build       # compile the binary into ./bin/gossipgrid (FIPS-enabled by default)
@@ -85,59 +125,57 @@ make version     # show the resolved build version, FIPS module, and image refer
 make clean       # remove build outputs
 ```
 
-The `make qa` target runs: `fmt-check` → `go vet` → `golangci-lint` → `gosec` → `go test` → `go test -race`. It fails if any check fails or if a required tool is missing.
-
-Investigating findings:
-
-- **golangci-lint** prints each finding with file, line, linter name, and description. Fix genuine issues directly. For false positives, add a `//nolint:lintername` comment on the affected line with a one-line explanation.
-- **gosec** prints each finding with the rule ID (e.g. `G104: Err returned`), file, line, and description. Fix actionable issues. For justified false positives, add a `#nosec <rule-id>: <reason>` comment on the affected line.
-
-The linter configuration lives in `.golangci.yml` (golangci-lint v2 format). gosec runs with its default rule set; no custom config file is used.
+The `make qa` target runs: `fmt-check` → `go vet` → `golangci-lint` → `gosec` → `docs-lint` → `go test` → `go test -race`.
 
 ### FIPS 140-3 builds
 
-Builds are **FIPS-enabled by default** using Go's native FIPS 140-3 support (`FIPS_MODULE=v1.0.0`). The startup log reports `fips_enabled` and `fips_module` so the actual runtime state is visible. If a FIPS-required build is run with FIPS disabled at runtime (e.g. `GODEBUG=fips140=off`), the application **refuses to start** — a runtime override must not silently disable a required security configuration.
-
-To produce an ordinary non-FIPS development build:
-
-```sh
-make build FIPS_MODULE=off
-make run   FIPS_MODULE=off
-```
-
-The `fips_enabled` field in the startup log will be `false` and `fips_module` will be `latest` for non-FIPS builds.
-
-Run with custom configuration via environment variables:
+Builds are **FIPS-enabled by default** using Go's native FIPS 140-3 support (`FIPS_MODULE=v1.0.0`). The startup log
+reports `fips_enabled` and `fips_module`. If a FIPS-required build is run with FIPS disabled at runtime, the
+application **refuses to start**.
 
 ```sh
-GOSSIPGRID_HTTP_ADDR=:8080 \
-GOSSIPGRID_NODE_ID=gossipgrid-0 \
-GOSSIPGRID_LOG_LEVEL=debug \
-GOSSIPGRID_SHUTDOWN_TIMEOUT=10s \
-make run
+make build FIPS_MODULE=off   # non-FIPS development build
 ```
 
-Endpoints once running (default `http://127.0.0.1:8080`):
+### Configuration
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `GOSSIPGRID_HTTP_ADDR` | `:8080` | HTTP listener address |
+| `GOSSIPGRID_NODE_ID` | hostname | Node identity |
+| `GOSSIPGRID_LOG_LEVEL` | `info` | Log level (debug, info, warn, error) |
+| `GOSSIPGRID_SHUTDOWN_TIMEOUT` | `10s` | Graceful shutdown grace period |
+| `GOSSIPGRID_DB_PATH` | `./data/gossipgrid.db` | SQLite database path |
+
+### Endpoints
 
 - `GET /` — HTML page identifying GossipGrid and the serving node
-- `GET /healthz` — liveness (`{"service":"gossipgrid","status":"healthy"}`)
-- `GET /readyz` — readiness (`{"service":"gossipgrid","ready":true}`)
+- `GET /healthz` — liveness
+- `GET /readyz` — readiness
+- `POST /api/messages` — create a local message (body only)
+- `GET /api/messages` — list local messages (newest first, paginated)
+- `GET /api/messages/{id}` — retrieve a single message
 
-The Docker image is a multistage static build with a final `scratch` stage and a non-root user:
+The Docker image is a multistage static build with a final `scratch` stage and a non-root user (UID 65534):
 
 ```sh
 make image
 docker run --rm -p 8080:8080 --name gossipgrid gossipgrid:dev
 ```
 
-## Next milestone
+## CI/CD
 
-The single-replica foundation is in place. The next milestone is **local storage**: the GORM/SQLite message schema, the local REST API (`POST /api/messages`, `GET /api/messages`), and idempotent insert, verified by a test that a message survives a process restart with the same data directory. Remaining architecture questions (catastrophic-loss reset arbitration, certificate identity format, snapshot page boundaries, FIPS toolchain pinning) will be resolved in subsequent reviews.
+- **GitLab CI** (`.gitlab-ci.yml`): primary pipeline — QA (fmt, vet, lint, security, tests, race detection) and binary
+  build. FIPS-enabled by default. Optional manual Docker image build for tags.
+- **GitHub Actions** (`.github/workflows/ci.yml`): public mirror pipeline — same QA and build steps. No Docker image
+  builds.
 
-## Intended scope
+## Scope
 
-This is a **learning and portfolio demonstration**, not a durable production message store. No uptime or FIPS compliance certification claims are made. Future experiments include DNS/EndpointSlice discovery, pod rollouts, partitions, cert rotation, RBAC, network policies, load balancing, scaling, and recovery.
+GossipGrid is a **distributed systems testbed**, not a durable production message store. It is designed for
+infrastructure testing, Kubernetes validation, fault-tolerance testing, and security validation. No uptime or FIPS
+compliance certification claims are made. The project is not production-ready.
 
 ## License
 
-Not chosen yet; no license is granted by the presence of this repository. Select a license before public distribution.
+[Apache License, Version 2.0](LICENSE). See the [LICENSE](LICENSE) file for the full text.

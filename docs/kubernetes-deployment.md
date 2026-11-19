@@ -1,6 +1,8 @@
 # Kubernetes and delivery design
 
-**Scope separation:** application source and Helm packaging are developed here; cluster-wide prerequisites (Vault issuer, cert-manager, trust-manager, Cilium Gateway/LB configuration, DNS, GitLab Agent access) are handled in a separate cluster operations track.
+**Scope separation:** application source and Helm packaging are developed here; cluster-wide prerequisites (Vault
+issuer, cert-manager, trust-manager, Cilium Gateway/LB configuration, DNS, GitLab Agent access) are handled in a
+separate cluster operations track.
 
 ## Kubernetes objects planned
 
@@ -20,27 +22,38 @@
 ## Failure-safe probes
 
 - **Liveness:** server/event loop is alive. Peer outage must not trigger restart storms.
-- **Readiness:** local storage usable, required TLS material available, and initial synchronization complete for this epoch. DNS peer Service still exposes unready peers, but web Service does not.
+- **Readiness:** local storage usable, required TLS material available, and initial synchronization complete for this
+  epoch. DNS peer Service still exposes unready peers, but web Service does not.
 - **Startup:** accommodates time for CSI issuance and the initial snapshot without premature liveness restarts.
-- During a total-loss lockout no ready web endpoints may exist; diagnostics available via direct pod port-forward and logs/events.
+- During a total-loss lockout no ready web endpoints may exist; diagnostics available via direct pod port-forward and
+  logs/events.
 
 ## Browser load balancing
 
-Target is **Cilium Gateway API** with a LAN-reachable LoadBalancer IP. Verify the local Cilium version, Gateway support, LB IPAM, and L2 announcements or an alternative advertisement mode. Do not assume Cilium deployment automatically enables these capabilities. The Gateway serves Vault-issued HTTPS; the upstream application listener is initially HTTP on `8080`.
+Target is **Cilium Gateway API** with a LAN-reachable LoadBalancer IP. Verify the local Cilium version, Gateway
+support, LB IPAM, and L2 announcements or an alternative advertisement mode. Do not assume Cilium deployment
+automatically enables these capabilities. The Gateway serves Vault-issued HTTPS; the upstream application listener is
+initially HTTP on `8080`.
 
-A browser refresh can land on another ready replica. UI explicitly displays which replica responded, helping illustrate load balancing and replication lag. Session affinity is intentionally not required for v1.
+A browser refresh can land on another ready replica. UI explicitly displays which replica responded, helping illustrate
+load balancing and replication lag. Session affinity is intentionally not required for v1.
 
 ## Peer communication
 
-`gossipgrid-<ordinal>.gossipgrid-headless.<namespace>.svc.<cluster-domain>` identifies each StatefulSet pod. Never assume `cluster.local` if the cluster DNS domain differs. Headless DNS serves discovery; actual source validity is established by the private status API and mutual TLS, not by DNS results alone.
+`gossipgrid-<ordinal>.gossipgrid-headless.<namespace>.svc.<cluster-domain>` identifies each StatefulSet pod.
+Never assume `cluster.local` if the cluster DNS domain differs. Headless DNS serves discovery; actual source
+validity is established by the private status API and mutual TLS, not by DNS results alone.
 
 ## Container and CI/CD
 
 - Build using Go, CGO, and static musl/SQLite linkage in a builder image; final runtime `scratch`.
-- Use a Makefile as the single command interface: `fmt`, `vet`, `test`, `test-race`, `build`, `image`, `qa`, `helm-lint`, `integration` as they become relevant.
-- GitLab CI: QA -> integration -> image build/push -> Helm lint/template -> controlled Helm deploy (initially manual/protected).
+- Use a Makefile as the single command interface: `fmt`, `vet`, `test`, `test-race`, `build`, `image`, `qa`,
+  `helm-lint`, `integration` as they become relevant.
+- GitLab CI: QA -> integration -> image build/push -> Helm lint/template -> controlled Helm deploy (initially
+  manual/protected).
 - Tag with immutable commit SHA and record image digests; do not use `latest` as a deployment identity.
-- Helm values: replica count, namespace, image, resources, ports, issuer references, CA bundles, sync timings, and intended reset policy. Keep secrets out of source.
+- Helm values: replica count, namespace, image, resources, ports, issuer references, CA bundles, sync timings, and
+  intended reset policy. Keep secrets out of source.
 - Implement manifests only after app behavior and local integration tests pass.
 
 ## Tests to demonstrate
