@@ -26,6 +26,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- Isolate from CI environment ---------------------------------------------
+# When this script runs under GitLab or GitHub CI, the environment carries
+# CI_COMMIT_TAG, CI_COMMIT_REF_NAME, GITHUB_REF_TYPE, and GITHUB_REF_NAME.
+# These would override the temporary repository's local branch/tag state during
+# version detection, causing tests that rely on local Git to produce incorrect
+# versions. Unsetting them here ensures a clean baseline; individual test cases
+# that explicitly set CI variables (e.g. "CI_COMMIT_REF_NAME=main make version")
+# override the empty environment via inline assignment.
+unset CI_COMMIT_TAG CI_COMMIT_REF_NAME GITHUB_REF_TYPE GITHUB_REF_NAME
+
 # --- Setup -------------------------------------------------------------------
 cd "$tmp"
 git init -q

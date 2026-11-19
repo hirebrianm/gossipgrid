@@ -49,10 +49,6 @@ qa:
   stage: qa
   script:
     - make qa
-  artifacts:
-    when: on_failure
-    paths:
-      - bin/
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_PIPELINE_SOURCE == "push"
