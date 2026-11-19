@@ -2,7 +2,7 @@
 
 **GossipGrid** is an intentionally small, distributed Go application for learning and demonstrating Kubernetes operations, secure service-to-service communication, and eventually consistent data replication.
 
-> **Status: design baseline only (November 2026).** No application, Helm chart, or CI pipeline has been implemented. Documentation describes the target behavior; it is not a claim of working functionality or production readiness.
+> **Status: Milestone 1 implemented (November 2026).** A locally runnable single-instance Go service with configuration, HTTP health/ready/root endpoints, structured logging, graceful shutdown, a Makefile, a static `scratch` Docker image, and tests. The distributed behaviors (messages, SQLite, gossip, mTLS, synchronization, Kubernetes deployment, CI) are described in the design documents below and are **not yet implemented**. No application-level FIPS or production-readiness claims are made.
 
 ## What it will do
 
@@ -67,9 +67,72 @@ The workload is planned as a **StatefulSet without PVCs**: stable ordinal identi
 
 Development is **incremental and reviewed**. One implementation prompt at a time will be sent to a locally running AI; its code and test results will be reviewed before the next prompt. Do not generate full application scaffolding or unreviewed deployment manifests as part of this documentation-only first commit.
 
+## Local development
+
+Prerequisites: a Go 1.27+ toolchain, `golangci-lint` v2, `gosec` v2, and (for the Docker image) Docker with a working daemon. Install compatible versions of the linters on `PATH`; `make qa` will fail with an installation message if a required tool is missing.
+
+```sh
+make build       # compile the binary into ./bin/gossipgrid (FIPS-enabled by default)
+make run         # build and run locally (default config: :8080, hostname node)
+make qa          # verify fmt, vet, lint, security, unit tests, race detection
+make lint        # run golangci-lint (fails on findings)
+make security    # run gosec security scan (fails on actionable findings)
+make test        # unit tests only
+make test-race   # unit tests with race detection
+make fmt         # format Go sources
+make image       # build the static Docker image
+make version     # show the resolved build version, FIPS module, and image reference
+make clean       # remove build outputs
+```
+
+The `make qa` target runs: `fmt-check` → `go vet` → `golangci-lint` → `gosec` → `go test` → `go test -race`. It fails if any check fails or if a required tool is missing.
+
+Investigating findings:
+
+- **golangci-lint** prints each finding with file, line, linter name, and description. Fix genuine issues directly. For false positives, add a `//nolint:lintername` comment on the affected line with a one-line explanation.
+- **gosec** prints each finding with the rule ID (e.g. `G104: Err returned`), file, line, and description. Fix actionable issues. For justified false positives, add a `#nosec <rule-id>: <reason>` comment on the affected line.
+
+The linter configuration lives in `.golangci.yml` (golangci-lint v2 format). gosec runs with its default rule set; no custom config file is used.
+
+### FIPS 140-3 builds
+
+Builds are **FIPS-enabled by default** using Go's native FIPS 140-3 support (`FIPS_MODULE=v1.0.0`). The startup log reports `fips_enabled` and `fips_module` so the actual runtime state is visible. If a FIPS-required build is run with FIPS disabled at runtime (e.g. `GODEBUG=fips140=off`), the application **refuses to start** — a runtime override must not silently disable a required security configuration.
+
+To produce an ordinary non-FIPS development build:
+
+```sh
+make build FIPS_MODULE=off
+make run   FIPS_MODULE=off
+```
+
+The `fips_enabled` field in the startup log will be `false` and `fips_module` will be `latest` for non-FIPS builds.
+
+Run with custom configuration via environment variables:
+
+```sh
+GOSSIPGRID_HTTP_ADDR=:8080 \
+GOSSIPGRID_NODE_ID=gossipgrid-0 \
+GOSSIPGRID_LOG_LEVEL=debug \
+GOSSIPGRID_SHUTDOWN_TIMEOUT=10s \
+make run
+```
+
+Endpoints once running (default `http://127.0.0.1:8080`):
+
+- `GET /` — HTML page identifying GossipGrid and the serving node
+- `GET /healthz` — liveness (`{"service":"gossipgrid","status":"healthy"}`)
+- `GET /readyz` — readiness (`{"service":"gossipgrid","ready":true}`)
+
+The Docker image is a multistage static build with a final `scratch` stage and a non-root user:
+
+```sh
+make image
+docker run --rm -p 8080:8080 --name gossipgrid gossipgrid:dev
+```
+
 ## Next milestone
 
-Agree on remaining implementation details (notably catastrophic-loss reset arbitration and exact certificate identity format), then implement a locally runnable single-instance Go service with health probes, configuration, Makefile, and tests. Kubernetes installation and configuration will be addressed in a separate discussion.
+The single-replica foundation is in place. The next milestone is **local storage**: the GORM/SQLite message schema, the local REST API (`POST /api/messages`, `GET /api/messages`), and idempotent insert, verified by a test that a message survives a process restart with the same data directory. Remaining architecture questions (catastrophic-loss reset arbitration, certificate identity format, snapshot page boundaries, FIPS toolchain pinning) will be resolved in subsequent reviews.
 
 ## Intended scope
 

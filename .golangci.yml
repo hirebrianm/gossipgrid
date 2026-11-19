@@ -1,0 +1,57 @@
+# golangci-lint v2 configuration for GossipGrid.
+#
+# This is a focused, maintainable selection of established linters covering
+# correctness, unchecked errors, and common programming mistakes.
+#
+# gosec is intentionally NOT included here; it is run standalone via
+# `make security` to keep the two concerns separate.
+#
+# Linter selection rationale:
+#   errcheck    — flags unchecked errors (correctness)
+#   govet       — flags suspicious constructs (correctness, overlaps go vet)
+#   ineffassign — flags useless assignments (correctness)
+#   staticcheck — flags incorrect, insecure, and deprecated code (correctness)
+#   unused      — flags unused code (maintainability)
+#   bodyclose   — flags unclosed HTTP response bodies (resource leak)
+#   contextcheck — flags missing context propagation (correctness)
+#   copyloopvar — flags loop variable copy issues (correctness, Go 1.22+)
+#   nilerr      — flags ignoring errors that are nil (correctness)
+#   noctx       — flags HTTP requests without context (correctness)
+#   predeclared — flags shadowing predeclared identifiers (clarity)
+#   unconvert   — flags unnecessary type conversions (maintainability)
+#   unparam     — flags unused function parameters (maintainability)
+
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - nilerr
+    - noctx
+    - predeclared
+    - unconvert
+    - unparam
+
+  disable:
+    # gosec is run standalone via `make security`.
+    - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+run:
+  timeout: 5m
+
+issues:
+  # Show all findings; no max-issues-to-report cap for a small codebase.
+  max-issues-per-linter: 0
+  max-same-issues: 0
