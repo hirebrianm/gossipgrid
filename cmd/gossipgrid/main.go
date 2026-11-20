@@ -17,9 +17,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"gossipgrid/internal/config"
+	"gossipgrid/internal/discovery"
 	"gossipgrid/internal/server"
 	"gossipgrid/internal/store"
 )
@@ -101,9 +105,24 @@ func run() (retErr error) {
 		slog.String("http_addr", cfg.HTTPAddr),
 		slog.String("db_path", cfg.DBPath),
 		slog.String("log_level", cfg.LogLevel),
+		slog.String("discovery_mode", cfg.DiscoveryMode),
 		slog.Bool("fips_enabled", fipsEnabled),
 		slog.String("fips_module", fipsModule),
 	)
+
+	// Initialize peer discovery (Milestone 3A).
+	// Discovery is observational for this stage: a failed DNS lookup does not
+	// affect the public HTTP service's readiness. Peer connections are
+	// established in later milestones (mTLS, gossip, synchronization).
+	discCfg, err := buildDiscoveryConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("building discovery config: %w", err)
+	}
+	discMgr := discovery.NewManager(discCfg, logger, nil)
+	// Deferred shutdown ensures the refresh loop goroutine is stopped on every
+	// exit path. Shutdown is idempotent and returns promptly for off/static
+	// modes (no goroutine was started).
+	defer discMgr.Shutdown()
 
 	srv := server.NewServer(cfg.HTTPAddr, server.NewWithStore(server.Node{ID: cfg.NodeID}, st))
 
@@ -120,6 +139,20 @@ func run() (retErr error) {
 	ctx, stop := signal.NotifyContext(context.Background(),
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Start peer discovery. The context is cancelled on signal, which stops
+	// the DNS refresh loop. For off and static modes, Start is a no-op or a
+	// single deterministic pass with no background goroutine.
+	if err := discMgr.Start(ctx); err != nil {
+		return fmt.Errorf("starting peer discovery: %w", err)
+	}
+	snap := discMgr.Snapshot()
+	logger.Info("peer discovery initialized",
+		slog.String("mode", string(snap.Mode)),
+		slog.Int("peers", len(snap.Peers)),
+		slog.Int("expected_replicas", discCfg.ExpectedReplicas),
+		slog.Bool("stale", snap.Stale),
+	)
 
 	select {
 	case err := <-errCh:
@@ -152,6 +185,8 @@ func levelFromName(name string) slog.Level {
 	switch name {
 	case "debug":
 		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
 	case "warn":
 		return slog.LevelWarn
 	case "error":
@@ -159,4 +194,61 @@ func levelFromName(name string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// buildDiscoveryConfig converts the validated environment configuration into
+// the discovery.Config struct, parsing durations and integers and splitting
+// the static peer list.
+func buildDiscoveryConfig(cfg *config.Config) (discovery.Config, error) {
+	var dc discovery.Config
+	dc.Mode = discovery.Mode(cfg.DiscoveryMode)
+	dc.NodeID = cfg.NodeID
+	dc.DNSName = cfg.DiscoveryDNSName
+	dc.SRVService = cfg.DiscoverySRVService
+	dc.StatefulSetName = cfg.StatefulSetName
+
+	n, err := strconv.Atoi(cfg.ExpectedReplicas)
+	if err != nil {
+		return dc, fmt.Errorf("expected replicas %q: %w", cfg.ExpectedReplicas, err)
+	}
+	dc.ExpectedReplicas = n
+
+	if cfg.DiscoveryMode == "static" {
+		dc.StaticPeers = splitTrimPeers(cfg.StaticPeers)
+	}
+
+	if cfg.DiscoveryMode == "dns" {
+		dc.Interval, err = time.ParseDuration(cfg.DiscoveryInterval)
+		if err != nil {
+			return dc, fmt.Errorf("discovery interval %q: %w", cfg.DiscoveryInterval, err)
+		}
+		dc.Timeout, err = time.ParseDuration(cfg.DiscoveryTimeout)
+		if err != nil {
+			return dc, fmt.Errorf("discovery timeout %q: %w", cfg.DiscoveryTimeout, err)
+		}
+	}
+
+	// Enforce centralized validation before the config is handed to the
+	// discovery manager. This catches malformed durations and port values
+	// early, before they reach time.NewTicker (which panics on non-positive
+	// durations) or the network layer.
+	if err := dc.Validate(); err != nil {
+		return dc, fmt.Errorf("discovery config validation: %w", err)
+	}
+
+	return dc, nil
+}
+
+// splitTrimPeers splits a comma-separated peer list, trimming whitespace and
+// removing empty entries.
+func splitTrimPeers(s string) []string {
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }

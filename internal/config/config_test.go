@@ -84,6 +84,43 @@ func TestLoadInvalidValues(t *testing.T) {
 		{"bad duration", map[string]string{EnvShutdownTimeout: "soon"}},
 		{"non-positive duration", map[string]string{EnvShutdownTimeout: "0s"}},
 		{"explicitly empty node id", map[string]string{EnvNodeID: ""}},
+		// Discovery: zero interval.
+		{"zero discovery interval", map[string]string{
+			EnvDiscoveryMode:     "dns",
+			EnvDiscoveryDNSName:  "gossipgrid-headless.default.svc",
+			EnvDiscoveryInterval: "0s",
+		}},
+		// Discovery: negative interval.
+		{"negative discovery interval", map[string]string{
+			EnvDiscoveryMode:     "dns",
+			EnvDiscoveryDNSName:  "gossipgrid-headless.default.svc",
+			EnvDiscoveryInterval: "-5s",
+		}},
+		// Discovery: zero timeout.
+		{"zero discovery timeout", map[string]string{
+			EnvDiscoveryMode:    "dns",
+			EnvDiscoveryDNSName: "gossipgrid-headless.default.svc",
+			EnvDiscoveryTimeout: "0s",
+		}},
+		// Discovery: negative timeout.
+		{"negative discovery timeout", map[string]string{
+			EnvDiscoveryMode:    "dns",
+			EnvDiscoveryDNSName: "gossipgrid-headless.default.svc",
+			EnvDiscoveryTimeout: "-3s",
+		}},
+		// Static peer: invalid port (out of range).
+		{"static peer port 0", map[string]string{
+			EnvDiscoveryMode: "static",
+			EnvStaticPeers:   "a:0",
+		}},
+		{"static peer port 65536", map[string]string{
+			EnvDiscoveryMode: "static",
+			EnvStaticPeers:   "a:65536",
+		}},
+		{"static peer non-numeric port", map[string]string{
+			EnvDiscoveryMode: "static",
+			EnvStaticPeers:   "a:80a",
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -135,6 +172,52 @@ func TestLoadMultipleErrors(t *testing.T) {
 		if !contains(err.Error(), want) {
 			t.Errorf("error should mention %s: %v", want, err)
 		}
+	}
+}
+
+// TestLoadValidDiscovery verifies that valid discovery configurations are
+// accepted, including DNS mode with the headless Service name and static mode
+// with bracketed IPv6 addresses.
+func TestLoadValidDiscovery(t *testing.T) {
+	cases := []struct {
+		name string
+		vars map[string]string
+	}{
+		{"valid DNS mode", map[string]string{
+			EnvDiscoveryMode:       "dns",
+			EnvDiscoveryDNSName:    "gossipgrid-headless.default.svc",
+			EnvDiscoverySRVService: "peer",
+			EnvDiscoveryInterval:   "10s",
+			EnvDiscoveryTimeout:    "3s",
+			EnvExpectedReplicas:    "5",
+			EnvStatefulSetName:     "gossipgrid",
+		}},
+		{"valid DNS mode with non-cluster-local domain", map[string]string{
+			EnvDiscoveryMode:       "dns",
+			EnvDiscoveryDNSName:    "gossipgrid-headless.prod.svc.example.internal",
+			EnvDiscoverySRVService: "peer",
+			EnvDiscoveryInterval:   "15s",
+			EnvDiscoveryTimeout:    "5s",
+			EnvExpectedReplicas:    "3",
+			EnvStatefulSetName:     "gossipgrid",
+		}},
+		{"valid static mode with IPv6", map[string]string{
+			EnvDiscoveryMode: "static",
+			EnvStaticPeers:   "[::1]:8443,127.0.0.1:8443",
+		}},
+		{"valid static mode with host:port", map[string]string{
+			EnvDiscoveryMode: "static",
+			EnvStaticPeers:   "gossipgrid-1:8443,gossipgrid-2:8443",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := load(env(tc.vars))
+			if err != nil {
+				t.Fatalf("expected valid config, got error: %v", err)
+			}
+			_ = cfg
+		})
 	}
 }
 

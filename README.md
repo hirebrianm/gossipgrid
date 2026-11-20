@@ -5,11 +5,12 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-> **Status: Milestone 2 implemented (November 2026).** A locally runnable single-instance Go service with configuration,
-> HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, structured logging, graceful
-> shutdown, a Makefile, a static `scratch` Docker image, GitLab CI, GitHub Actions, and tests. Gossip replication, peer
-> mTLS, multi-node synchronization, and Kubernetes deployment are **not yet implemented** and remain planned milestones.
-> No application-level FIPS certification or production-readiness claims are made.
+> **Status: Milestone 3A implemented (November 2026).** A locally runnable single-instance Go service with configuration,
+> HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, peer discovery (static and
+> Kubernetes DNS SRV), structured logging, graceful shutdown, a Makefile, a static `scratch` Docker image, GitLab CI,
+> GitHub Actions, and tests. Gossip replication, peer mTLS, multi-node synchronization, and Kubernetes deployment are
+> **not yet implemented** and remain planned milestones. No application-level FIPS certification or
+> production-readiness claims are made.
 
 ## What it does (planned)
 
@@ -42,7 +43,10 @@ deliberate part of the testbed design.
 | Makefile (build, test, QA, image) | ✅ |
 | GitLab CI pipeline | ✅ |
 | GitHub Actions CI | ✅ |
-| Peer mTLS transport | 🔜 Milestone 3 |
+| Peer discovery (static mode) | ✅ |
+| Peer discovery (DNS SRV mode) | ✅ |
+| Membership tracking and reconciliation | ✅ |
+| Peer mTLS transport | 🔜 Milestone 3B |
 | Gossip replication protocol | 🔜 Milestone 4 |
 | Bootstrap/sync lifecycle | 🔜 Milestone 5 |
 | Web UI and diagnostics | 🔜 Milestone 6 |
@@ -146,6 +150,14 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_LOG_LEVEL` | `info` | Log level (debug, info, warn, error) |
 | `GOSSIPGRID_SHUTDOWN_TIMEOUT` | `10s` | Graceful shutdown grace period |
 | `GOSSIPGRID_DB_PATH` | `./data/gossipgrid.db` | SQLite database path |
+| `GOSSIPGRID_DISCOVERY_MODE` | `off` | Discovery mode: `off`, `static`, or `dns` |
+| `GOSSIPGRID_STATIC_PEERS` | (empty) | Comma-separated `host:port` peer list (static mode) |
+| `GOSSIPGRID_DISCOVERY_DNS_NAME` | (empty) | Headless Service DNS name (dns mode, e.g. `gossipgrid-headless.default.svc`) |
+| `GOSSIPGRID_DISCOVERY_SRV_SERVICE` | `peer` | Named port in SRV records (dns mode) |
+| `GOSSIPGRID_DISCOVERY_INTERVAL` | `10s` | DNS refresh period (dns mode) |
+| `GOSSIPGRID_DISCOVERY_TIMEOUT` | `3s` | Per-lookup DNS timeout (dns mode) |
+| `GOSSIPGRID_EXPECTED_REPLICAS` | `1` | Configured cluster size (StatefulSet replicas) |
+| `GOSSIPGRID_STATEFULSET_NAME` | `gossipgrid` | StatefulSet name for deriving expected replica identities |
 
 ### Endpoints
 
@@ -155,6 +167,43 @@ make build FIPS_MODULE=off   # non-FIPS development build
 - `POST /api/messages` — create a local message (body only)
 - `GET /api/messages` — list local messages (newest first, paginated)
 - `GET /api/messages/{id}` — retrieve a single message
+
+### Peer discovery
+
+GossipGrid supports three discovery modes. Discovery is **observational** in this milestone: a failed DNS
+lookup does not affect the public HTTP service's readiness, and no peer connections are initiated.
+Peer connections (mTLS, gossip, synchronization) are implemented in subsequent milestones.
+
+| Mode | Use case | Behavior |
+| --- | --- | --- |
+| `off` | Single-instance development | No discovery; no background activity |
+| `static` | Local multi-process testing | Peers read from `GOSSIPGRID_STATIC_PEERS`; deterministic, no background network I/O |
+| `dns` | Kubernetes deployment | Peers discovered from headless Service DNS SRV records; periodic refresh with bounded timeouts |
+
+**Static mode example (five local processes):**
+
+```sh
+GOSSIPGRID_NODE_ID=gossipgrid-0 GOSSIPGRID_DISCOVERY_MODE=static \
+  GOSSIPGRID_STATIC_PEERS="gossipgrid-1:8443,gossipgrid-2:8443,gossipgrid-3:8443,gossipgrid-4:8443" \
+  GOSSIPGRID_EXPECTED_REPLICAS=5 gossipgrid
+
+GOSSIPGRID_NODE_ID=gossipgrid-1 GOSSIPGRID_DISCOVERY_MODE=static \
+  GOSSIPGRID_STATIC_PEERS="gossipgrid-0:8443,gossipgrid-2:8443,gossipgrid-3:8443,gossipgrid-4:8443" \
+  GOSSIPGRID_EXPECTED_REPLICAS=5 gossipgrid
+```
+
+**DNS mode example (Kubernetes):**
+
+```sh
+GOSSIPGRID_NODE_ID=gossipgrid-0 GOSSIPGRID_DISCOVERY_MODE=dns \
+  GOSSIPGRID_DISCOVERY_DNS_NAME="gossipgrid-headless.default.svc" \
+  GOSSIPGRID_EXPECTED_REPLICAS=5 gossipgrid
+```
+
+The headless Service must have a named TCP port called `peer` on port 8443 and
+`publishNotReadyAddresses: true`. No Kubernetes API permissions are required for peer discovery.
+DNS records are not proof that a peer is healthy, reachable, authenticated, synchronized, or ready to
+supply data; those properties are established by the mTLS and lifecycle implementations in later milestones.
 
 The Docker image is a multistage static build with a final `scratch` stage and a non-root user (UID 65534):
 

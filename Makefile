@@ -3,7 +3,9 @@
 # The same commands work on macOS (local development) and Linux (CI).
 #
 # Version detection precedence:
-#   1. Exact Git tag on HEAD (or CI_COMMIT_TAG in GitLab CI)
+#   1. Exact Git tag on HEAD (or CI_COMMIT_TAG in GitLab CI) — only when the
+#      working tree is clean. A dirty tree falls through to branch resolution
+#      to prevent local uncommitted changes from reusing a release tag.
 #   2. Sanitised branch name if not on main (or CI_COMMIT_REF_NAME in GitLab CI)
 #   3. "dev"
 #
@@ -53,7 +55,9 @@ endif
 # Precedence:
 #   1. An explicit CI tag (GitLab CI_COMMIT_TAG, GitHub GITHUB_REF_NAME when
 #      GITHUB_REF_TYPE=tag) takes precedence over branch-name fallbacks.
-#   2. An exact tag on HEAD (local annotated/lightweight tag).
+#   2. An exact tag on HEAD (local annotated/lightweight tag) — only when the
+#      working tree is clean. A dirty tree falls through to branch resolution
+#      to prevent local uncommitted changes from reusing a release tag.
 #   3. A CI branch name (GitLab CI_COMMIT_REF_NAME, GitHub GITHUB_REF_NAME
 #      when GITHUB_REF_TYPE=branch) — "main" resolves to "dev".
 #   4. The local branch name (detached HEAD yields empty -> "dev").

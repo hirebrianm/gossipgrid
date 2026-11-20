@@ -15,7 +15,9 @@
 #
 # Precedence:
 #   1. CI_COMMIT_TAG (GitLab) or a GitHub tag ref (GITHUB_REF_TYPE=tag).
-#   2. An exact tag on HEAD (local tag).
+#   2. An exact tag on HEAD (local tag) — only when the working tree is clean.
+#      A dirty tree at a tagged commit falls through to branch-based resolution
+#      to prevent local uncommitted changes from reusing a release tag.
 #   3. CI_COMMIT_REF_NAME (GitLab) or a GitHub branch ref.
 #   4. The local branch name.
 #   5. Fallback: "dev" (untagged main, detached HEAD without ref metadata).
@@ -35,12 +37,30 @@ resolve_raw() {
     return 0
   fi
 
-  # 2. Exact tag on HEAD (local annotated/lightweight tag).
+  # 2. Exact tag on HEAD (local annotated/lightweight tag), but ONLY when the
+  #    working tree is clean. A dirty tree at a tagged commit means local
+  #    uncommitted changes exist — reusing the release tag would be misleading.
+  #    Fall through to branch-based resolution instead.
   local tag
   tag="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
   if [ -n "$tag" ]; then
-    printf '%s\n' "$tag"
-    return 0
+    # Check for uncommitted changes. Both tracked file modifications
+    # (git diff) and untracked files (git status --porcelain --untracked-files=normal)
+    # can affect the build. The --untracked-files=normal flag respects .gitignore:
+    # ignored files (e.g. bin/, data/) are not reported, so normal generated
+    # artifacts do not dirty the tree for versioning purposes.
+    if git diff --quiet HEAD 2>/dev/null; then
+      # Tracked files are clean; now check for non-ignored untracked files.
+      local untracked
+      untracked="$(git status --porcelain --untracked-files=normal 2>/dev/null || true)"
+      if [ -z "$untracked" ]; then
+        printf '%s\n' "$tag"
+        return 0
+      fi
+    fi
+    # Dirty tree (tracked modifications or non-ignored untracked files):
+    # do not reuse the release tag. Fall through to branch-based resolution
+    # (main -> dev, feature branch -> sanitised branch name).
   fi
 
   # 3. CI branch name (GitLab) or GitHub branch ref.

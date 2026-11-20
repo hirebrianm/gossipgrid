@@ -18,11 +18,19 @@ import (
 
 // Env vars read by Load.
 const (
-	EnvHTTPAddr        = "GOSSIPGRID_HTTP_ADDR"
-	EnvNodeID          = "GOSSIPGRID_NODE_ID"
-	EnvLogLevel        = "GOSSIPGRID_LOG_LEVEL"
-	EnvShutdownTimeout = "GOSSIPGRID_SHUTDOWN_TIMEOUT"
-	EnvDBPath          = "GOSSIPGRID_DB_PATH"
+	EnvHTTPAddr            = "GOSSIPGRID_HTTP_ADDR"
+	EnvNodeID              = "GOSSIPGRID_NODE_ID"
+	EnvLogLevel            = "GOSSIPGRID_LOG_LEVEL"
+	EnvShutdownTimeout     = "GOSSIPGRID_SHUTDOWN_TIMEOUT"
+	EnvDBPath              = "GOSSIPGRID_DB_PATH"
+	EnvDiscoveryMode       = "GOSSIPGRID_DISCOVERY_MODE"
+	EnvStaticPeers         = "GOSSIPGRID_STATIC_PEERS"
+	EnvDiscoveryDNSName    = "GOSSIPGRID_DISCOVERY_DNS_NAME"
+	EnvDiscoverySRVService = "GOSSIPGRID_DISCOVERY_SRV_SERVICE"
+	EnvDiscoveryInterval   = "GOSSIPGRID_DISCOVERY_INTERVAL"
+	EnvDiscoveryTimeout    = "GOSSIPGRID_DISCOVERY_TIMEOUT"
+	EnvExpectedReplicas    = "GOSSIPGRID_EXPECTED_REPLICAS"
+	EnvStatefulSetName     = "GOSSIPGRID_STATEFULSET_NAME"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -32,6 +40,16 @@ type Config struct {
 	LogLevel        string
 	ShutdownTimeout time.Duration
 	DBPath          string
+
+	// Discovery configuration (Milestone 3A).
+	DiscoveryMode       string
+	StaticPeers         string
+	DiscoveryDNSName    string
+	DiscoverySRVService string
+	DiscoveryInterval   string
+	DiscoveryTimeout    string
+	ExpectedReplicas    string
+	StatefulSetName     string
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -86,6 +104,20 @@ func load(lookup envFunc) (*Config, error) {
 	}
 
 	cfg.DBPath = getEnv(lookup, EnvDBPath, "./data/gossipgrid.db")
+
+	// Discovery configuration (Milestone 3A).
+	cfg.DiscoveryMode = strings.ToLower(getEnv(lookup, EnvDiscoveryMode, "off"))
+	cfg.StaticPeers = getEnv(lookup, EnvStaticPeers, "")
+	cfg.DiscoveryDNSName = getEnv(lookup, EnvDiscoveryDNSName, "")
+	cfg.DiscoverySRVService = getEnv(lookup, EnvDiscoverySRVService, "peer")
+	cfg.DiscoveryInterval = getEnv(lookup, EnvDiscoveryInterval, "10s")
+	cfg.DiscoveryTimeout = getEnv(lookup, EnvDiscoveryTimeout, "3s")
+	cfg.ExpectedReplicas = getEnv(lookup, EnvExpectedReplicas, "1")
+	cfg.StatefulSetName = getEnv(lookup, EnvStatefulSetName, "gossipgrid")
+
+	if err := validateDiscoveryConfig(cfg); err != nil {
+		errs = append(errs, err)
+	}
 
 	return cfg, errors.Join(errs...)
 }
@@ -145,4 +177,99 @@ func validLogLevel(level string) bool {
 	default:
 		return false
 	}
+}
+
+// validatePeerAddr checks host:port syntax and the numeric port range
+// (1-65535) for a static peer address without performing DNS resolution or
+// any network operation. It accepts bracketed IPv6 addresses (e.g.
+// "[::1]:8443") via net.SplitHostPort.
+func validatePeerAddr(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid peer address (want host:port): %w", EnvStaticPeers, addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("%s: %q is missing a host", EnvStaticPeers, addr)
+	}
+	if port == "" {
+		return fmt.Errorf("%s: %q is missing a port", EnvStaticPeers, addr)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("%s: port %q in %q is not a valid number: %w", EnvStaticPeers, port, addr, err)
+	}
+	if n < 1 || n > 65535 {
+		return fmt.Errorf("%s: port %d in %q is out of range (want 1-65535)", EnvStaticPeers, n, addr)
+	}
+	return nil
+}
+
+// validateDiscoveryConfig checks the discovery fields for the active mode.
+// It returns the first error found, or nil if all values are valid.
+func validateDiscoveryConfig(cfg *Config) error {
+	switch cfg.DiscoveryMode {
+	case "off":
+		// No mode-specific requirements.
+	case "static":
+		if cfg.StaticPeers == "" {
+			return fmt.Errorf("%s: static discovery mode requires a non-empty peer list", EnvStaticPeers)
+		}
+		for _, addr := range splitPeers(cfg.StaticPeers) {
+			if err := validatePeerAddr(addr); err != nil {
+				return err
+			}
+		}
+	case "dns":
+		if cfg.DiscoveryDNSName == "" {
+			return fmt.Errorf("%s: dns discovery mode requires a non-empty DNS service name", EnvDiscoveryDNSName)
+		}
+		if cfg.DiscoverySRVService == "" {
+			return fmt.Errorf("%s: SRV service name must not be empty", EnvDiscoverySRVService)
+		}
+		interval, err := time.ParseDuration(cfg.DiscoveryInterval)
+		if err != nil {
+			return fmt.Errorf("%s: %q is not a valid duration: %w", EnvDiscoveryInterval, cfg.DiscoveryInterval, err)
+		}
+		if interval <= 0 {
+			return fmt.Errorf("%s: %q must be a positive duration", EnvDiscoveryInterval, cfg.DiscoveryInterval)
+		}
+		timeout, err := time.ParseDuration(cfg.DiscoveryTimeout)
+		if err != nil {
+			return fmt.Errorf("%s: %q is not a valid duration: %w", EnvDiscoveryTimeout, cfg.DiscoveryTimeout, err)
+		}
+		if timeout <= 0 {
+			return fmt.Errorf("%s: %q must be a positive duration", EnvDiscoveryTimeout, cfg.DiscoveryTimeout)
+		}
+	default:
+		return fmt.Errorf("%s: %q is not a valid discovery mode (want off, static, or dns)", EnvDiscoveryMode, cfg.DiscoveryMode)
+	}
+
+	// Expected replicas must be a positive integer.
+	n, err := strconv.Atoi(cfg.ExpectedReplicas)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid integer: %w", EnvExpectedReplicas, cfg.ExpectedReplicas, err)
+	}
+	if n < 1 {
+		return fmt.Errorf("%s: must be at least 1 (got %d)", EnvExpectedReplicas, n)
+	}
+
+	// StatefulSet name is required when replicas > 1.
+	if n > 1 && cfg.StatefulSetName == "" {
+		return fmt.Errorf("%s: stateful set name is required when expected replicas exceeds 1", EnvStatefulSetName)
+	}
+
+	return nil
+}
+
+// splitPeers splits a comma-separated peer list, trimming whitespace.
+func splitPeers(s string) []string {
+	parts := strings.Split(s, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
 }

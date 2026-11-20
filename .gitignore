@@ -7,6 +7,9 @@ dist/
 *.test
 coverage.*
 
+# Local SQLite data (created by smoke tests and local runs)
+data/
+
 # goldmark-lint cache (written by `make docs-fix`; `docs-lint` uses --no-cache)
 .goldmark-lint-cache
 
