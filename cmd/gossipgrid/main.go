@@ -157,7 +157,12 @@ func run() (retErr error) {
 		if err := peerMgr.Start(ctx); err != nil {
 			return fmt.Errorf("starting peer TLS (initial credential load): %w", err)
 		}
-		peerSrv = peertls.NewPeerServer(peerMgr, cfg.PeerAddr, cfg.NodeID, Version)
+		// Milestone 4A: pass the local store and the opt-in flag so the
+		// private peer listener can register POST /internal/messages when
+		// the operator has explicitly enabled authenticated peer message
+		// exchange. When disabled (the default), only /internal/status is
+		// registered — no automatic replication before Milestone 5.
+		peerSrv = peertls.NewPeerServerWithStore(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled)
 	}
 
 	// Start listening in a goroutine so we can watch for OS signals on the
@@ -191,6 +196,7 @@ func run() (retErr error) {
 		logger.Info("peer mTLS enabled",
 			slog.String("addr", cfg.PeerAddr),
 			slog.String("identity_suffix", cfg.PeerIdentitySuffix),
+			slog.Bool("peer_message_exchange", cfg.PeerMessageExchangeEnabled),
 		)
 	}
 

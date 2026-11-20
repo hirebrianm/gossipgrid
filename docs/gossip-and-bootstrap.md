@@ -60,7 +60,32 @@ answered'.
 If no valid source can be found, do **not** silently initialize an empty epoch. Report `RECOVERY_REQUIRED` or a more
 specific waiting status.
 
-## Epidemic gossip
+## Authenticated peer message exchange (Milestone 4A — implemented)
+
+A provisional, opt-in, caller-initiated direct-exchange capability for authenticated GossipGrid replicas. When
+`GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED=true` (and peer mTLS is enabled), the private peer listener registers
+`POST /internal/messages`. A caller explicitly transfers an existing message to a specific peer over mTLS; the
+receiver validates the message (canonical UUIDv7, nonempty body/origin, valid timestamp, bounded size) and inserts it
+idempotently via the existing atomic `ON CONFLICT DO NOTHING` store operation.
+
+Key properties:
+
+- **Private endpoint.** The endpoint is registered only on the authenticated peer listener (port 8443, TLS 1.3, mTLS).
+  It is never registered on the public HTTP router.
+- **Identity.** The authenticated TLS client identity establishes who transmitted the message; the receiver does not
+  trust any HTTP header as proof of peer identity. The message's `origin` field is immutable metadata identifying
+  its original creator, which may differ from the forwarding peer. mTLS alone does not cryptographically prove the
+  historical origin of a forwarded message.
+- **Idempotency.** A new valid message is stored (200); an identical duplicate is a no-op (200); a duplicate ID with
+  conflicting content returns 409 without altering the original row.
+- **Opt-in.** Default is `false`. When disabled, the endpoint is not registered (404/405). Enabling it requires
+  `GOSSIPGRID_PEER_TLS_ENABLED=true`; otherwise configuration validation fails.
+- **No automatic replication.** This milestone does NOT implement automatic gossip fanout, bounded queues, retry
+  scheduling, anti-entropy, or readiness gating. `POST /api/messages` does not automatically replicate.
+- **No epoch management.** Cluster genesis, epoch management, and recovery lockout are reserved for Milestone 5. This
+  milestone is a provisional direct-exchange capability, not a complete safe cluster bootstrap protocol.
+
+## Epidemic gossip (Milestone 4B — pending)
 
 - On locally committed message, enqueue an event; replication is asynchronous.
 - Pick up to two random peers (fanout configurable) per round; peer selection rotates and excludes self.

@@ -89,14 +89,41 @@ unit tests plus a two-node integration test (all run under the FIPS build and th
   authorized (exactly one DNS SAN, correct suffix, StatefulSet name prefix, ordinal in range [0, ExpectedReplicas-1]);
   (e) both `serverAuth` and `clientAuth` EKUs are present; (f) the local certificate's pod identity matches the
   configured `GOSSIPGRID_NODE_ID`. A mismatched key/cert pair or a local cert signed by an untrusted CA fails startup.
-- **Private endpoint isolation.** `GET /internal/status` is served only on the peer listener (TLS 1.3, mTLS) and
-  requires a successful client-certificate handshake; it is not registered on the public HTTP router (verified by a
-  negative test). The production `ListenAndServe` entry point serves HTTPS only — plaintext HTTP is rejected.
+- **Private endpoint isolation.** `GET /internal/status` and (when enabled) `POST /internal/messages` are served only
+  on the peer listener (TLS 1.3, mTLS) and require a successful client-certificate handshake; they are not registered
+  on the public HTTP router (verified by negative tests). The production `ListenAndServe` entry point serves HTTPS
+  only — plaintext HTTP is rejected.
 - **FIPS.** The mTLS handshake (ECDSA P-256, SHA-256, TLS 1.3) is exercised by tests run under the FIPS-enabled build
   (`GOFIPS140=v1.0.0`, the default for `make test`/`make test-race`).
 - **Negative tests (27 scenarios):** the 20 scenarios above, plus: production listener serves HTTPS (not plaintext);
   manager lifecycle (failed Start, repeated Start, concurrent Shutdown); key/cert mismatch; local cert not signed by
   configured CA; certificate with IP SAN; out-of-range ordinal; NodeID mismatch.
+
+## Authenticated peer message exchange (Milestone 4A)
+
+When `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED=true` (and peer mTLS is enabled), the private peer listener registers
+`POST /internal/messages` for authenticated peer message exchange. Security properties, verified by 25 unit/negative
+tests plus a two-node integration test (all run under the FIPS build and the race detector):
+
+- **mTLS-only.** The endpoint is reachable only through the authenticated peer listener (TLS 1.3, mutual TLS,
+  dedicated workload CA trust, strict identity authorization). It is not registered on the public HTTP router.
+- **Identity authorization.** The sender must present a client certificate that passes the full GossipGrid identity
+  policy (exactly one DNS SAN, correct suffix, StatefulSet name prefix, ordinal in range, clientAuth EKU).
+- **No header-based identity.** The receiver does not accept a supplied HTTP header as proof of peer identity; the
+  authenticated TLS client identity is the sole basis for authorization.
+- **Bounded input.** The request body is bounded to 8192 bytes; the message body is bounded to 4096 bytes (the
+  store's limit). The JSON decoder enforces exactly one document, no unknown fields, and canonical UUIDv7.
+- **Idempotent, immutable insert.** The receiver uses the existing atomic `ON CONFLICT DO NOTHING` insert. A new
+  message is stored; an identical duplicate is a no-op; a conflicting duplicate returns 409 without overwriting the
+  original row. The original ID, body, origin, and timestamp are never regenerated or overwritten.
+- **Opt-in and mTLS-gated.** Default is `false`. When disabled, the endpoint is not registered. Enabling it requires
+  `GOSSIPGRID_PEER_TLS_ENABLED=true`; configuration validation fails otherwise. This prevents accidental
+  cross-epoch replication before Milestone 5 establishes the safe bootstrap protocol.
+- **No epoch claim.** This milestone does not establish cluster genesis, epoch management, or recovery lockout. It is
+  a provisional direct-exchange capability, not a complete safe cluster bootstrap protocol. Production
+  cluster-reset and epoch-isolation guarantees are not established until the lifecycle milestone.
+- **No automatic replication.** This milestone does not implement automatic gossip fanout, bounded queues, retry
+  scheduling, or anti-entropy. `POST /api/messages` does not automatically replicate.
 
 ## Go TLS handling (target design for the remainder)
 

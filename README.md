@@ -5,12 +5,13 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-> **Status: Milestone 3B implemented (November 2026).** A locally runnable single-instance Go service with configuration,
+> **Status: Milestone 4A implemented (November 2026).** A locally runnable single-instance Go service with configuration,
 > HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, peer discovery (static and
-> Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with certificate hot-reload**, structured logging,
-> graceful shutdown, a Makefile, a static `scratch` Docker image, GitLab CI, GitHub Actions, and tests. Gossip
-> replication, multi-node synchronization, and Kubernetes deployment are **not yet implemented** and remain planned
-> milestones. No application-level FIPS certification or production-readiness claims are made.
+> Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with certificate hot-reload**, **authenticated
+> peer message exchange (POST /internal/messages, opt-in)**, structured logging, graceful shutdown, a Makefile, a
+> static `scratch` Docker image, GitLab CI, GitHub Actions, and tests. Automatic gossip fanout, anti-entropy,
+> multi-node synchronization, and Kubernetes deployment are **not yet implemented** and remain planned milestones
+> (Milestones 4B, 4C, 5, and 7). No application-level FIPS certification or production-readiness claims are made.
 
 ## What it does (planned)
 
@@ -51,7 +52,8 @@ deliberate part of the testbed design.
 | Certificate and trust-bundle hot-reload without restart | ✅ |
 | Authenticated peer HTTP client (dial address vs expected identity) | ✅ |
 | Private `/internal/status` endpoint (mTLS-protected) | ✅ |
-| Gossip replication protocol | 🔜 Milestone 4 |
+| Authenticated peer message exchange (POST /internal/messages, opt-in) | ✅ |
+| Gossip replication protocol (automatic fanout, retries, anti-entropy) | 🔜 Milestone 4B/4C |
 | Bootstrap/sync lifecycle | 🔜 Milestone 5 |
 | Web UI and diagnostics | 🔜 Milestone 6 |
 | Kubernetes packaging (Helm) | 🔜 Milestone 7 |
@@ -169,10 +171,17 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_PEER_TRUST_BUNDLE_FILE` | (empty) | Path to the dedicated workload CA trust bundle (PEM) |
 | `GOSSIPGRID_PEER_IDENTITY_SUFFIX` | (empty) | DNS suffix following the pod name in the cert SAN (e.g. `gossipgrid-headless.default.svc.cluster.local`) |
 | `GOSSIPGRID_PEER_TLS_RELOAD_INTERVAL` | `2s` | Polling interval for credential file changes |
+| `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED` | `false` | Enable the private peer message exchange endpoint (POST /internal/messages). Requires peer mTLS |
 
 When `GOSSIPGRID_PEER_TLS_ENABLED` is `true`, all of the peer TLS file paths and the identity suffix are **required**; a
 missing or malformed value fails startup clearly (no silent fallback to unauthenticated communication). When it is
 `false` (the default), the peer listener is not started and local single-instance development is unchanged.
+
+When `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED` is `true`, the private peer listener additionally registers
+`POST /internal/messages`, accepting idempotent replicated message inserts from authenticated replicas. This is a
+provisional, opt-in, direct-exchange capability: it does **not** enable automatic gossip, fanout, anti-entropy, or
+readiness gating (those belong to Milestones 4B, 4C, and 5). It **requires** `GOSSIPGRID_PEER_TLS_ENABLED=true`;
+enabling it without peer mTLS fails configuration validation.
 
 ### Endpoints
 
@@ -271,6 +280,63 @@ GOFIPS140=v1.0.0 CGO_ENABLED=1 go test -tags sqlite_omit_load_extension -race -r
 ```
 
 No development certificates or private keys are committed: all test material is generated in memory per run.
+
+### Authenticated peer message exchange (Milestone 4A)
+
+When `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED=true` (and peer mTLS is enabled), the private peer listener registers:
+
+- `POST /internal/messages` — accepts an authenticated peer's message for idempotent replicated storage.
+
+**Wire contract.** The request body is a JSON envelope containing a complete message:
+
+```json
+{
+  "message": {
+    "id": "<uuidv7>",
+    "body": "Hello from gossipgrid-0",
+    "origin": "gossipgrid-0",
+    "created_at": "2026-11-20T12:34:56.789Z"
+  }
+}
+```
+
+The receiver preserves the original UUIDv7 ID, body, origin, and creation timestamp — it does **not** generate a new
+ID or timestamp during replication. Validation enforces:
+
+- Maximum request body size of 8192 bytes.
+- Maximum message body size of 4096 bytes (the store's limit).
+- Valid canonical UUIDv7 (lowercase, hyphenated).
+- Nonempty origin and message body.
+- Valid nonzero timestamp (RFC3339).
+- Exactly one JSON document; no unknown JSON fields.
+- Appropriate Content-Type handling (application/json).
+
+**Idempotency.** The receiver uses the existing atomic SQLite `ON CONFLICT DO NOTHING` insert:
+
+- New valid message: inserted successfully (HTTP 200).
+- Identical duplicate ID and content: success, no modification (HTTP 200).
+- Duplicate ID with conflicting content: HTTP 409 Conflict; the original row is never overwritten.
+- Invalid message: HTTP 400 or 413 as appropriate.
+- Storage failure: HTTP 500.
+
+**Security.** The authenticated TLS client identity establishes who transmitted a message; the receiver does **not**
+accept a supplied HTTP header as proof of peer identity. The message's `origin` field is immutable metadata
+identifying its original creator, which may differ from the forwarding peer. mTLS alone does **not**
+cryptographically prove the historical origin of a forwarded message.
+
+**Scope limitation.** This is a provisional, direct, caller-initiated exchange. It does **not** implement automatic
+gossip fanout, bounded queues, retry scheduling, anti-entropy, snapshot transfer, epoch management, or production
+cluster-reset and epoch-isolation guarantees (those belong to Milestones 4B, 4C, and 5). `POST /api/messages` does
+**not** automatically replicate in this milestone.
+
+**Local testing.** The `cmd/gossipgrid` package includes a repeatable integration test
+(`TestIntegrationTwoNodesMessageExchange`) that starts two GossipGrid nodes with distinct identities, SQLite
+databases, and loopback mTLS listeners, and demonstrates the full message-exchange flow including idempotency,
+conflict rejection, and unauthorized-peer rejection. Run it with:
+
+```sh
+GOFIPS140=v1.0.0 CGO_ENABLED=1 go test -tags sqlite_omit_load_extension -race -run TestIntegrationTwoNodesMessageExchange ./cmd/gossipgrid/
+```
 
 The Docker image is a multistage static build with a final `scratch` stage and a non-root user (UID 65534):
 

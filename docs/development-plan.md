@@ -13,7 +13,9 @@ continuing.
 | 2. Local storage | GORM/SQLite schema, local REST API, idempotent insert, tests | Message survives process restart with same data directory |
 | 3A. Peer discovery and membership (✅ 2026-11-19) | Static peer discovery, DNS SRV resolver, membership tracking, reconciliation, tests | Local peer addresses discoverable; DNS errors observable without crash; race-safe |
 | 3B. Peer mTLS (✅ 2026-11-19) | mTLS transport, cert hot reload, identity validation, private status endpoint, peer client | Negative TLS tests (20 scenarios); rotated certs/trust picked up by new connections; FIPS + race |
-| 4. Gossip | Fanout, bounded queues, duplicate suppression, retries, anti-entropy | Five independent local stores converge |
+| 4A. Authenticated peer message exchange (✅ 2026-11-20) | POST /internal/messages on private peer listener, idempotent insert, SendMessage client, opt-in flag, two-node integration test | Explicit authenticated transfer between two local stores; idempotent; conflicts rejected; unauthorized peers rejected |
+| 4B. Gossip fanout and retries | Epidemic fanout, bounded queues, duplicate suppression, retries | Five independent local stores converge |
+| 4C. Anti-entropy | Periodic inventory comparison, bounded ID sets, deterministic order | Converges after partition recovery |
 | 5. Lifecycle/bootstrap | Explicit state machine, initial snapshot, readiness, recovery lockout | Fresh process joins; unsynced pods never source snapshots |
 | 6. UI and diagnostics | HTML templates, current pod, message status, cert status, incidents | Accurate displayed state under network failures |
 | 7. Kubernetes packaging | Helm StatefulSet, Services, cert CSI, probes, Gateway resource integration | On-cluster smoke tests |

@@ -40,6 +40,13 @@ const (
 	EnvPeerTrustBundleFile   = "GOSSIPGRID_PEER_TRUST_BUNDLE_FILE"
 	EnvPeerIdentitySuffix    = "GOSSIPGRID_PEER_IDENTITY_SUFFIX"
 	EnvPeerTLSReloadInterval = "GOSSIPGRID_PEER_TLS_RELOAD_INTERVAL"
+
+	// Authenticated peer message exchange (Milestone 4A).
+	// When enabled, the private peer listener accepts POST /internal/messages
+	// from authenticated replicas. It requires peer mTLS to be enabled; it
+	// does NOT enable automatic gossip, fanout, anti-entropy, or readiness
+	// gating (those belong to Milestones 4B/4C/5).
+	EnvPeerMessageExchangeEnabled = "GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -70,6 +77,12 @@ type Config struct {
 	PeerTrustBundleFile   string
 	PeerIdentitySuffix    string
 	PeerTLSReloadInterval string
+
+	// Authenticated peer message exchange (Milestone 4A). When true, the
+	// private peer listener registers POST /internal/messages and accepts
+	// idempotent replicated message inserts from authenticated replicas.
+	// Requires PeerTLSEnabled to be true (validated).
+	PeerMessageExchangeEnabled bool
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -152,13 +165,27 @@ func load(lookup envFunc) (*Config, error) {
 	// When the enable flag is set, parse it strictly; an unrecognised value is
 	// an error (a typo must not silently disable a security feature).
 	if v, ok := lookup(EnvPeerTLSEnabled); ok {
-		b, perr := parseBoolEnv(v)
+		b, perr := parseBoolEnv(v, EnvPeerTLSEnabled)
 		if perr != nil {
 			errs = append(errs, perr)
 		}
 		cfg.PeerTLSEnabled = b
 	}
 	if err := validatePeerTLSConfig(cfg); err != nil {
+		errs = append(errs, err)
+	}
+
+	// Authenticated peer message exchange (Milestone 4A). Default false:
+	// when unset, the private peer listener does NOT register
+	// POST /internal/messages (no automatic replication before Milestone 5).
+	if v, ok := lookup(EnvPeerMessageExchangeEnabled); ok {
+		b, perr := parseBoolEnv(v, EnvPeerMessageExchangeEnabled)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.PeerMessageExchangeEnabled = b
+	}
+	if err := validatePeerMessageExchangeConfig(cfg); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -225,15 +252,15 @@ func validLogLevel(level string) bool {
 // parseBoolEnv parses a boolean environment variable. It accepts the common
 // true/false spellings case-insensitively and returns an error for anything
 // else so the operator notices a typo instead of silently disabling a
-// security feature.
-func parseBoolEnv(v string) (bool, error) {
+// security feature. The env name is supplied for the error message.
+func parseBoolEnv(v, envName string) (bool, error) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "true", "1", "yes", "on":
 		return true, nil
 	case "false", "0", "no", "off":
 		return false, nil
 	default:
-		return false, fmt.Errorf("%s: %q is not a valid boolean (want true or false)", EnvPeerTLSEnabled, v)
+		return false, fmt.Errorf("%s: %q is not a valid boolean (want true or false)", envName, v)
 	}
 }
 
@@ -291,6 +318,22 @@ func validatePeerTLSConfig(cfg *Config) error {
 	}
 	if reloadInterval <= 0 {
 		return fmt.Errorf("%s: %q must be a positive duration", EnvPeerTLSReloadInterval, cfg.PeerTLSReloadInterval)
+	}
+	return nil
+}
+
+// validatePeerMessageExchangeConfig checks the authenticated peer message
+// exchange flag (Milestone 4A). Message exchange is a provisional, opt-in
+// direct-exchange capability: it requires peer mTLS to be enabled (the private
+// peer listener is what enforces the mTLS identity that authorises each
+// inbound message). It does NOT enable automatic replication or readiness
+// gating; those belong to later milestones.
+func validatePeerMessageExchangeConfig(cfg *Config) error {
+	if !cfg.PeerMessageExchangeEnabled {
+		return nil
+	}
+	if !cfg.PeerTLSEnabled {
+		return fmt.Errorf("%s: peer message exchange requires peer mTLS to be enabled (%s=true)", EnvPeerMessageExchangeEnabled, EnvPeerTLSEnabled)
 	}
 	return nil
 }

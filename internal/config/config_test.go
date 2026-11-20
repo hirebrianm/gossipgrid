@@ -289,6 +289,79 @@ func TestPeerTLSDisabledDefaults(t *testing.T) {
 	if cfg.PeerTLSReloadInterval != "2s" {
 		t.Errorf("PeerTLSReloadInterval default = %q, want 2s", cfg.PeerTLSReloadInterval)
 	}
+	if cfg.PeerMessageExchangeEnabled {
+		t.Error("PeerMessageExchangeEnabled should default to false (Milestone 4A opt-in)")
+	}
+}
+
+// TestPeerMessageExchangeEnabledDefaults verifies the default for
+// GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED is false (no automatic replication
+// before Milestone 5).
+func TestPeerMessageExchangeEnabledDefaults(t *testing.T) {
+	cfg, err := load(env(nil))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.PeerMessageExchangeEnabled {
+		t.Error("PeerMessageExchangeEnabled should default to false")
+	}
+}
+
+// TestPeerMessageExchangeRequiresPeerTLS verifies that enabling message
+// exchange without peer mTLS fails configuration validation (Milestone 4A:
+// message exchange is only available over the authenticated peer listener).
+func TestPeerMessageExchangeRequiresPeerTLS(t *testing.T) {
+	_, err := load(env(map[string]string{
+		EnvPeerMessageExchangeEnabled: "true",
+		// PeerTLSEnabled is NOT set (defaults to false).
+	}))
+	if err == nil {
+		t.Fatal("expected error when message exchange enabled without peer mTLS, got nil")
+	}
+	if !contains(err.Error(), EnvPeerMessageExchangeEnabled) {
+		t.Errorf("error should mention %s: %v", EnvPeerMessageExchangeEnabled, err)
+	}
+}
+
+// TestPeerMessageExchangeValidWithPeerTLS verifies that enabling message
+// exchange WITH peer mTLS is accepted.
+func TestPeerMessageExchangeValidWithPeerTLS(t *testing.T) {
+	cfg, err := load(env(map[string]string{
+		EnvPeerTLSEnabled:             "true",
+		EnvPeerCertFile:               "/certs/tls.crt",
+		EnvPeerKeyFile:                "/certs/tls.key",
+		EnvPeerTrustBundleFile:        "/certs/ca-bundle.pem",
+		EnvPeerIdentitySuffix:         "gossipgrid-headless.default.svc.cluster.local",
+		EnvPeerMessageExchangeEnabled: "true",
+	}))
+	if err != nil {
+		t.Fatalf("expected valid config, got error: %v", err)
+	}
+	if !cfg.PeerMessageExchangeEnabled {
+		t.Error("PeerMessageExchangeEnabled should be true")
+	}
+	if !cfg.PeerTLSEnabled {
+		t.Error("PeerTLSEnabled should be true")
+	}
+}
+
+// TestPeerMessageExchangeInvalidBool verifies a malformed boolean value for
+// GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED is rejected.
+func TestPeerMessageExchangeInvalidBool(t *testing.T) {
+	_, err := load(env(map[string]string{
+		EnvPeerTLSEnabled:             "true",
+		EnvPeerCertFile:               "/certs/tls.crt",
+		EnvPeerKeyFile:                "/certs/tls.key",
+		EnvPeerTrustBundleFile:        "/certs/ca-bundle.pem",
+		EnvPeerIdentitySuffix:         "gossipgrid-headless.default.svc.cluster.local",
+		EnvPeerMessageExchangeEnabled: "tru", // typo
+	}))
+	if err == nil {
+		t.Fatal("expected error for invalid boolean, got nil")
+	}
+	if !contains(err.Error(), EnvPeerMessageExchangeEnabled) {
+		t.Errorf("error should mention %s: %v", EnvPeerMessageExchangeEnabled, err)
+	}
 }
 
 func TestLoadValidDiscovery(t *testing.T) {
