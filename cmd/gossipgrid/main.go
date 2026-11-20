@@ -24,6 +24,7 @@ import (
 
 	"gossipgrid/internal/config"
 	"gossipgrid/internal/discovery"
+	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/server"
 	"gossipgrid/internal/store"
 )
@@ -124,21 +125,54 @@ func run() (retErr error) {
 	// modes (no goroutine was started).
 	defer discMgr.Shutdown()
 
+	// Interrupt and terminate signals from the OS or a Kubernetes liveness
+	// probe. signal.NotifyContext cancels the parent context on first signal.
+	// This must be created before peer TLS Start (which needs the context to
+	// derive its reload-loop context) and before the listeners start.
+	ctx, stop := signal.NotifyContext(context.Background(),
+		syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	srv := server.NewServer(cfg.HTTPAddr, server.NewWithStore(server.Node{ID: cfg.NodeID}, st))
+
+	// Initialize the private peer mTLS transport (Milestone 3B). When peer TLS
+	// is enabled, load credentials and create the peer server. A credential
+	// load failure must fail startup clearly — no silent fallback to
+	// unauthenticated communication, and the public server must not be left
+	// running indefinitely.
+	var peerMgr *peertls.Manager
+	var peerSrv *peertls.PeerServer
+	if cfg.PeerTLSEnabled {
+		peerCfg, perr := buildPeerTLSConfig(cfg)
+		if perr != nil {
+			return fmt.Errorf("building peer TLS config: %w", perr)
+		}
+		peerMgr = peertls.New(peerCfg, logger)
+		// Defer the reload-worker shutdown on every exit path. Shutdown is
+		// idempotent and returns promptly.
+		defer peerMgr.Shutdown()
+		// Start loads credentials synchronously and starts the reload worker.
+		// This must happen before we start listening so a credential failure
+		// fails startup, not a late handshake.
+		if err := peerMgr.Start(ctx); err != nil {
+			return fmt.Errorf("starting peer TLS (initial credential load): %w", err)
+		}
+		peerSrv = peertls.NewPeerServer(peerMgr, cfg.PeerAddr, cfg.NodeID, Version)
+	}
 
 	// Start listening in a goroutine so we can watch for OS signals on the
 	// main goroutine. ListenAndServe returns nil when Shutdown has been called.
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
 		logger.Info("http listener starting", slog.String("addr", cfg.HTTPAddr))
 		errCh <- srv.ListenAndServe()
 	}()
-
-	// Interrupt and terminate signals from the OS or a Kubernetes liveness
-	// probe. signal.NotifyContext cancels the parent context on first signal.
-	ctx, stop := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	if peerSrv != nil {
+		go func() {
+			logger.Info("peer https listener starting", slog.String("addr", cfg.PeerAddr))
+			errCh <- peerSrv.ListenAndServe()
+		}()
+	}
 
 	// Start peer discovery. The context is cancelled on signal, which stops
 	// the DNS refresh loop. For off and static modes, Start is a no-op or a
@@ -153,13 +187,36 @@ func run() (retErr error) {
 		slog.Int("expected_replicas", discCfg.ExpectedReplicas),
 		slog.Bool("stale", snap.Stale),
 	)
+	if peerMgr != nil {
+		logger.Info("peer mTLS enabled",
+			slog.String("addr", cfg.PeerAddr),
+			slog.String("identity_suffix", cfg.PeerIdentitySuffix),
+		)
+	}
 
+	// Wait for a startup failure or a signal.
 	select {
 	case err := <-errCh:
-		// The server failed to start (e.g. address in use) before a signal
-		// was received.
+		// A listener failed to start (e.g. address in use) before a signal
+		// was received. Drain the other listener's error if it is already
+		// available (non-blocking) so we don't lose it, then shut down both.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("listener failed to start", slog.Any("error", err))
 			retErr = err
+		}
+		select {
+		case otherErr := <-errCh:
+			if otherErr != nil && !errors.Is(otherErr, http.ErrServerClosed) {
+				retErr = errors.Join(retErr, otherErr)
+			}
+		default:
+		}
+		// Shut down the other listener (it may have started or not).
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		if peerSrv != nil {
+			_ = peerSrv.Shutdown(shutdownCtx)
 		}
 	case <-ctx.Done():
 		logger.Info("shutdown initiated",
@@ -170,8 +227,18 @@ func run() (retErr error) {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("graceful shutdown failed", slog.Any("error", err))
+			logger.Error("graceful shutdown failed (public)", slog.Any("error", err))
 			retErr = err
+		}
+		if peerSrv != nil {
+			if err := peerSrv.Shutdown(shutdownCtx); err != nil {
+				logger.Error("graceful shutdown failed (peer)", slog.Any("error", err))
+				if retErr == nil {
+					retErr = err
+				} else {
+					retErr = errors.Join(retErr, err)
+				}
+			}
 		}
 		logger.Info("shutdown complete", slog.String("node", cfg.NodeID))
 	}
@@ -251,4 +318,39 @@ func splitTrimPeers(s string) []string {
 		}
 	}
 	return result
+}
+
+// buildPeerTLSConfig converts the validated environment configuration into the
+// peertls.Config struct, parsing the reload interval. It is only called when
+// peer TLS is enabled; the field presence and suffix syntax are already
+// validated by config.validatePeerTLSConfig at load time.
+func buildPeerTLSConfig(cfg *config.Config) (peertls.Config, error) {
+	var pc peertls.Config
+	pc.CertFile = cfg.PeerCertFile
+	pc.KeyFile = cfg.PeerKeyFile
+	pc.TrustBundleFile = cfg.PeerTrustBundleFile
+	pc.IdentitySuffix = cfg.PeerIdentitySuffix
+	// The StatefulSet name is shared with the discovery config (the same
+	// StatefulSet provides both peer discovery and the pod identity prefix).
+	pc.StatefulSetName = cfg.StatefulSetName
+	pc.NodeID = cfg.NodeID
+
+	n, err := strconv.Atoi(cfg.ExpectedReplicas)
+	if err != nil {
+		return pc, fmt.Errorf("expected replicas %q: %w", cfg.ExpectedReplicas, err)
+	}
+	pc.ExpectedReplicas = n
+
+	interval, err := time.ParseDuration(cfg.PeerTLSReloadInterval)
+	if err != nil {
+		return pc, fmt.Errorf("peer TLS reload interval %q: %w", cfg.PeerTLSReloadInterval, err)
+	}
+	pc.ReloadInterval = interval
+
+	// Enforce centralized validation before handing the config to the peer
+	// TLS manager.
+	if err := pc.Validate(); err != nil {
+		return pc, fmt.Errorf("peer TLS config validation: %w", err)
+	}
+	return pc, nil
 }

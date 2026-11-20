@@ -178,6 +178,119 @@ func TestLoadMultipleErrors(t *testing.T) {
 // TestLoadValidDiscovery verifies that valid discovery configurations are
 // accepted, including DNS mode with the headless Service name and static mode
 // with bracketed IPv6 addresses.
+func TestLoadValidPeerTLS(t *testing.T) {
+	cfg, err := load(env(map[string]string{
+		EnvPeerTLSEnabled:        "true",
+		EnvPeerAddr:              "127.0.0.1:8443",
+		EnvPeerCertFile:          "/certs/tls.crt",
+		EnvPeerKeyFile:           "/certs/tls.key",
+		EnvPeerTrustBundleFile:   "/certs/ca-bundle.pem",
+		EnvPeerIdentitySuffix:    "gossipgrid-headless.default.svc.cluster.local",
+		EnvPeerTLSReloadInterval: "5s",
+	}))
+	if err != nil {
+		t.Fatalf("expected valid peer TLS config, got error: %v", err)
+	}
+	if !cfg.PeerTLSEnabled {
+		t.Error("PeerTLSEnabled should be true")
+	}
+	if cfg.PeerAddr != "127.0.0.1:8443" {
+		t.Errorf("PeerAddr = %q, want 127.0.0.1:8443", cfg.PeerAddr)
+	}
+	if cfg.PeerIdentitySuffix != "gossipgrid-headless.default.svc.cluster.local" {
+		t.Errorf("PeerIdentitySuffix = %q, want full suffix", cfg.PeerIdentitySuffix)
+	}
+	if cfg.PeerTLSReloadInterval != "5s" {
+		t.Errorf("PeerTLSReloadInterval = %q, want 5s", cfg.PeerTLSReloadInterval)
+	}
+}
+
+func TestLoadInvalidPeerTLS(t *testing.T) {
+	cases := []struct {
+		name string
+		vars map[string]string
+	}{
+		{"enabled but missing cert file", map[string]string{
+			EnvPeerTLSEnabled:      "true",
+			EnvPeerKeyFile:         "/k",
+			EnvPeerTrustBundleFile: "/t",
+			EnvPeerIdentitySuffix:  "a.b.c",
+		}},
+		{"enabled but missing key file", map[string]string{
+			EnvPeerTLSEnabled:      "true",
+			EnvPeerCertFile:        "/c",
+			EnvPeerTrustBundleFile: "/t",
+			EnvPeerIdentitySuffix:  "a.b.c",
+		}},
+		{"enabled but missing trust bundle", map[string]string{
+			EnvPeerTLSEnabled:     "true",
+			EnvPeerCertFile:       "/c",
+			EnvPeerKeyFile:        "/k",
+			EnvPeerIdentitySuffix: "a.b.c",
+		}},
+		{"enabled but missing identity suffix", map[string]string{
+			EnvPeerTLSEnabled:      "true",
+			EnvPeerCertFile:        "/c",
+			EnvPeerKeyFile:         "/k",
+			EnvPeerTrustBundleFile: "/t",
+		}},
+		{"invalid identity suffix (single label)", map[string]string{
+			EnvPeerTLSEnabled:      "true",
+			EnvPeerCertFile:        "/c",
+			EnvPeerKeyFile:         "/k",
+			EnvPeerTrustBundleFile: "/t",
+			EnvPeerIdentitySuffix:  "gossipgrid-headless",
+		}},
+		{"invalid enable value (typo)", map[string]string{
+			EnvPeerTLSEnabled:      "tru",
+			EnvPeerCertFile:        "/c",
+			EnvPeerKeyFile:         "/k",
+			EnvPeerTrustBundleFile: "/t",
+			EnvPeerIdentitySuffix:  "a.b.c",
+		}},
+		{"invalid reload interval", map[string]string{
+			EnvPeerTLSEnabled:        "true",
+			EnvPeerCertFile:          "/c",
+			EnvPeerKeyFile:           "/k",
+			EnvPeerTrustBundleFile:   "/t",
+			EnvPeerIdentitySuffix:    "a.b.c",
+			EnvPeerTLSReloadInterval: "soon",
+		}},
+		{"non-positive reload interval", map[string]string{
+			EnvPeerTLSEnabled:        "true",
+			EnvPeerCertFile:          "/c",
+			EnvPeerKeyFile:           "/k",
+			EnvPeerTrustBundleFile:   "/t",
+			EnvPeerIdentitySuffix:    "a.b.c",
+			EnvPeerTLSReloadInterval: "0s",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := load(env(tc.vars))
+			if err == nil {
+				t.Fatalf("expected error for %s, got nil", tc.name)
+			}
+		})
+	}
+}
+
+func TestPeerTLSDisabledDefaults(t *testing.T) {
+	cfg, err := load(env(nil))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.PeerTLSEnabled {
+		t.Error("PeerTLSEnabled should default to false")
+	}
+	if cfg.PeerAddr != ":8443" {
+		t.Errorf("PeerAddr default = %q, want :8443", cfg.PeerAddr)
+	}
+	if cfg.PeerTLSReloadInterval != "2s" {
+		t.Errorf("PeerTLSReloadInterval default = %q, want 2s", cfg.PeerTLSReloadInterval)
+	}
+}
+
 func TestLoadValidDiscovery(t *testing.T) {
 	cases := []struct {
 		name string

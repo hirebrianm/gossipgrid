@@ -5,12 +5,12 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-> **Status: Milestone 3A implemented (November 2026).** A locally runnable single-instance Go service with configuration,
+> **Status: Milestone 3B implemented (November 2026).** A locally runnable single-instance Go service with configuration,
 > HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, peer discovery (static and
-> Kubernetes DNS SRV), structured logging, graceful shutdown, a Makefile, a static `scratch` Docker image, GitLab CI,
-> GitHub Actions, and tests. Gossip replication, peer mTLS, multi-node synchronization, and Kubernetes deployment are
-> **not yet implemented** and remain planned milestones. No application-level FIPS certification or
-> production-readiness claims are made.
+> Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with certificate hot-reload**, structured logging,
+> graceful shutdown, a Makefile, a static `scratch` Docker image, GitLab CI, GitHub Actions, and tests. Gossip
+> replication, multi-node synchronization, and Kubernetes deployment are **not yet implemented** and remain planned
+> milestones. No application-level FIPS certification or production-readiness claims are made.
 
 ## What it does (planned)
 
@@ -46,7 +46,11 @@ deliberate part of the testbed design.
 | Peer discovery (static mode) | ✅ |
 | Peer discovery (DNS SRV mode) | ✅ |
 | Membership tracking and reconciliation | ✅ |
-| Peer mTLS transport | 🔜 Milestone 3B |
+| Peer mTLS transport (private HTTPS listener) | ✅ |
+| Peer certificate identity authorization (SAN, EKU, StatefulSet name) | ✅ |
+| Certificate and trust-bundle hot-reload without restart | ✅ |
+| Authenticated peer HTTP client (dial address vs expected identity) | ✅ |
+| Private `/internal/status` endpoint (mTLS-protected) | ✅ |
 | Gossip replication protocol | 🔜 Milestone 4 |
 | Bootstrap/sync lifecycle | 🔜 Milestone 5 |
 | Web UI and diagnostics | 🔜 Milestone 6 |
@@ -158,6 +162,17 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_DISCOVERY_TIMEOUT` | `3s` | Per-lookup DNS timeout (dns mode) |
 | `GOSSIPGRID_EXPECTED_REPLICAS` | `1` | Configured cluster size (StatefulSet replicas) |
 | `GOSSIPGRID_STATEFULSET_NAME` | `gossipgrid` | StatefulSet name for deriving expected replica identities |
+| `GOSSIPGRID_PEER_TLS_ENABLED` | `false` | Enable the private peer mTLS listener |
+| `GOSSIPGRID_PEER_ADDR` | `:8443` | Private peer HTTPS listener address |
+| `GOSSIPGRID_PEER_CERT_FILE` | (empty) | Path to the mounted certificate chain (PEM) |
+| `GOSSIPGRID_PEER_KEY_FILE` | (empty) | Path to the mounted private key (PEM) |
+| `GOSSIPGRID_PEER_TRUST_BUNDLE_FILE` | (empty) | Path to the dedicated workload CA trust bundle (PEM) |
+| `GOSSIPGRID_PEER_IDENTITY_SUFFIX` | (empty) | DNS suffix following the pod name in the cert SAN (e.g. `gossipgrid-headless.default.svc.cluster.local`) |
+| `GOSSIPGRID_PEER_TLS_RELOAD_INTERVAL` | `2s` | Polling interval for credential file changes |
+
+When `GOSSIPGRID_PEER_TLS_ENABLED` is `true`, all of the peer TLS file paths and the identity suffix are **required**; a
+missing or malformed value fails startup clearly (no silent fallback to unauthenticated communication). When it is
+`false` (the default), the peer listener is not started and local single-instance development is unchanged.
 
 ### Endpoints
 
@@ -204,6 +219,58 @@ The headless Service must have a named TCP port called `peer` on port 8443 and
 `publishNotReadyAddresses: true`. No Kubernetes API permissions are required for peer discovery.
 DNS records are not proof that a peer is healthy, reachable, authenticated, synchronized, or ready to
 supply data; those properties are established by the mTLS and lifecycle implementations in later milestones.
+
+### Peer mTLS
+
+GossipGrid runs a **separate private HTTPS peer listener** (default `:8443`) in addition to the public HTTP listener
+(`:8080`). The peer listener:
+
+- enforces **TLS 1.3 only** (no 1.2 or lower);
+- **requires and verifies client certificates** (mutual TLS) signed by the dedicated workload CA trust bundle;
+- performs **additional peer identity authorization** after the standard TLS chain/hostname verification: the
+  certificate must have exactly one DNS SAN of the form `<statefulset-name>-<ordinal>.<identity-suffix>` with a
+  non-negative ordinal, and the correct Extended Key Usage (`clientAuth` for clients, `serverAuth` for servers);
+- rejects wildcard SANs, IP SANs, multiple SANs, and the Common Name (SAN-only validation).
+
+The **network dial address and the expected authenticated peer identity are distinct inputs**. A client may dial
+`127.0.0.1:8443` (a loopback address for local testing) while verifying a certificate for
+`gossipgrid-1.gossipgrid-headless.default.svc.cluster.local` (the in-cluster FQDN). This is the mechanism that lets the
+application be tested as independent local processes without Kubernetes.
+
+For this milestone the peer listener exposes a single private endpoint:
+
+- `GET /internal/status` — returns the authenticated server's node identity, application version, pod identity, and a
+  safe certificate fingerprint (no private key or PEM content). This endpoint is **not** exposed on the public HTTP
+  router and requires a successful client-certificate handshake.
+
+**Certificate identity convention.** Each replica's certificate DNS identity is
+`<replica>.<GOSSIPGRID_PEER_IDENTITY_SUFFIX>`, for example
+`gossipgrid-0.gossipgrid-headless.default.svc.cluster.local`. The cluster DNS domain is **not** hard-coded; the
+operator configures the full suffix. The same certificate is used for both the server and client roles, so it must
+carry both `serverAuth` and `clientAuth` Extended Key Usages.
+
+**Certificate rotation (hot-reload).** The application polls the certificate, key, and trust-bundle files at
+`GOSSIPGRID_PEER_TLS_RELOAD_INTERVAL` (default `2s`). On a successful reload the new credentials are published
+atomically and used for **new** handshakes without a process restart. A failed reload (malformed or missing file)
+preserves the previous valid configuration; it never exposes partially loaded credentials or replaces a valid trust
+bundle with malformed material. The trust bundle may contain multiple CAs during a CA transition. Existing
+established connections are not forcibly terminated during normal leaf-certificate rotation. Reload outcomes are
+reported through structured logs and the `Diagnostics` API (cert fingerprint, pod ID, load time, reload count — no
+secrets). This mirrors the cert-manager CSI + trust-manager rotation flow planned for the Kubernetes deployment.
+
+**Local testing.** The `cmd/gossipgrid` package includes a repeatable integration test
+(`TestIntegrationTwoNodesMTLS`) that starts two GossipGrid nodes with distinct identities, SQLite databases, and
+loopback mTLS listeners, and demonstrates: successful authenticated `GET /internal/status`, failure on a wrong
+expected peer identity, failure with an untrusted client certificate, and successful credential rotation without
+restart. Run it with:
+
+```sh
+make test-race
+# or just the integration test:
+GOFIPS140=v1.0.0 CGO_ENABLED=1 go test -tags sqlite_omit_load_extension -race -run TestIntegration ./cmd/gossipgrid/
+```
+
+No development certificates or private keys are committed: all test material is generated in memory per run.
 
 The Docker image is a multistage static build with a final `scratch` stage and a non-root user (UID 65534):
 

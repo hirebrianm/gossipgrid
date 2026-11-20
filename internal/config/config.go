@@ -31,6 +31,15 @@ const (
 	EnvDiscoveryTimeout    = "GOSSIPGRID_DISCOVERY_TIMEOUT"
 	EnvExpectedReplicas    = "GOSSIPGRID_EXPECTED_REPLICAS"
 	EnvStatefulSetName     = "GOSSIPGRID_STATEFULSET_NAME"
+
+	// Peer mTLS configuration (Milestone 3B).
+	EnvPeerTLSEnabled        = "GOSSIPGRID_PEER_TLS_ENABLED"
+	EnvPeerAddr              = "GOSSIPGRID_PEER_ADDR"
+	EnvPeerCertFile          = "GOSSIPGRID_PEER_CERT_FILE"
+	EnvPeerKeyFile           = "GOSSIPGRID_PEER_KEY_FILE"
+	EnvPeerTrustBundleFile   = "GOSSIPGRID_PEER_TRUST_BUNDLE_FILE"
+	EnvPeerIdentitySuffix    = "GOSSIPGRID_PEER_IDENTITY_SUFFIX"
+	EnvPeerTLSReloadInterval = "GOSSIPGRID_PEER_TLS_RELOAD_INTERVAL"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -50,6 +59,17 @@ type Config struct {
 	DiscoveryTimeout    string
 	ExpectedReplicas    string
 	StatefulSetName     string
+
+	// Peer mTLS configuration (Milestone 3B). The private peer listener is
+	// only started when PeerTLSEnabled is true; otherwise local single-instance
+	// development and observational discovery are unchanged.
+	PeerTLSEnabled        bool
+	PeerAddr              string
+	PeerCertFile          string
+	PeerKeyFile           string
+	PeerTrustBundleFile   string
+	PeerIdentitySuffix    string
+	PeerTLSReloadInterval string
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -119,6 +139,29 @@ func load(lookup envFunc) (*Config, error) {
 		errs = append(errs, err)
 	}
 
+	// Peer mTLS configuration (Milestone 3B).
+	cfg.PeerAddr = getEnv(lookup, EnvPeerAddr, ":8443")
+	if err := validateAddrWithVar(EnvPeerAddr, cfg.PeerAddr); err != nil {
+		errs = append(errs, err)
+	}
+	cfg.PeerCertFile = getEnv(lookup, EnvPeerCertFile, "")
+	cfg.PeerKeyFile = getEnv(lookup, EnvPeerKeyFile, "")
+	cfg.PeerTrustBundleFile = getEnv(lookup, EnvPeerTrustBundleFile, "")
+	cfg.PeerIdentitySuffix = strings.ToLower(strings.TrimSpace(getEnv(lookup, EnvPeerIdentitySuffix, "")))
+	cfg.PeerTLSReloadInterval = getEnv(lookup, EnvPeerTLSReloadInterval, "2s")
+	// When the enable flag is set, parse it strictly; an unrecognised value is
+	// an error (a typo must not silently disable a security feature).
+	if v, ok := lookup(EnvPeerTLSEnabled); ok {
+		b, perr := parseBoolEnv(v)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.PeerTLSEnabled = b
+	}
+	if err := validatePeerTLSConfig(cfg); err != nil {
+		errs = append(errs, err)
+	}
+
 	return cfg, errors.Join(errs...)
 }
 
@@ -177,6 +220,101 @@ func validLogLevel(level string) bool {
 	default:
 		return false
 	}
+}
+
+// parseBoolEnv parses a boolean environment variable. It accepts the common
+// true/false spellings case-insensitively and returns an error for anything
+// else so the operator notices a typo instead of silently disabling a
+// security feature.
+func parseBoolEnv(v string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "1", "yes", "on":
+		return true, nil
+	case "false", "0", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s: %q is not a valid boolean (want true or false)", EnvPeerTLSEnabled, v)
+	}
+}
+
+// validateAddrWithVar is validateAddr with a configurable env var name in the
+// error message (validateAddr hard-codes EnvHTTPAddr).
+func validateAddrWithVar(env, addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid listen address (want e.g. \":8443\"): %w", env, addr, err)
+	}
+	if port == "" {
+		return fmt.Errorf("%s: %q is missing a port", env, addr)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("%s: port %q is not a valid number: %w", env, addr, err)
+	}
+	if n < 1 || n > 65535 {
+		return fmt.Errorf("%s: port %d in %q is out of range (want 1-65535)", env, n, addr)
+	}
+	return nil
+}
+
+// validatePeerTLSConfig checks the peer mTLS fields. When peer TLS is disabled
+// the peer fields are ignored entirely (local single-instance development and
+// observational discovery are preserved). When enabled, the required file
+// paths, identity suffix, and reload interval must all be present and valid,
+// and the reload interval must be positive.
+func validatePeerTLSConfig(cfg *Config) error {
+	if !cfg.PeerTLSEnabled {
+		return nil
+	}
+	if cfg.PeerCertFile == "" {
+		return fmt.Errorf("%s: peer TLS is enabled but the certificate file path is empty", EnvPeerCertFile)
+	}
+	if cfg.PeerKeyFile == "" {
+		return fmt.Errorf("%s: peer TLS is enabled but the private key file path is empty", EnvPeerKeyFile)
+	}
+	if cfg.PeerTrustBundleFile == "" {
+		return fmt.Errorf("%s: peer TLS is enabled but the trust bundle file path is empty", EnvPeerTrustBundleFile)
+	}
+	if cfg.PeerIdentitySuffix == "" {
+		return fmt.Errorf("%s: peer TLS is enabled but the peer identity suffix is empty", EnvPeerIdentitySuffix)
+	}
+	// The identity suffix must be a non-empty DNS name with at least two
+	// labels (e.g. "gossipgrid-headless.default.svc" or
+	// "gossipgrid-headless.default.svc.cluster.local"). This prevents a
+	// malformed suffix from silently authorising every host.
+	if !isValidDNSSuffix(cfg.PeerIdentitySuffix) {
+		return fmt.Errorf("%s: %q is not a valid DNS suffix (want e.g. \"gossipgrid-headless.default.svc.cluster.local\")", EnvPeerIdentitySuffix, cfg.PeerIdentitySuffix)
+	}
+	reloadInterval, err := time.ParseDuration(cfg.PeerTLSReloadInterval)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid duration: %w", EnvPeerTLSReloadInterval, cfg.PeerTLSReloadInterval, err)
+	}
+	if reloadInterval <= 0 {
+		return fmt.Errorf("%s: %q must be a positive duration", EnvPeerTLSReloadInterval, cfg.PeerTLSReloadInterval)
+	}
+	return nil
+}
+
+// isValidDNSSuffix reports whether s is a syntactically plausible DNS name
+// with at least two dot-separated labels. It does not perform name resolution;
+// it only checks syntax so a malformed suffix is rejected at load time.
+func isValidDNSSuffix(s string) bool {
+	labels := strings.Split(s, ".")
+	if len(labels) < 2 {
+		return false
+	}
+	for _, l := range labels {
+		if l == "" || len(l) > 63 {
+			return false
+		}
+		for i := 0; i < len(l); i++ {
+			c := l[i]
+			if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // validatePeerAddr checks host:port syntax and the numeric port range
