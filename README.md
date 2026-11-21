@@ -5,14 +5,18 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-> **Status: Milestone 4B implemented (November 2026).** A locally runnable single-instance Go service with configuration,
-> HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, peer discovery (static and
-> Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with certificate hot-reload**, **authenticated
-> peer message exchange (POST /internal/messages, opt-in)**, **automatic epidemic gossip fanout with bounded queues,
-> exponential-backoff retries, and duplicate suppression (opt-in)**, structured logging, graceful shutdown, a Makefile,
-> a static `scratch` Docker image, GitLab CI, GitHub Actions, and tests. Anti-entropy, multi-node synchronization,
-> and Kubernetes deployment are **not yet implemented** and remain planned milestones
-> (Milestones 4C, 5, and 7). No application-level FIPS certification or production-readiness claims are made.
+> **Status: Milestones 4A, 4B, and 4C implemented (November 2026).** A locally runnable single-instance Go service with
+> configuration, HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, peer discovery
+> (static and Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with certificate hot-reload**
+> (Milestone 3B), **authenticated peer message exchange (POST /internal/messages, opt-in)** (Milestone 4A),
+> **automatic epidemic gossip fanout with bounded queues, exponential-backoff retries, and duplicate suppression
+> (opt-in)** (Milestone 4B), and **periodic anti-entropy synchronization with inventory comparison, keyset pagination,
+> and cursor progression (opt-in)** (Milestone 4C). Gossip and anti-entropy are implemented and operational in
+> standalone multi-process deployments. Structured logging, graceful shutdown, a Makefile, a static `scratch` Docker
+> image, GitLab CI, GitHub Actions, and tests are in place. Cluster genesis (the bootstrap/sync lifecycle), epoch
+> management, recovery safeguards, and Kubernetes deployment are **not yet implemented** and remain planned
+> milestones (Milestones 5, 6, 7, and 9). No application-level FIPS certification or production-readiness claims
+> are made.
 
 ## What it does (planned)
 
@@ -196,10 +200,11 @@ missing or malformed value fails startup clearly (no silent fallback to unauthen
 
 When `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED` is `true`, the private peer listener additionally registers
 `POST /internal/messages`, accepting idempotent replicated message inserts from authenticated replicas. This is a
-provisional, opt-in, direct-exchange capability: it does **not** enable anti-entropy or readiness gating
-(Milestones 4C and 5). It **requires** `GOSSIPGRID_PEER_TLS_ENABLED=true`; enabling it without peer mTLS fails
-configuration validation. Automatic epidemic gossip fanout is enabled separately via `GOSSIPGRID_GOSSIP_ENABLED`
-(Milestone 4B, implemented).
+provisional, opt-in, direct-exchange capability: it does **not** by itself enable readiness gating (Milestone 5). It
+**requires** `GOSSIPGRID_PEER_TLS_ENABLED=true`; enabling it without peer mTLS fails configuration validation.
+Automatic epidemic gossip fanout is enabled separately via `GOSSIPGRID_GOSSIP_ENABLED` (Milestone 4B, implemented).
+Periodic anti-entropy synchronization is enabled separately via `GOSSIPGRID_ANTI_ENTROPY_ENABLED` (Milestone 4C,
+implemented); it uses the message-exchange endpoint for inventory comparison and batched fetches.
 
 ### Endpoints
 
@@ -215,8 +220,9 @@ configuration validation. Automatic epidemic gossip fanout is enabled separately
 GossipGrid supports three discovery modes. Discovery is **observational**: a failed DNS
 lookup does not affect the public HTTP service's readiness. When gossip is enabled
 (`GOSSIPGRID_GOSSIP_ENABLED=true`), the discovery snapshot feeds the gossip engine's
-peer selector through the production bridge. Peer synchronization (anti-entropy,
-Milestone 4C) is not yet implemented.
+peer selector through the production bridge. When anti-entropy is enabled
+(`GOSSIPGRID_ANTI_ENTROPY_ENABLED=true`), the same snapshot feeds the anti-entropy
+synchronization worker's peer selection (Milestone 4C, implemented).
 
 | Mode | Use case | Behavior |
 | --- | --- | --- |
@@ -344,10 +350,12 @@ accept a supplied HTTP header as proof of peer identity. The message's `origin` 
 identifying its original creator, which may differ from the forwarding peer. mTLS alone does **not**
 cryptographically prove the historical origin of a forwarded message.
 
-**Scope limitation.** This is a provisional, direct, caller-initiated exchange. It does **not** implement automatic
-gossip fanout, bounded queues, retry scheduling, anti-entropy, snapshot transfer, epoch management, or production
-cluster-reset and epoch-isolation guarantees (those belong to Milestones 4B, 4C, and 5). `POST /api/messages` does
-**not** automatically replicate in this milestone.
+**Scope limitation.** This is a provisional, direct, caller-initiated exchange. It does **not** by itself implement
+automatic gossip fanout, bounded queues, retry scheduling, anti-entropy, snapshot transfer, epoch management, or
+production cluster-reset and epoch-isolation guarantees. Automatic gossip fanout and anti-entropy are implemented in
+Milestones 4B and 4C and build on this endpoint. `POST /api/messages` does **not** automatically replicate;
+replication is driven by the gossip engine (Milestone 4B) and anti-entropy worker (Milestone 4C), both of which are
+opt-in and require this endpoint plus peer mTLS.
 
 **Local testing.** The `cmd/gossipgrid` package includes a repeatable integration test
 (`TestIntegrationTwoNodesMessageExchange`) that starts two GossipGrid nodes with distinct identities, SQLite
