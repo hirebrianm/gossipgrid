@@ -25,8 +25,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 
 	"gossipgrid/internal/store"
 )
@@ -63,6 +66,29 @@ type PeerServer struct {
 // body itself.
 const maxPeerRequestBodyBytes = 8192
 
+// maxSyncRequestBodyBytes bounds the inbound request body for
+// POST /internal/sync/messages. A batch of up to 1024 IDs (36 bytes each in
+// canonical UUIDv7 form) plus JSON overhead requires roughly 40 KiB.
+// 64 KiB provides headroom while remaining finite.
+const maxSyncRequestBodyBytes = 64 * 1024
+
+// maxSyncPageSize is the strict maximum page size for the inventory endpoint.
+// It is enforced server-side regardless of the caller's limit parameter.
+const maxSyncPageSize = 1024
+
+// maxSyncFetchBatchSize is the strict maximum number of message records the
+// POST /internal/sync/messages endpoint will return in a single response.
+//
+// It is enforced server-side regardless of the number of IDs requested. It
+// must be compatible with the client's fetch-batch bound (both 8): a batch
+// of 8 records at the per-record wire-size bound (maxSyncMessageWireBytes =
+// 32768 = the absolute worst-case JSON-encoded body for a 4096-byte stored
+// body, plus the origin/ID/timestamp overhead) is 32768*8 = ~256 KiB,
+// within the client's 256 KiB response bound. The server bound prevents an
+// authenticated client from requesting a response that would force
+// uncontrolled allocations beyond the response limit.
+const maxSyncFetchBatchSize = 8
+
 // NewPeerServer builds a PeerServer with the given listen address, node
 // identity, and application version. The Manager must have been Started (its
 // credentials loaded) before calling ListenAndServe.
@@ -76,7 +102,7 @@ const maxPeerRequestBodyBytes = 8192
 // Timeouts are conservative: this is an internal endpoint with small payloads,
 // so slow connections are shed quickly.
 func NewPeerServer(mgr *Manager, addr, nodeID, version string) *PeerServer {
-	return newPeerServer(mgr, addr, nodeID, version, nil, false, nil)
+	return newPeerServer(mgr, addr, nodeID, version, nil, false, false, nil)
 }
 
 // NewPeerServerWithStore builds a PeerServer with the given listen address,
@@ -86,7 +112,7 @@ func NewPeerServer(mgr *Manager, addr, nodeID, version string) *PeerServer {
 // Milestone 4A authenticated peer message exchange. The enable flag is a
 // hard opt-in: when false, only /internal/status is served.
 func NewPeerServerWithStore(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool) *PeerServer {
-	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange, nil)
+	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange, false, nil)
 }
 
 // NewPeerServerWithStoreAndCallback is like NewPeerServerWithStore but also
@@ -95,11 +121,21 @@ func NewPeerServerWithStore(mgr *Manager, addr, nodeID, version string, s *store
 // sender's pod identity (extracted from the mTLS client certificate). It is
 // NOT called for duplicate no-ops or conflicts.
 func NewPeerServerWithStoreAndCallback(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
-	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange, onNewMessage)
+	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange, false, onNewMessage)
+}
+
+// NewPeerServerWithSync builds a PeerServer with the given listen address,
+// node identity, application version, local message store, and both the
+// message-exchange and anti-entropy sync flags. When enabledAntiEntropy is
+// true and a store is supplied, the private sync endpoints
+// (GET /internal/sync/ids and POST /internal/sync/messages) are additionally
+// registered on the private peer listener.
+func NewPeerServerWithSync(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
+	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange, enabledAntiEntropy, onNewMessage)
 }
 
 // newPeerServer is the shared builder for PeerServer variants.
-func newPeerServer(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
+func newPeerServer(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /internal/status", newStatusHandler(mgr, nodeID, version))
 
@@ -108,6 +144,13 @@ func newPeerServer(mgr *Manager, addr, nodeID, version string, s *store.Store, e
 	// supplied. When disabled, the endpoint is NOT registered at all.
 	if enabledMessageExchange && s != nil {
 		mux.HandleFunc("POST /internal/messages", newMessageExchangeHandler(mgr, s, onNewMessage))
+	}
+
+	// Milestone 4C: register the private anti-entropy sync endpoints only
+	// when (a) the anti-entropy flag is enabled AND (b) a store is supplied.
+	if enabledAntiEntropy && s != nil {
+		mux.HandleFunc("GET /internal/sync/ids", newSyncInventoryHandler(s))
+		mux.HandleFunc("POST /internal/sync/messages", newSyncFetchHandler(s))
 	}
 
 	return &PeerServer{
@@ -304,6 +347,8 @@ func newMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessage func(m
 				writePeerJSONError(w, http.StatusBadRequest, "invalid message: body must not be empty")
 			case errors.Is(err, store.ErrBodyTooLarge):
 				writePeerJSONError(w, http.StatusRequestEntityTooLarge, "invalid message: body exceeds 4096 bytes")
+			case errors.Is(err, store.ErrOriginTooLarge):
+				writePeerJSONError(w, http.StatusRequestEntityTooLarge, "invalid message: origin exceeds 253 bytes")
 			case errors.Is(err, store.ErrDuplicateIDConflict):
 				writePeerJSONError(w, http.StatusConflict, "message ID already exists with conflicting content")
 			default:
@@ -410,4 +455,183 @@ func extractSenderPodID(r *http.Request, mgr *Manager) string {
 		return san[:len(san)-len(suffix)-1]
 	}
 	return ""
+}
+
+// newSyncInventoryHandler returns the handler for GET /internal/sync/ids.
+// It is reached only after the mTLS handshake has succeeded. It accepts
+// optional query parameters: after (the exclusive cursor, a canonical UUIDv7)
+// and limit (the page size, 1-1024). It returns a bounded page of message IDs
+// in strict ascending order using keyset pagination.
+func newSyncInventoryHandler(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+
+		// Parse and validate the limit parameter.
+		limit := 128
+		if v := q.Get("limit"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 || n > maxSyncPageSize {
+				writePeerJSONError(w, http.StatusBadRequest, fmt.Sprintf("limit must be an integer between 1 and %d", maxSyncPageSize))
+				return
+			}
+			limit = n
+		}
+
+		// Parse and validate the after (cursor) parameter.
+		after := ""
+		if v := q.Get("after"); v != "" {
+			// Validate as canonical UUIDv7.
+			u, err := uuid.Parse(v)
+			if err != nil || u.Version() != 7 || u.String() != v {
+				writePeerJSONError(w, http.StatusBadRequest, "after must be a valid canonical UUIDv7 (lowercase, hyphenated)")
+				return
+			}
+			after = v
+		}
+
+		page, err := s.ListIDsAfter(r.Context(), after, limit)
+		if err != nil {
+			writePeerJSONError(w, http.StatusInternalServerError, "failed to list message IDs")
+			return
+		}
+
+		resp := InventoryPageResponse{
+			IDs:        page.IDs,
+			NextCursor: page.NextCursor,
+			HasMore:    page.HasMore,
+		}
+		if page.IDs == nil {
+			resp.IDs = []string{}
+		}
+		writePeerJSON(w, http.StatusOK, resp)
+	}
+}
+
+// newSyncFetchHandler returns the handler for POST /internal/sync/messages.
+// It is reached only after the mTLS handshake has succeeded. It accepts a JSON
+// body with a bounded "ids" array (canonical UUIDv7 values, no duplicates,
+// max 1024 entries) and returns the complete message records in ascending ID
+// order. If any requested ID is missing, an explicit error is returned
+// (partial results are not silently presented as complete).
+func newSyncFetchHandler(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Reject oversized bodies before reading.
+		if r.ContentLength > maxSyncRequestBodyBytes {
+			writePeerJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, maxSyncRequestBodyBytes)
+
+		// Validate Content-Type.
+		if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
+			writePeerJSONError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+			return
+		}
+
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+
+		var req fetchMessagesRequest
+		if err := dec.Decode(&req); err != nil {
+			var typeErr *json.UnmarshalTypeError
+			if errors.As(err, &typeErr) {
+				writePeerJSONError(w, http.StatusBadRequest, "invalid request: ids field has wrong type")
+				return
+			}
+			if errors.Is(err, io.EOF) {
+				writePeerJSONError(w, http.StatusBadRequest, "invalid request: empty body")
+				return
+			}
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writePeerJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			writePeerJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
+			return
+		}
+
+		// Reject multiple JSON values.
+		var extra any
+		if err := dec.Decode(&extra); err != io.EOF {
+			if err != nil {
+				var maxErr *http.MaxBytesError
+				if errors.As(err, &maxErr) {
+					writePeerJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
+					return
+				}
+			}
+			writePeerJSONError(w, http.StatusBadRequest, "invalid JSON: multiple values in request body")
+			return
+		}
+
+		// Validate the ID count.
+		if len(req.IDs) == 0 {
+			writePeerJSONError(w, http.StatusBadRequest, "ids must contain at least one entry")
+			return
+		}
+		// The strict maximum number of records returned in a single response.
+		// A request exceeding this is rejected even though the IDs are
+		// individually valid: it would produce a response that exceeds the
+		// client's response-size bound (and force uncontrolled server
+		// allocations). The caller (the anti-entropy engine) requests bounded
+		// batches, so this only rejects oversized requests.
+		if len(req.IDs) > maxSyncFetchBatchSize {
+			writePeerJSONError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("ids must not exceed %d entries per batch", maxSyncFetchBatchSize))
+			return
+		}
+
+		// Validate each ID as canonical UUIDv7 and check for duplicates.
+		seen := make(map[string]bool, len(req.IDs))
+		for _, id := range req.IDs {
+			u, err := uuid.Parse(id)
+			if err != nil || u.Version() != 7 || u.String() != id {
+				writePeerJSONError(w, http.StatusBadRequest, fmt.Sprintf("id %q is not a valid canonical UUIDv7", id))
+				return
+			}
+			if seen[id] {
+				writePeerJSONError(w, http.StatusBadRequest, fmt.Sprintf("duplicate id %q in request", id))
+				return
+			}
+			seen[id] = true
+		}
+
+		// Fetch the messages. The store returns an error listing missing IDs.
+		msgs, err := s.GetMessagesByIDs(r.Context(), req.IDs)
+		if err != nil {
+			// The error contains the list of missing IDs.
+			writePeerJSONError(w, http.StatusNotFound, err.Error())
+			return
+		}
+
+		// Build the response.
+		wireMsgs := make([]SyncMessageWire, len(msgs))
+		for i, m := range msgs {
+			wireMsgs[i] = SyncMessageWire{
+				ID:        m.ID,
+				Body:      m.Body,
+				Origin:    m.Origin,
+				CreatedAt: m.CreatedAt.UTC().Format(time.RFC3339Nano),
+			}
+		}
+		respBytes, err := json.Marshal(fetchMessagesResponse{Messages: wireMsgs})
+		if err != nil {
+			writePeerJSONError(w, http.StatusInternalServerError, "failed to encode sync response")
+			return
+		}
+		// Bound server response generation: a valid batch (bounded ID count
+		// and per-field length) must serialize within the client's response
+		// bound. A response that would exceed it is an explicit error rather
+		// than a truncated or uncontrolled allocation. This guards against a
+		// legacy or malformed oversized record that slipped past the field
+		// bounds (e.g. a body stored before the origin bound existed).
+		if len(respBytes) > maxSyncResponseBodyBytes {
+			writePeerJSONError(w, http.StatusInternalServerError, fmt.Sprintf("sync response exceeds maximum of %d bytes", maxSyncResponseBodyBytes))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		// The client may have disconnected; no useful recovery for a write error.
+		_, _ = w.Write(respBytes)
+	}
 }

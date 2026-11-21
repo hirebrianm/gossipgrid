@@ -59,6 +59,18 @@ const (
 	EnvGossipMaxAttempts   = "GOSSIPGRID_GOSSIP_MAX_ATTEMPTS"
 	EnvGossipRetryBase     = "GOSSIPGRID_GOSSIP_RETRY_BASE"
 	EnvGossipRetryMax      = "GOSSIPGRID_GOSSIP_RETRY_MAX"
+
+	// Anti-entropy (Milestone 4C). When enabled, replicas periodically
+	// compare bounded message ID inventories with authenticated peers and
+	// fetch missing records. Requires peer mTLS, peer message exchange,
+	// and static or DNS discovery. Gossip need not be enabled.
+	EnvAntiEntropyEnabled         = "GOSSIPGRID_ANTI_ENTROPY_ENABLED"
+	EnvAntiEntropyInterval        = "GOSSIPGRID_ANTI_ENTROPY_INTERVAL"
+	EnvAntiEntropyPageSize        = "GOSSIPGRID_ANTI_ENTROPY_PAGE_SIZE"
+	EnvAntiEntropyFetchBatchSize  = "GOSSIPGRID_ANTI_ENTROPY_FETCH_BATCH_SIZE"
+	EnvAntiEntropyMaxPagesPerPeer = "GOSSIPGRID_ANTI_ENTROPY_MAX_PAGES_PER_PEER"
+	EnvAntiEntropyWorkers         = "GOSSIPGRID_ANTI_ENTROPY_WORKERS"
+	EnvAntiEntropyRequestTimeout  = "GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -109,6 +121,19 @@ type Config struct {
 	GossipMaxAttempts   int
 	GossipRetryBase     time.Duration
 	GossipRetryMax      time.Duration
+
+	// Anti-entropy (Milestone 4C). When AntiEntropyEnabled is true, replicas
+	// periodically compare bounded message ID inventories with authenticated
+	// peers and fetch missing records. Requires PeerTLSEnabled,
+	// PeerMessageExchangeEnabled, and discovery mode static or dns.
+	// Gossip need not be enabled.
+	AntiEntropyEnabled         bool
+	AntiEntropyInterval        time.Duration
+	AntiEntropyPageSize        int
+	AntiEntropyFetchBatchSize  int
+	AntiEntropyMaxPagesPerPeer int
+	AntiEntropyWorkers         int
+	AntiEntropyRequestTimeout  time.Duration
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -262,6 +287,46 @@ func load(lookup envFunc) (*Config, error) {
 		}
 	}
 
+	// Anti-entropy (Milestone 4C). Default disabled: when unset, no periodic
+	// inventory comparison or fetch occurs.
+	if v, ok := lookup(EnvAntiEntropyEnabled); ok {
+		b, perr := parseBoolEnv(v, EnvAntiEntropyEnabled)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.AntiEntropyEnabled = b
+	}
+	if cfg.AntiEntropyEnabled {
+		var aerr error
+		cfg.AntiEntropyInterval, aerr = parseDurationEnv(lookup, EnvAntiEntropyInterval, 30*time.Second)
+		if aerr != nil {
+			errs = append(errs, aerr)
+		}
+		cfg.AntiEntropyPageSize, aerr = parseIntEnv(lookup, EnvAntiEntropyPageSize, 128)
+		if aerr != nil {
+			errs = append(errs, aerr)
+		}
+		cfg.AntiEntropyFetchBatchSize, aerr = parseIntEnv(lookup, EnvAntiEntropyFetchBatchSize, 8)
+		if aerr != nil {
+			errs = append(errs, aerr)
+		}
+		cfg.AntiEntropyMaxPagesPerPeer, aerr = parseIntEnv(lookup, EnvAntiEntropyMaxPagesPerPeer, 4)
+		if aerr != nil {
+			errs = append(errs, aerr)
+		}
+		cfg.AntiEntropyWorkers, aerr = parseIntEnv(lookup, EnvAntiEntropyWorkers, 2)
+		if aerr != nil {
+			errs = append(errs, aerr)
+		}
+		cfg.AntiEntropyRequestTimeout, aerr = parseDurationEnv(lookup, EnvAntiEntropyRequestTimeout, 5*time.Second)
+		if aerr != nil {
+			errs = append(errs, aerr)
+		}
+		if err := validateAntiEntropyConfig(cfg); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	return cfg, errors.Join(errs...)
 }
 
@@ -282,6 +347,32 @@ func parseIntEnvGossip(lookup envFunc, key string, fallback int) (int, error) {
 			return 0, fmt.Errorf("%s: %q is not a valid integer: %w", key, v, err)
 		}
 		return n, nil
+	}
+	return fallback, nil
+}
+
+// parseIntEnv reads an integer environment variable. Unset values use the
+// documented fallback; an explicitly supplied malformed value is an error.
+func parseIntEnv(lookup envFunc, key string, fallback int) (int, error) {
+	if v, ok := lookup(key); ok && v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %q is not a valid integer: %w", key, v, err)
+		}
+		return n, nil
+	}
+	return fallback, nil
+}
+
+// parseDurationEnv reads a duration environment variable. Unset values use the
+// documented fallback; an explicitly supplied malformed value is an error.
+func parseDurationEnv(lookup envFunc, key string, fallback time.Duration) (time.Duration, error) {
+	if v, ok := lookup(key); ok && v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %q is not a valid duration: %w", key, v, err)
+		}
+		return d, nil
 	}
 	return fallback, nil
 }
@@ -482,6 +573,70 @@ func validateGossipConfig(cfg *Config) error {
 	}
 	if cfg.GossipRetryMax < cfg.GossipRetryBase {
 		return fmt.Errorf("%s: gossip retry max (%v) must be >= retry base (%v)", EnvGossipRetryMax, cfg.GossipRetryMax, cfg.GossipRetryBase)
+	}
+	return nil
+}
+
+// validateAntiEntropyConfig checks the anti-entropy fields (Milestone 4C).
+// Anti-entropy is an opt-in feature: it requires peer mTLS, peer message
+// exchange, and a discovery mode that can produce peer addresses (static or
+// dns). Gossip need not be enabled. When enabled, all resource limits must
+// be within documented bounds.
+func validateAntiEntropyConfig(cfg *Config) error {
+	if !cfg.AntiEntropyEnabled {
+		return nil
+	}
+	// Anti-entropy requires peer mTLS (the transport for authenticated sync).
+	if !cfg.PeerTLSEnabled {
+		return fmt.Errorf("%s: anti-entropy requires peer mTLS to be enabled (%s=true)", EnvAntiEntropyEnabled, EnvPeerTLSEnabled)
+	}
+	// Anti-entropy requires peer message exchange (the endpoint that provides
+	// the inventory and fetch operations).
+	if !cfg.PeerMessageExchangeEnabled {
+		return fmt.Errorf("%s: anti-entropy requires peer message exchange to be enabled (%s=true)", EnvAntiEntropyEnabled, EnvPeerMessageExchangeEnabled)
+	}
+	// Anti-entropy requires a discovery mode that produces peer addresses.
+	if cfg.DiscoveryMode != "static" && cfg.DiscoveryMode != "dns" {
+		return fmt.Errorf("%s: anti-entropy requires discovery mode static or dns (got %q)", EnvAntiEntropyEnabled, cfg.DiscoveryMode)
+	}
+	// Resource bounds (documented in docs/gossip-and-bootstrap.md).
+	if cfg.AntiEntropyInterval <= 0 {
+		return fmt.Errorf("%s: anti-entropy interval must be a positive duration (got %v)", EnvAntiEntropyInterval, cfg.AntiEntropyInterval)
+	}
+	if cfg.AntiEntropyInterval < 1*time.Second {
+		return fmt.Errorf("%s: anti-entropy interval must be at least 1s (got %v)", EnvAntiEntropyInterval, cfg.AntiEntropyInterval)
+	}
+	if cfg.AntiEntropyInterval > 10*time.Minute {
+		return fmt.Errorf("%s: anti-entropy interval must be at most 10m (got %v)", EnvAntiEntropyInterval, cfg.AntiEntropyInterval)
+	}
+	if cfg.AntiEntropyPageSize < 1 || cfg.AntiEntropyPageSize > 1024 {
+		return fmt.Errorf("%s: anti-entropy page size must be between 1 and 1024 (got %d)", EnvAntiEntropyPageSize, cfg.AntiEntropyPageSize)
+	}
+	// Fetch batch size is bounded to 8: a batch of 8 records at the
+	// per-record wire-size bound (32768 = the absolute worst-case
+	// JSON-encoded body for a 4096-byte stored body, plus the origin/ID/
+	// timestamp overhead) produces ~256 KiB of JSON, within the client's
+	// 256 KiB response bound. The peer server enforces the same 8-record
+	// bound server-side. Larger batches risk exceeding the response-size
+	// limit and are rejected.
+	if cfg.AntiEntropyFetchBatchSize < 1 || cfg.AntiEntropyFetchBatchSize > 8 {
+		return fmt.Errorf("%s: anti-entropy fetch batch size must be between 1 and 8 (got %d); larger batches may exceed the 256 KiB response bound", EnvAntiEntropyFetchBatchSize, cfg.AntiEntropyFetchBatchSize)
+	}
+	// Fetch batch must not exceed page size (a batch is a subset of a page).
+	if cfg.AntiEntropyFetchBatchSize > cfg.AntiEntropyPageSize {
+		return fmt.Errorf("%s: fetch batch size (%d) must not exceed page size (%d)", EnvAntiEntropyFetchBatchSize, cfg.AntiEntropyFetchBatchSize, cfg.AntiEntropyPageSize)
+	}
+	if cfg.AntiEntropyMaxPagesPerPeer < 1 || cfg.AntiEntropyMaxPagesPerPeer > 64 {
+		return fmt.Errorf("%s: anti-entropy max pages per peer must be between 1 and 64 (got %d)", EnvAntiEntropyMaxPagesPerPeer, cfg.AntiEntropyMaxPagesPerPeer)
+	}
+	if cfg.AntiEntropyWorkers < 1 || cfg.AntiEntropyWorkers > 16 {
+		return fmt.Errorf("%s: anti-entropy workers must be between 1 and 16 (got %d)", EnvAntiEntropyWorkers, cfg.AntiEntropyWorkers)
+	}
+	if cfg.AntiEntropyRequestTimeout <= 0 {
+		return fmt.Errorf("%s: anti-entropy request timeout must be a positive duration (got %v)", EnvAntiEntropyRequestTimeout, cfg.AntiEntropyRequestTimeout)
+	}
+	if cfg.AntiEntropyRequestTimeout > 60*time.Second {
+		return fmt.Errorf("%s: anti-entropy request timeout must be at most 60s (got %v)", EnvAntiEntropyRequestTimeout, cfg.AntiEntropyRequestTimeout)
 	}
 	return nil
 }

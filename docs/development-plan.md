@@ -15,7 +15,7 @@ continuing.
 | 3B. Peer mTLS (✅ 2026-11-19) | mTLS transport, cert hot reload, identity validation, private status endpoint, peer client | Negative TLS tests (20 scenarios); rotated certs/trust picked up by new connections; FIPS + race |
 | 4A. Authenticated peer message exchange (✅ 2026-11-20) | POST /internal/messages on private peer listener, idempotent insert, SendMessage client, opt-in flag, two-node integration test | Explicit authenticated transfer between two local stores; idempotent; conflicts rejected; unauthorized peers rejected |
 | 4B. Gossip fanout and retries (✅ 2026-11-20) | Epidemic fanout, bounded queues, duplicate suppression, exponential-backoff retries, five-node integration test | Five independent local stores converge under controlled healthy conditions; no unbounded forwarding loops |
-| 4C. Anti-entropy | Periodic inventory comparison, bounded ID sets, deterministic order | Converges after partition recovery |
+| 4C. Anti-entropy (✅ 2026-11-20) | Periodic inventory comparison, bounded ID sets, keyset pagination, cursor progression, five-node integration test | Converges after partition recovery; no unbounded forwarding loops |
 | 5. Lifecycle/bootstrap | Explicit state machine, initial snapshot, readiness, recovery lockout | Fresh process joins; unsynced pods never source snapshots |
 | 6. UI and diagnostics | HTML templates, current pod, message status, cert status, incidents | Accurate displayed state under network failures |
 | 7. Kubernetes packaging | Helm StatefulSet, Services, cert CSI, probes, Gateway resource integration | On-cluster smoke tests |

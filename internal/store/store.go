@@ -6,6 +6,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -19,7 +20,24 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+// maxMessageBodyBytes bounds the stored message body. It is the wire-size
+// bound for the body field in sync (anti-entropy) responses: the body is a
+// single JSON string, so its serialized length is the stored length plus JSON
+// escaping overhead.
 const maxMessageBodyBytes = 4096
+
+// maxMessageOriginBytes bounds the stored message origin.
+//
+// The origin is a variable-size field (set from the local node ID at
+// creation) with no prior length limit, so it is now bounded to a finite
+// value that mirrors the DNS name length cap (253) the node identity already
+// obeys. It is part of the sync response size contract: a batch of
+// maximum-size records (4096-byte body + 253-byte origin) must serialize to
+// JSON within the sync client's response bound, and this bound is what makes
+// that worst case finite and provable. The value is shared with the peer
+// sync client (peertls.maxMessageOriginBytes), which enforces the same bound
+// when validating sync responses.
+const maxMessageOriginBytes = 253
 
 var (
 	// ErrNilMessage is returned when a nil message pointer is submitted.
@@ -40,6 +58,10 @@ var (
 
 	// ErrBodyTooLarge is returned when a message body exceeds 4096 bytes.
 	ErrBodyTooLarge = errors.New("message body exceeds 4096 bytes")
+
+	// ErrOriginTooLarge is returned when a message origin exceeds the
+	// maximum origin length (253 bytes).
+	ErrOriginTooLarge = errors.New("message origin exceeds 253 bytes")
 
 	// ErrDuplicateIDConflict is returned when a duplicate ID is inserted with
 	// conflicting content (different body, origin, or timestamp).
@@ -125,6 +147,9 @@ func validateMessage(msg *Message) error {
 	}
 	if msg.Origin == "" {
 		return ErrEmptyOrigin
+	}
+	if len([]byte(msg.Origin)) > maxMessageOriginBytes {
+		return ErrOriginTooLarge
 	}
 	if msg.CreatedAt.IsZero() {
 		return ErrMissingTimestamp
@@ -270,6 +295,160 @@ func (s *Store) List(limit, offset int) ([]Message, int64, error) {
 		return nil, 0, err
 	}
 	return msgs, total, nil
+}
+
+// InventoryPage is a bounded page of message IDs from the keyset inventory
+// scan. IDs are in strict ascending order with no duplicates.
+type InventoryPage struct {
+	// IDs is the ascending slice of message IDs in this page.
+	IDs []string
+	// NextCursor is the last ID in this page, to be passed as the cursor for
+	// the next request. Empty on the final page (HasMore == false).
+	NextCursor string
+	// HasMore is true when additional records exist beyond this page.
+	HasMore bool
+}
+
+// ListIDsAfter returns a bounded page of message IDs using keyset pagination:
+//
+//	SELECT id FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?+1
+//
+// after is the exclusive cursor (empty string for the first page). limit is
+// the maximum number of IDs to return. The method uses the primary-key index
+// and does not scan or sort the entire table in application memory. It
+// returns at most limit IDs (plus a HasMore indicator) and a NextCursor that
+// identifies the last actual ID in the page.
+//
+// The query is cancellable through context.
+func (s *Store) ListIDsAfter(ctx context.Context, after string, limit int) (*InventoryPage, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("page limit must be at least 1 (got %d)", limit)
+	}
+
+	query := s.db.WithContext(ctx).Model(&Message{}).Order("id ASC").Limit(limit + 1)
+	if after != "" {
+		query = query.Where("id > ?", after)
+	}
+
+	var ids []string
+	if err := query.Pluck("id", &ids).Error; err != nil {
+		return nil, fmt.Errorf("listing message IDs: %w", err)
+	}
+
+	page := &InventoryPage{IDs: ids}
+	if len(ids) > limit {
+		page.HasMore = true
+		page.IDs = ids[:limit]
+		page.NextCursor = ids[limit-1]
+	} else {
+		// Final page: HasMore is false and NextCursor is empty. The
+		// client resets its local cursor to detect a completed sweep.
+		page.HasMore = false
+	}
+	return page, nil
+}
+
+// FindMissingIDs returns which of the supplied IDs are absent from the local
+// store. It validates each ID as a canonical UUIDv7 and performs a bounded
+// query (no full table scan). The returned slice contains only IDs that do
+// not exist locally, in the same order as supplied.
+//
+// The query is cancellable through context.
+func (s *Store) FindMissingIDs(ctx context.Context, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	// Validate all IDs first (rejects non-UUIDv7 values that could be
+	// injection vectors or indicate a protocol defect).
+	for _, id := range ids {
+		if err := validateCanonicalUUIDv7(id); err != nil {
+			return nil, err
+		}
+	}
+
+	var existing []string
+	if err := s.db.WithContext(ctx).Model(&Message{}).Where("id IN ?", ids).Pluck("id", &existing).Error; err != nil {
+		return nil, fmt.Errorf("checking existing message IDs: %w", err)
+	}
+
+	existingSet := make(map[string]bool, len(existing))
+	for _, id := range existing {
+		existingSet[id] = true
+	}
+
+	var missing []string
+	for _, id := range ids {
+		if !existingSet[id] {
+			missing = append(missing, id)
+		}
+	}
+	return missing, nil
+}
+
+// GetMessagesByIDs retrieves complete message records for the supplied IDs.
+// It validates each ID as a canonical UUIDv7 and returns the found messages
+// in deterministic ID-ascending order. If any supplied ID is not found, the
+// method returns the found messages plus an error listing the missing IDs
+// (the caller decides whether partial results are acceptable).
+//
+// The query is cancellable through context.
+func (s *Store) GetMessagesByIDs(ctx context.Context, ids []string) ([]*Message, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	for _, id := range ids {
+		if err := validateCanonicalUUIDv7(id); err != nil {
+			return nil, err
+		}
+	}
+
+	// Use the primary-key index for a bounded lookup.
+	query := s.db.WithContext(ctx).Where("id IN ?", ids)
+	var msgs []Message
+	if err := query.Order("id ASC").Find(&msgs).Error; err != nil {
+		return nil, fmt.Errorf("fetching messages by ID: %w", err)
+	}
+
+	// Determine which requested IDs are missing.
+	found := make(map[string]bool, len(msgs))
+	for i := range msgs {
+		found[msgs[i].ID] = true
+	}
+	var missing []string
+	for _, id := range ids {
+		if !found[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) > 0 {
+		result := make([]*Message, len(msgs))
+		for i := range msgs {
+			result[i] = &msgs[i]
+		}
+		return result, fmt.Errorf("message IDs not found: %v", missing)
+	}
+
+	result := make([]*Message, len(msgs))
+	for i := range msgs {
+		result[i] = &msgs[i]
+	}
+	return result, nil
+}
+
+// validateCanonicalUUIDv7 checks that s is a valid canonical UUIDv7 in
+// lowercase hyphenated form.
+func validateCanonicalUUIDv7(s string) error {
+	u, err := uuid.Parse(s)
+	if err != nil {
+		return ErrInvalidID
+	}
+	if u.Version() != 7 {
+		return ErrInvalidID
+	}
+	if u.String() != s {
+		return ErrInvalidID
+	}
+	return nil
 }
 
 // DB returns the underlying *gorm.DB for testing.

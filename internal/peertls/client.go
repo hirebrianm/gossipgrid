@@ -34,12 +34,39 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // maxResponseBodyBytes bounds the response body read from a peer (for
 // meaningful error reporting on non-success responses). Message responses
 // are small; 8 KiB is generous without risking unbounded memory.
 const maxResponseBodyBytes = 8192
+
+// maxSyncResponseBodyBytes bounds the response body for anti-entropy sync
+// requests. 256 KiB provides headroom over the worst-case valid batch while
+// remaining finite. The worst case is 8 records at the per-record wire-size
+// bound (maxSyncMessageWireBytes = 32768 = the absolute worst-case JSON-encoded
+// body for a 4096-byte stored body, plus the origin/ID/timestamp overhead),
+// i.e. ~256 KiB; see the fetch-batch bounds.
+const maxSyncResponseBodyBytes = 256 * 1024
+
+// maxMessageOriginBytes bounds the origin field of a message in a sync
+// response. It mirrors the store's origin bound (store.maxMessageOriginBytes,
+// 253) and is enforced when validating sync fetch responses so a legacy or
+// malformed oversized origin fails explicitly rather than producing a
+// response that exceeds maxSyncResponseBodyBytes.
+const maxMessageOriginBytes = 253
+
+// maxSyncMessageWireBytes is the absolute worst-case JSON-encoded size of a
+// single message record in a sync fetch response. A stored body of at most
+// 4096 bytes (store.maxMessageBodyBytes) can serialize to up to 24576 bytes
+// when every byte is escaped as a 6-byte \uXXXX sequence (e.g. "<" →
+// \u003c). The origin (253 stored bytes) can expand to ~3000 bytes when
+// escaped. Adding the fixed per-record overhead (ID, timestamp, field names,
+// JSON punctuation) gives ~32768 bytes as the conservative per-record bound.
+// A batch of 8 such records is ~256 KiB, within the response limit.
+const maxSyncMessageWireBytes = 32768
 
 // PeerHTTPStatusError is returned by Client.SendMessage (and GetStatus) when a
 // peer responds with a non-success HTTP status. The exact status code is
@@ -169,13 +196,14 @@ func buildClient(tlsCfg *tls.Config) *http.Client {
 }
 
 // doRequest performs an authenticated request against a private peer endpoint.
-// It is the shared plumbing for GetStatus and SendMessage.
+// It is the shared plumbing for GetStatus, SendMessage, FetchInventoryPage,
+// and FetchMessages.
 //
 // method is the HTTP method (GET or POST). body is the request body (nil for
 // GET). The caller supplies the exact expected peer identity; the TLS layer
 // verifies the server presents a certificate whose single DNS SAN exactly
-// matches expectedIdentity.
-func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expectedIdentity string, body []byte) ([]byte, int, error) {
+// matches expectedIdentity. responseLimit bounds the response body read.
+func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expectedIdentity string, body []byte, responseLimit int64) ([]byte, int, error) {
 	tlsCfg, err := c.mgr.TLSConfigForClient(dialAddr, expectedIdentity)
 	if err != nil {
 		return nil, 0, fmt.Errorf("building peer TLS client config: %w", err)
@@ -216,9 +244,16 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 		client.Transport.(*http.Transport).CloseIdleConnections()
 	}()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
+	// Read the response body bounded to responseLimit. If the body exceeds
+	// the limit, detect it explicitly rather than silently accepting
+	// truncated JSON.
+	lr := io.LimitReader(resp.Body, responseLimit+1)
+	respBody, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("reading peer response body: %w", err)
+	}
+	if int64(len(respBody)) > responseLimit {
+		return nil, resp.StatusCode, fmt.Errorf("peer response exceeds maximum of %d bytes", responseLimit)
 	}
 	return respBody, resp.StatusCode, nil
 }
@@ -235,7 +270,7 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 // match expectedIdentity all cause the handshake to fail and this method to
 // return an error.
 func (c *Client) GetStatus(ctx context.Context, dialAddr, expectedIdentity string) (*peerStatusResponse, error) {
-	respBody, status, err := c.doRequest(ctx, http.MethodGet, "/internal/status", dialAddr, expectedIdentity, nil)
+	respBody, status, err := c.doRequest(ctx, http.MethodGet, "/internal/status", dialAddr, expectedIdentity, nil, maxResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +316,7 @@ func (c *Client) SendMessage(ctx context.Context, dialAddr, expectedIdentity str
 	if err != nil {
 		return nil, fmt.Errorf("encoding send request: %w", err)
 	}
-	respBody, status, err := c.doRequest(ctx, http.MethodPost, "/internal/messages", dialAddr, expectedIdentity, body)
+	respBody, status, err := c.doRequest(ctx, http.MethodPost, "/internal/messages", dialAddr, expectedIdentity, body, maxResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -312,6 +347,218 @@ func (c *Client) SendMessage(ctx context.Context, dialAddr, expectedIdentity str
 		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("acknowledged a mismatched message timestamp: %v", err)}
 	}
 	return ack, nil
+}
+
+// InventoryPageResponse is the JSON response from GET /internal/sync/ids.
+// It carries a bounded page of message IDs in strict ascending order, the
+// cursor for the next page, and a has_more indicator.
+//
+// NextCursor semantics:
+//   - When HasMore is true: NextCursor equals the last ID in this page and
+//     is the exclusive cursor to pass as after for the next request.
+//   - When HasMore is false: NextCursor must be empty (the final page carries
+//     no further cursor). The caller resets its local cursor to empty to
+//     detect a completed full sweep.
+type InventoryPageResponse struct {
+	IDs        []string `json:"ids"`
+	NextCursor string   `json:"next_cursor"`
+	HasMore    bool     `json:"has_more"`
+}
+
+// SyncMessageWire is the wire form of a message in a sync fetch response.
+// It mirrors the store.Message JSON contract.
+type SyncMessageWire struct {
+	ID        string `json:"id"`
+	Body      string `json:"body"`
+	Origin    string `json:"origin"`
+	CreatedAt string `json:"created_at"`
+}
+
+// fetchMessagesRequest is the JSON request for POST /internal/sync/messages.
+type fetchMessagesRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// fetchMessagesResponse is the JSON response for POST /internal/sync/messages.
+type fetchMessagesResponse struct {
+	Messages []SyncMessageWire `json:"messages"`
+}
+
+// FetchInventoryPage requests a bounded page of message IDs from a specific
+// expected peer over mTLS. The after parameter is the exclusive cursor
+// (empty string for the first page). The limit is the maximum page size.
+//
+// The response is validated:
+//   - The page must not exceed limit entries;
+//   - Every ID must be a canonical UUIDv7;
+//   - IDs must be in strict ascending order with no duplicates;
+//   - Every returned ID must be greater than the requested after cursor;
+//   - When HasMore is true: the ID list must be non-empty, and NextCursor
+//     must equal the last ID in the page and be greater than after;
+//   - When HasMore is false: NextCursor must be empty (the final page
+//     carries no further cursor; the caller resets its local cursor to
+//     empty so that a full sweep is detected);
+//   - An empty ID list is only valid when HasMore is false (the peer has
+//     no more records).
+//
+// All protocol violations return a typed *PeerAckError; no panic occurs
+// regardless of response shape.
+func (c *Client) FetchInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int) (*InventoryPageResponse, error) {
+	path := fmt.Sprintf("/internal/sync/ids?limit=%d", limit)
+	if after != "" {
+		path += "&after=" + after
+	}
+	respBody, status, err := c.doRequest(ctx, http.MethodGet, path, dialAddr, expectedIdentity, nil, maxSyncResponseBodyBytes)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
+	}
+	var out InventoryPageResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("decoding inventory page response: %v", err)}
+	}
+
+	// Enforce the requested page limit.
+	if len(out.IDs) > limit {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("inventory page has %d IDs, exceeding limit %d", len(out.IDs), limit)}
+	}
+
+	// has_more=true with an empty ID list is a protocol contradiction: the
+	// peer claims there are more records but returned none to continue from.
+	if out.HasMore && len(out.IDs) == 0 {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: "has_more is true but the ID list is empty"}
+	}
+
+	// Validate every returned ID as canonical UUIDv7, enforce strict
+	// ascending order, no duplicates, and that all IDs advance past the
+	// requested cursor.
+	for i, id := range out.IDs {
+		if err := validateCanonicalUUIDv7(id); err != nil {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("ID at position %d: %v", i, err)}
+		}
+		if i > 0 && id <= out.IDs[i-1] {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("inventory IDs not in strict ascending order at position %d: %q <= %q", i, id, out.IDs[i-1])}
+		}
+		if after != "" && id <= after {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("ID %q at position %d does not advance past the supplied after %q", id, i, after)}
+		}
+	}
+
+	// Validate next_cursor semantics.
+	if out.HasMore {
+		if out.NextCursor == "" {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: "has_more is true but next_cursor is empty"}
+		}
+		if err := validateCanonicalUUIDv7(out.NextCursor); err != nil {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("next_cursor: %v", err)}
+		}
+		if out.NextCursor != out.IDs[len(out.IDs)-1] {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("next_cursor %q does not match last ID %q", out.NextCursor, out.IDs[len(out.IDs)-1])}
+		}
+		if after != "" && out.NextCursor <= after {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("next_cursor %q does not advance past the supplied after %q", out.NextCursor, after)}
+		}
+	} else {
+		// Final page: next_cursor must be empty. The caller resets its
+		// local cursor to empty to detect a completed full sweep.
+		if out.NextCursor != "" {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("has_more is false but next_cursor is %q (must be empty on the final page)", out.NextCursor)}
+		}
+	}
+
+	return &out, nil
+}
+
+// FetchMessages requests a bounded set of complete message records by ID from
+// a specific expected peer over mTLS. The IDs must be validated as canonical
+// UUIDv7 before the call (the server enforces this too).
+//
+// The response is validated:
+//   - The number of returned messages must exactly match the number of
+//     requested IDs (no extra unsolicited records, no missing records);
+//   - Messages must be in deterministic ID-ascending order;
+//   - Each message ID must match one of the requested IDs;
+//   - Timestamps must be valid RFC3339.
+func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string) ([]SyncMessageWire, error) {
+	body, err := json.Marshal(fetchMessagesRequest{IDs: ids})
+	if err != nil {
+		return nil, fmt.Errorf("encoding fetch request: %w", err)
+	}
+	respBody, status, err := c.doRequest(ctx, http.MethodPost, "/internal/sync/messages", dialAddr, expectedIdentity, body, maxSyncResponseBodyBytes)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
+	}
+	var out fetchMessagesResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("decoding fetch response: %v", err)}
+	}
+	// The response must contain exactly the requested number of messages.
+	if len(out.Messages) != len(ids) {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("expected %d messages but received %d", len(ids), len(out.Messages))}
+	}
+	// Validate: messages must be in ascending order, each ID must be a
+	// requested ID, and no duplicates.
+	requested := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		requested[id] = true
+	}
+	for i := 1; i < len(out.Messages); i++ {
+		if out.Messages[i].ID <= out.Messages[i-1].ID {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("fetched messages not in ascending order at position %d", i)}
+		}
+	}
+	for i, m := range out.Messages {
+		if !requested[m.ID] {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("unsolicited message ID %q at position %d", m.ID, i)}
+		}
+		if err := validateCanonicalUUIDv7(m.ID); err != nil {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("message ID %q at position %d: %v", m.ID, i, err)}
+		}
+		if m.CreatedAt == "" {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("message %q has empty timestamp", m.ID)}
+		}
+		if _, err := parseRFC3339(m.CreatedAt); err != nil {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("message %q has malformed timestamp %q: %v", m.ID, m.CreatedAt, err)}
+		}
+		// Enforce the per-record wire-size contract. A legacy or malformed
+		// record with an oversized origin or body would otherwise serialize
+		// to a response exceeding maxSyncResponseBodyBytes and be rejected by
+		// doRequest; rejecting it here gives a precise, explicit error and
+		// guarantees the response stays within the response bound. The
+		// encoded size is measured with json.Marshal (the same encoder the
+		// server uses), so it is the true serialized size of the record in a
+		// sync response. The 253-byte origin limit and 4096-byte body limit
+		// guarantee that every valid record fits within the per-record
+		// wire-size bound; an oversized legacy record is rejected explicitly.
+		if len(m.Origin) > maxMessageOriginBytes {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("message %q has an origin of %d bytes, exceeding the maximum of %d", m.ID, len(m.Origin), maxMessageOriginBytes)}
+		}
+		if encoded, err := json.Marshal(m); err == nil && len(encoded) > maxSyncMessageWireBytes {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("message %q serializes to %d bytes, exceeding the per-record wire-size maximum of %d", m.ID, len(encoded), maxSyncMessageWireBytes)}
+		}
+	}
+	return out.Messages, nil
+}
+
+// validateCanonicalUUIDv7 checks that s is a valid canonical UUIDv7 in
+// lowercase hyphenated form.
+func validateCanonicalUUIDv7(s string) error {
+	u, err := uuid.Parse(s)
+	if err != nil {
+		return fmt.Errorf("%q is not a valid UUID", s)
+	}
+	if u.Version() != 7 {
+		return fmt.Errorf("%q is not a UUIDv7 (version %d)", s, u.Version())
+	}
+	if u.String() != s {
+		return fmt.Errorf("%q is not in canonical UUIDv7 form", s)
+	}
+	return nil
 }
 
 // verifyAcknowledgedTimestamp parses the submitted and acknowledged creation

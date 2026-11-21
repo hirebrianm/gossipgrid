@@ -55,7 +55,7 @@ deliberate part of the testbed design.
 | Private `/internal/status` endpoint (mTLS-protected) | ✅ |
 | Authenticated peer message exchange (POST /internal/messages, opt-in) | ✅ |
 | Epidemic gossip (automatic fanout, bounded queues, retries, duplicate suppression) | ✅ |
-| Anti-entropy (periodic inventory comparison, snapshot sync) | 🔜 Milestone 4C |
+| Anti-entropy (periodic inventory comparison, keyset pagination, cursor progression) | ✅ |
 | Bootstrap/sync lifecycle | 🔜 Milestone 5 |
 | Web UI and diagnostics | 🔜 Milestone 6 |
 | Kubernetes packaging (Helm) | 🔜 Milestone 7 |
@@ -182,6 +182,13 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_GOSSIP_MAX_ATTEMPTS` | `3` | Total delivery attempts per peer, including initial (range 1-10) |
 | `GOSSIPGRID_GOSSIP_RETRY_BASE` | `250ms` | Base duration for exponential backoff (must be positive) |
 | `GOSSIPGRID_GOSSIP_RETRY_MAX` | `5s` | Maximum backoff duration (must be >= retry base) |
+| `GOSSIPGRID_ANTI_ENTROPY_ENABLED` | `false` | Enable periodic anti-entropy reconciliation (Milestone 4C). Requires peer mTLS, message exchange, and static or dns discovery |
+| `GOSSIPGRID_ANTI_ENTROPY_INTERVAL` | `30s` | Synchronization cycle period (range 1s–10m) |
+| `GOSSIPGRID_ANTI_ENTROPY_PAGE_SIZE` | `128` | Maximum IDs per inventory page (range 1–1024) |
+| `GOSSIPGRID_ANTI_ENTROPY_FETCH_BATCH_SIZE` | `12` | Maximum messages fetched per batch (range 1–12, ≤ page size) |
+| `GOSSIPGRID_ANTI_ENTROPY_MAX_PAGES_PER_PEER` | `4` | Maximum inventory pages per peer per cycle (range 1–64) |
+| `GOSSIPGRID_ANTI_ENTROPY_WORKERS` | `2` | Concurrent synchronization workers (range 1–16) |
+| `GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT` | `5s` | Per-request timeout for sync HTTP calls (range 1ms–60s) |
 
 When `GOSSIPGRID_PEER_TLS_ENABLED` is `true`, all of the peer TLS file paths and the identity suffix are **required**; a
 missing or malformed value fails startup clearly (no silent fallback to unauthenticated communication). When it is

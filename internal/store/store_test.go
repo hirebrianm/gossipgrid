@@ -97,6 +97,24 @@ func TestCreateLocalMessageValidation(t *testing.T) {
 	if err != nil {
 		t.Errorf("4096-byte body: err = %v, want nil", err)
 	}
+
+	// Origin exceeding 253 bytes.
+	_, err = st.CreateLocalMessage(strings.Repeat("o", 254), "hello")
+	if !errors.Is(err, ErrOriginTooLarge) {
+		t.Errorf("oversized origin: err = %v, want ErrOriginTooLarge", err)
+	}
+
+	// Exactly 253-byte origin should succeed.
+	_, err = st.CreateLocalMessage(strings.Repeat("o", 253), "hello")
+	if err != nil {
+		t.Errorf("253-byte origin: err = %v, want nil", err)
+	}
+
+	// A valid 4090-backslash body (a valid public POST) is accepted.
+	_, err = st.CreateLocalMessage("node-0", strings.Repeat("\\", 4090))
+	if err != nil {
+		t.Errorf("4090-backslash body: err = %v, want nil", err)
+	}
 }
 
 func TestDuplicateInsertIdempotent(t *testing.T) {

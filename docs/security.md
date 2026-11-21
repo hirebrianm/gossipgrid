@@ -125,6 +125,36 @@ tests plus a two-node integration test (all run under the FIPS build and the rac
 - **No automatic replication.** This milestone does not implement automatic gossip fanout, bounded queues, retry
   scheduling, or anti-entropy. `POST /api/messages` does not automatically replicate.
 
+## Anti-entropy sync endpoints (Milestone 4C)
+
+When `GOSSIPGRID_ANTI_ENTROPY_ENABLED=true` (and peer mTLS and peer message exchange are enabled), the private peer
+listener additionally registers `GET /internal/sync/ids` and `POST /internal/sync/messages`. Security properties:
+
+- **mTLS-only.** Both endpoints are reachable only through the authenticated peer listener (TLS 1.3, mutual TLS,
+  dedicated workload CA trust, strict identity authorization). They are not registered on the public HTTP router.
+- **No header-based identity.** The authenticated TLS client identity is the sole basis for authorization.
+- **Bounded input (inventory).** The page limit is clamped to 1–1024 server-side. The cursor must be a valid
+  canonical UUIDv7. Responses are bounded to 256 KiB (detected explicitly; truncated JSON is rejected).
+- **Bounded input (fetch).** The request body is bounded to 64 KiB. The ID array is bounded to 12 entries per
+  batch (the maximum that keeps a fully-populated response within the 256 KiB response limit given the
+  per-record wire-size bound of 20480 bytes and the 253-byte origin bound). Each ID must be a valid canonical
+  UUIDv7. Duplicate IDs are rejected. Multiple JSON documents are rejected. Unknown fields are rejected.
+  The server additionally validates that the marshalled response does not exceed the 256 KiB bound before
+  writing; oversized responses (e.g. from legacy records with bodies beyond the current 4096-byte store limit)
+  return an explicit 500 error and are never written.
+- **No silent partial results.** If any requested ID is missing on the server, the response is 404 with the list
+  of missing IDs. Partial results are never presented as complete.
+- **Idempotent, immutable insert.** Fetched records are inserted via the existing atomic `ON CONFLICT DO NOTHING`
+  path. Conflicting content never overwrites the local row.
+- **Response validation (client-side).** The client validates: strict ascending ID order, no duplicates, correct
+  cursor semantics, exact count match (no extra/missing records), valid timestamps. Malformed responses are
+  rejected; no record is inserted from a protocol-defect response.
+- **Opt-in and mTLS-gated.** Default is `false`. Enabling requires peer mTLS, peer message exchange, and static or
+  DNS discovery. Gossip need not be enabled.
+- **No epoch claim.** A previously authorized replica carrying old-epoch data could reintroduce it until Milestone 5
+  is implemented. This milestone is periodic reconciliation within the current provisional trust model, not a
+  complete safe cluster bootstrap protocol.
+
 ## Go TLS handling (target design for the remainder)
 
 - Peer client: verify server name, chain, approved identity; bound timeouts and connections (implemented; see above).

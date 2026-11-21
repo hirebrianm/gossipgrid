@@ -162,15 +162,64 @@ Key properties:
   fanout/rounds budget is exhausted before a reachable peer is selected. Milestone 4C
   anti-entropy is required for full convergence guarantees.
 
-## Anti-entropy
+## Anti-entropy (Milestone 4C — implemented 2026-11-20)
 
-Periodically compare bounded inventories of immutable message IDs with one or more peers, fetching records absent
-locally. For a small learning application, paginated ID sets and deterministic order are acceptable; a future
-milestone may add Merkle-tree or digest optimizations. Missing a gossip round must not permanently lose a replicated
-message if a live source remains.
+Periodic, PULL-based reconciliation: each replica periodically compares bounded message ID inventories with
+authenticated peers and retrieves records missing locally. Because every participating replica pulls from others,
+information moves in both directions without a separate push-based implementation.
 
-Possible edge cases to test: posts during snapshot; two pods posting concurrently; dropped gossip request; pod restart
-with old `emptyDir` data; replaced pod with new `emptyDir`; partitions, reconnect, and scale-up.
+- **Protocol.** For each eligible peer (from discovery, excluding self, respecting stale DNS), the engine:
+  1. Fetches a bounded inventory page of message IDs (keyset pagination: `WHERE id > ? ORDER BY id ASC LIMIT ?+1`).
+  2. Determines which IDs are missing locally (bounded `WHERE id IN ?` query).
+  3. Fetches missing records in bounded batches via `POST /internal/sync/messages`.
+  4. Inserts each using the existing atomic `ON CONFLICT DO NOTHING` store path.
+  5. Advances the per-peer cursor only after the page is fully processed.
+  6. Repeats until the per-cycle page budget (`MaxPagesPerPeer`) is exhausted.
+- **Cursor progression.** Per-peer in-memory cursors resume across cycles. When a full sweep completes
+  (`has_more=false`), the cursor resets to the beginning so later-inserted lower-sorting IDs are eventually
+  found. In-memory cursors reset on process restart; correctness does not depend on their persistence.
+- **Bounded resources.** Page size (default 128, max 1024), fetch batch size (default 12, max 12),
+  max pages per peer per cycle (default 4, max 64), worker count (default 2, max 16), request timeout
+  (default 5s, max 60s). No unbounded goroutines, timers, or memory allocations.
+- **Conflict handling.** A fetched message whose ID exists locally with different immutable fields is never
+  overwritten. The conflict is recorded via a counter and structured warning; the engine continues processing
+  other IDs in the same page. An ID-only inventory cannot detect different contents for an ID that already
+  exists on both nodes (no content digests in this milestone).
+- **Independence.** Anti-entropy operates independently from the gossip queue and retry scheduler. It can
+  repair data even when epidemic gossip is disabled. A duplicate anti-entropy insert does NOT trigger a new
+  gossip propagation event (the callback is only invoked for the message-exchange endpoint, not the sync
+  fetch endpoint).
+- **Opt-in.** Default is `false`. Enabling requires peer mTLS, peer message exchange, and static or DNS
+  discovery. Gossip need not be enabled.
+- **Configuration:**
+  - GOSSIPGRID_ANTI_ENTROPY_ENABLED (default false)
+  - GOSSIPGRID_ANTI_ENTROPY_INTERVAL (default 30s, range 1s–10m)
+  - GOSSIPGRID_ANTI_ENTROPY_PAGE_SIZE (default 128, range 1–1024)
+  - GOSSIPGRID_ANTI_ENTROPY_FETCH_BATCH_SIZE (default 12, range 1–12, ≤ page size)
+  - GOSSIPGRID_ANTI_ENTROPY_MAX_PAGES_PER_PEER (default 4, range 1–64)
+  - GOSSIPGRID_ANTI_ENTROPY_WORKERS (default 2, range 1–16)
+  - GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT (default 5s, range 1ms–60s)
+- **Private endpoints (Milestone 4C).** Registered only on the authenticated peer listener when anti-entropy
+  is enabled:
+  - `GET /internal/sync/ids?after=<optional-uuidv7>&limit=<1-1024>` — returns a bounded page of IDs in
+    ascending order, `next_cursor`, and `has_more`.
+  - `POST /internal/sync/messages` — accepts `{"ids":[...]}` (bounded count, canonical UUIDv7, no duplicates)
+    and returns complete message records in ascending ID order. Missing IDs return 404 (no silent partial results).
+- **Response limits.** Sync requests use a 256 KiB response limit (vs. 8 KiB for status/single-message);
+  oversized responses are rejected explicitly. The per-record wire-size bound is 20480 bytes (a 4096-byte
+  message body that escapes 5× in JSON, plus origin, ID, and timestamp overhead). The origin field is
+  bounded to 253 bytes (the DNS name cap). The fetch batch limit of 12 ensures that 12 records at the
+  per-record bound (12 × 20480 = 245,760 bytes) stay within the 256 KiB response limit. Both the client
+  and the server enforce these bounds: the client rejects oversized individual records and the server
+  rejects oversized responses before writing.
+- **Five-node integration test.** Five independent replicas with separate SQLite DBs, distinct workload
+  certificates, real mTLS, static discovery, and the production peer client. Scenarios: repair gossip misses
+  (node down → recovery), replica replacement (convergence on identical message sets), concurrent writers,
+  pagination stress (cursor advances across multiple cycles), recovery and isolation (disconnect → verify
+  responsiveness → reconnect → repair). All nodes shut down cleanly; repeated Stop is safe.
+- **Limitations.** ID-only inventory cannot detect same-ID content divergence. No Merkle trees or content
+  digests in this milestone. A previously authorized replica carrying old-epoch data could reintroduce it
+  until Milestone 5 is implemented. In-memory cursors reset on process restart.
 
 ## Proposed API behavior (not final wire contract)
 

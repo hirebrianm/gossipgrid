@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"gossipgrid/internal/antientropy"
 	"gossipgrid/internal/config"
 	"gossipgrid/internal/discovery"
 	"gossipgrid/internal/gossip"
@@ -211,7 +212,15 @@ func run() (retErr error) {
 				})
 			}
 		}
-		if onNewMsg != nil {
+		// Milestone 4C: when anti-entropy is enabled, use the sync-aware
+		// constructor which also registers the private sync endpoints.
+		if cfg.AntiEntropyEnabled {
+			if onNewMsg != nil {
+				peerSrv = peertls.NewPeerServerWithSync(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, onNewMsg)
+			} else {
+				peerSrv = peertls.NewPeerServerWithSync(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, nil)
+			}
+		} else if onNewMsg != nil {
 			peerSrv = peertls.NewPeerServerWithStoreAndCallback(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, onNewMsg)
 		} else {
 			peerSrv = peertls.NewPeerServerWithStore(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled)
@@ -297,6 +306,70 @@ func run() (retErr error) {
 			slog.Int("workers", cfg.GossipWorkers),
 			slog.Int("queue_capacity", cfg.GossipQueueCapacity),
 			slog.Int("max_attempts", cfg.GossipMaxAttempts),
+		)
+	}
+
+	// Milestone 4C: when anti-entropy is enabled, build and start the
+	// anti-entropy engine. It operates independently from the gossip engine
+	// and can run with gossip disabled.
+	if cfg.AntiEntropyEnabled && peerMgr != nil {
+		aEngine := buildAntiEntropyEngine(cfg, logger)
+		if aEngine == nil {
+			return fmt.Errorf("anti-entropy engine initialization failed (see logs)")
+		}
+		// Defer anti-entropy engine shutdown.
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+			aEngine.Stop(shutdownCtx)
+		}()
+
+		peerClient := peertls.NewClient(peerMgr)
+		aEngine.SetInventoryClient(peerClient)
+		aEngine.SetMessageFetcher(peerClient)
+		aEngine.SetLocalStore(st)
+		// Set the peer source to bridge discovery.Snapshot into
+		// antientropy.PeerSourceSnapshot (avoiding a circular import).
+		aEngine.SetPeerSource(antientropy.NewDiscoveryPeerSource(cfg.PeerIdentitySuffix, func() antientropy.PeerSourceSnapshot {
+			ds := discMgr.Snapshot()
+			peers := make([]antientropy.PeerSourceInfo, len(ds.Peers))
+			for i, p := range ds.Peers {
+				peers[i] = antientropy.PeerSourceInfo{
+					Hostname:    p.Hostname,
+					PodIdentity: p.PodIdentity,
+					Address:     p.Address,
+				}
+			}
+			var localNode *antientropy.PeerSourceInfo
+			if ds.LocalNode != nil {
+				localNode = &antientropy.PeerSourceInfo{
+					Hostname:    ds.LocalNode.Hostname,
+					PodIdentity: ds.LocalNode.PodIdentity,
+					Address:     ds.LocalNode.Address,
+				}
+			}
+			expected := make([]string, len(ds.ExpectedIdentities))
+			for i, id := range ds.ExpectedIdentities {
+				expected[i] = id.Hostname
+			}
+			return antientropy.PeerSourceSnapshot{
+				Peers:              peers,
+				LocalNode:          localNode,
+				ExpectedIdentities: expected,
+				Stale:              ds.Stale,
+				Mode:               string(ds.Mode),
+			}
+		}))
+		if err := aEngine.Start(ctx); err != nil {
+			return fmt.Errorf("starting anti-entropy engine: %w", err)
+		}
+		logger.Info("anti-entropy engine started",
+			slog.Duration("interval", cfg.AntiEntropyInterval),
+			slog.Int("page_size", cfg.AntiEntropyPageSize),
+			slog.Int("fetch_batch_size", cfg.AntiEntropyFetchBatchSize),
+			slog.Int("max_pages_per_peer", cfg.AntiEntropyMaxPagesPerPeer),
+			slog.Int("workers", cfg.AntiEntropyWorkers),
+			slog.Duration("request_timeout", cfg.AntiEntropyRequestTimeout),
 		)
 	}
 
@@ -452,6 +525,28 @@ func buildGossipEngine(cfg *config.Config, logger *slog.Logger) *gossip.Engine {
 	// For now, create the engine with a placeholder; the real delivery
 	// is set via SetDelivery after the peer client exists.
 	return gossip.New(gossipCfg, selector, nil, logger)
+}
+
+// buildAntiEntropyEngine constructs and returns the anti-entropy engine for
+// the configured parameters. It does NOT start the engine (Start is called
+// after discovery is initialized, so the peer source can be set).
+// Returns nil on failure (the error is logged).
+func buildAntiEntropyEngine(cfg *config.Config, logger *slog.Logger) *antientropy.Engine {
+	aCfg := antientropy.Config{
+		Interval:        cfg.AntiEntropyInterval,
+		PageSize:        cfg.AntiEntropyPageSize,
+		FetchBatchSize:  cfg.AntiEntropyFetchBatchSize,
+		MaxPagesPerPeer: cfg.AntiEntropyMaxPagesPerPeer,
+		Workers:         cfg.AntiEntropyWorkers,
+		RequestTimeout:  cfg.AntiEntropyRequestTimeout,
+	}
+	if err := aCfg.Validate(); err != nil {
+		logger.Error("anti-entropy config validation failed", "error", err)
+		return nil
+	}
+	// The peer source, inventory client, message fetcher, and local store
+	// are set via setters after the peer client is available.
+	return antientropy.New(aCfg, nil, nil, nil, nil, logger)
 }
 
 // buildPeerTLSConfig converts the validated environment configuration into the
