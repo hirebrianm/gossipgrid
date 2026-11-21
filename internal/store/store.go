@@ -207,6 +207,43 @@ func (s *Store) InsertReplicatedMessage(msg *Message) error {
 	return ErrDuplicateIDConflict
 }
 
+// InsertReplicatedMessageReturningInserted is like InsertReplicatedMessage but
+// also returns a boolean indicating whether a new row was actually created.
+// The boolean is true only when the atomic ON CONFLICT DO NOTHING insert
+// created a row (RowsAffected == 1). An identical duplicate (no-op) and a
+// conflicting duplicate (ErrDuplicateIDConflict) both return false.
+//
+// This method exists for the gossip engine (Milestone 4B) which needs to
+// distinguish "new message stored" from "duplicate no-op" to decide whether
+// to forward the message further. It preserves the same validation, atomicity,
+// and error semantics as InsertReplicatedMessage.
+func (s *Store) InsertReplicatedMessageReturningInserted(msg *Message) (bool, error) {
+	if err := validateMessage(msg); err != nil {
+		return false, err
+	}
+
+	res := s.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoNothing: true,
+	}).Create(msg)
+	if res.Error != nil {
+		return false, fmt.Errorf("inserting replicated message: %w", res.Error)
+	}
+	if res.RowsAffected == 1 {
+		return true, nil // new row created
+	}
+
+	// The row already existed. Compare its immutable fields.
+	var existing Message
+	if err := s.db.Where("id = ?", msg.ID).First(&existing).Error; err != nil {
+		return false, fmt.Errorf("fetching existing message %q: %w", msg.ID, err)
+	}
+	if existing.Body == msg.Body && existing.Origin == msg.Origin && existing.CreatedAt.Equal(msg.CreatedAt) {
+		return false, nil // idempotent no-op
+	}
+	return false, ErrDuplicateIDConflict
+}
+
 // GetByID retrieves a single message by its ID.
 // Returns gorm.ErrRecordNotFound if the message does not exist.
 func (s *Store) GetByID(id string) (*Message, error) {

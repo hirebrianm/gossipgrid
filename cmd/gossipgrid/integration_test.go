@@ -35,9 +35,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"gossipgrid/internal/discovery"
+	"gossipgrid/internal/gossip"
 	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/server"
 	"gossipgrid/internal/store"
@@ -720,4 +723,675 @@ func writePEMFile(t *testing.T, dir, name string, data []byte) string {
 		t.Fatalf("writing %s: %v", p, err)
 	}
 	return p
+}
+
+// --- Five-node gossip integration test (Milestone 4B) ---
+
+const (
+	fiveNodeSuffix      = "gossipgrid-headless.int5.svc"
+	fiveNodeStatefulSet = "gossipgrid"
+	fiveNodeReplicas    = 5
+)
+
+// fiveNode is a self-contained GossipGrid replica for the gossip integration
+// test. Each node has its own SQLite DB, peer TLS manager, public HTTP
+// listener, private mTLS listener, static discovery manager, and gossip engine.
+type fiveNode struct {
+	podID      string
+	store      *store.Store
+	mgr        *peertls.Manager
+	client     *peertls.Client
+	peerSrv    *peertls.PeerServer
+	publicSrv  *server.Server
+	publicAddr string
+	peerAddr   string
+	engine     *gossip.Engine
+	discMgr    *discovery.Manager
+
+	// peerListenerMu serializes stop/restart of the peer listener so a
+	// concurrent Stop and Restart cannot double-close the listener.
+	peerListenerMu sync.Mutex
+	peerListener   net.Listener
+	peerHTTP       *http.Server
+	peerServing    bool
+
+	// Shutdown functions (idempotent).
+	peerShutdown   func()
+	publicShutdown func()
+}
+
+// newFiveNodeBase builds and starts a single GossipGrid node with all
+// components except the gossip engine (store, peer TLS, public HTTP, private
+// mTLS listener). The peer server is created with a nil onNewMsg callback;
+// the caller wires the gossip engine later and can re-create the peer server
+// if needed. This allows all nodes to be created first (to learn their
+// loopback addresses) before static discovery and gossip are configured.
+func newFiveNodeBase(t *testing.T, ca *testCA, podID string) *fiveNode {
+	t.Helper()
+	dir := t.TempDir()
+
+	// Credentials.
+	cert, key := issueLeafCert(t, ca, podID+"."+fiveNodeSuffix)
+	chainPEM, keyPEM := certKeyPEMTwo(t, cert, key, ca)
+	certFile := writePEMFile(t, dir, "cert.pem", chainPEM)
+	keyFile := writePEMFile(t, dir, "key.pem", keyPEM)
+	trustFile := writePEMFile(t, dir, "ca-bundle.pem", ca.pem)
+
+	// Store.
+	st, err := store.New(filepath.Join(dir, "node.db"))
+	if err != nil {
+		t.Fatalf("%s: store.New: %v", podID, err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Peer TLS manager.
+	mgr := peertls.New(peertls.Config{
+		CertFile:         certFile,
+		KeyFile:          keyFile,
+		TrustBundleFile:  trustFile,
+		IdentitySuffix:   fiveNodeSuffix,
+		StatefulSetName:  fiveNodeStatefulSet,
+		NodeID:           podID,
+		ExpectedReplicas: fiveNodeReplicas,
+		ReloadInterval:   50 * time.Millisecond,
+	}, nil)
+	ctx := context.Background()
+	if err := mgr.Start(ctx); err != nil {
+		t.Fatalf("%s: manager Start: %v", podID, err)
+	}
+	t.Cleanup(mgr.Shutdown)
+	client := peertls.NewClient(mgr)
+
+	// Peer server: the onNewMsg callback references node.engine through a
+	// closure over the *fiveNode pointer; node.engine is set later by
+	// wireGossipForNode before any messages are received.
+	node := &fiveNode{
+		podID: podID, store: st, mgr: mgr, client: client,
+	}
+	onNewMsg := func(msg *store.Message, senderPodID string) {
+		if node.engine == nil {
+			return
+		}
+		node.engine.Enqueue(gossip.MessageEvent{
+			Message: peertls.MessageWire{
+				ID: msg.ID, Body: msg.Body, Origin: msg.Origin,
+				CreatedAt: msg.CreatedAt.UTC().Format(time.RFC3339Nano),
+			},
+			SenderPodID: senderPodID,
+		})
+	}
+	peerSrv := peertls.NewPeerServerWithStoreAndCallback(mgr, ":0", podID, "v0.1.0-5n", st, true, onNewMsg)
+	tlsListener, err := tls.Listen("tcp", "127.0.0.1:0", mgr.TLSConfigForServer())
+	if err != nil {
+		t.Fatalf("%s: tls.Listen: %v", podID, err)
+	}
+	peerAddr := tlsListener.Addr().String()
+	httpSrv := &http.Server{Handler: peerSrv.Handler()}
+	go func() { _ = httpSrv.Serve(tlsListener) }()
+	node.peerListener = tlsListener
+	node.peerHTTP = httpSrv
+	node.peerServing = true
+	// Idempotent shutdown: only closes the listener if it is still the
+	// current one (a restart may have replaced it).
+	peerShutdown := func() {
+		node.peerListenerMu.Lock()
+		defer node.peerListenerMu.Unlock()
+		if !node.peerServing {
+			return
+		}
+		node.peerServing = false
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = node.peerHTTP.Shutdown(sctx)
+		_ = node.peerListener.Close()
+	}
+	t.Cleanup(peerShutdown)
+
+	// Public HTTP server: the onMessage callback references node.engine
+	// through the same closure pattern as the peer server.
+	onMessage := func(msg store.Message) {
+		if node.engine == nil {
+			return
+		}
+		node.engine.Enqueue(gossip.MessageEvent{
+			Message: peertls.MessageWire{
+				ID: msg.ID, Body: msg.Body, Origin: msg.Origin,
+				CreatedAt: msg.CreatedAt.UTC().Format(time.RFC3339Nano),
+			},
+		})
+	}
+	publicSrv := server.NewServer(":0", server.NewWithStoreAndCallback(server.Node{ID: podID}, st, onMessage))
+	lc := net.ListenConfig{}
+	publicListener, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("%s: net.Listen (public): %v", podID, err)
+	}
+	publicAddr := publicListener.Addr().String()
+	go func() { _ = publicSrv.HTTPServer.Serve(publicListener) }()
+	publicShutdown := func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = publicSrv.Shutdown(sctx)
+		_ = publicListener.Close()
+	}
+	t.Cleanup(publicShutdown)
+
+	node.peerSrv = peerSrv
+	node.publicSrv = publicSrv
+	node.publicAddr = publicAddr
+	node.peerAddr = peerAddr
+	node.peerShutdown = peerShutdown
+	node.publicShutdown = publicShutdown
+	return node
+}
+
+// stopPeerListener stops the node's peer listener (simulating the replica
+// becoming temporarily unavailable). It is idempotent: a second call is a
+// no-op. The mTLS manager and store are NOT closed (only the listener), so
+// the node can be restored by restartPeerListener.
+func (n *fiveNode) stopPeerListener(t *testing.T) {
+	t.Helper()
+	n.peerListenerMu.Lock()
+	defer n.peerListenerMu.Unlock()
+	if !n.peerServing {
+		return
+	}
+	n.peerServing = false
+	sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = n.peerHTTP.Shutdown(sctx)
+	_ = n.peerListener.Close()
+	t.Logf("%s: peer listener stopped (temporarily unavailable)", n.podID)
+}
+
+// restartPeerListener restores the node's peer listener on the SAME loopback
+// address (n.peerAddr) using the same mTLS config and handler. This simulates
+// a temporarily unavailable replica being restored at a reachable, stable
+// address within the retry budget. It is safe to call after stopPeerListener.
+// The static discovery snapshot (and the AddressOverrides) still points at
+// n.peerAddr, so other nodes' gossip engines reach the restored node at its
+// original address.
+func (n *fiveNode) restartPeerListener(t *testing.T) {
+	t.Helper()
+	n.peerListenerMu.Lock()
+	defer n.peerListenerMu.Unlock()
+	if n.peerServing {
+		return
+	}
+	// Rebind the original loopback address (which was freed by
+	// stopPeerListener) with the same mTLS config and the same peer handler
+	// (which routes to the same store and onNewMsg callback).
+	listener, err := tls.Listen("tcp", n.peerAddr, n.mgr.TLSConfigForServer())
+	if err != nil {
+		t.Fatalf("%s: re-listen on %s: %v", n.podID, n.peerAddr, err)
+	}
+	n.peerListener = listener
+	httpSrv := &http.Server{Handler: n.peerSrv.Handler()}
+	n.peerHTTP = httpSrv
+	n.peerServing = true
+	go func() { _ = httpSrv.Serve(listener) }()
+	t.Logf("%s: peer listener restored on %s", n.podID, n.peerAddr)
+}
+
+// wireGossipForNode creates a static discovery manager and gossip engine for
+// the given node, using the production bridge (discMgr.Snapshot() →
+// gossip.PeerSnapshot, the same code as main.go). The static peers are the
+// FQDN hostnames of the other nodes; AddressOverrides maps pod identities to
+// the actual loopback dial addresses.
+func wireGossipForNode(t *testing.T, node *fiveNode, allNodes []*fiveNode, gossipCfg gossip.Config) {
+	t.Helper()
+	ctx := context.Background()
+
+	// Build static peer list: FQDN hostname + dummy port for each other node.
+	// The port here is not used for dialing (AddressOverrides provides the
+	// real loopback address); it only needs to be a valid port for config
+	// validation.
+	staticPeers := make([]string, 0, len(allNodes)-1)
+	addrOverrides := make(map[string]string, len(allNodes)-1)
+	for _, other := range allNodes {
+		if other.podID == node.podID {
+			continue
+		}
+		staticPeers = append(staticPeers, other.podID+"."+fiveNodeSuffix+":8443")
+		addrOverrides[other.podID] = other.peerAddr
+	}
+
+	// Static discovery: deterministic, no network I/O, snapshot populated
+	// synchronously when Start returns.
+	discCfg := discovery.Config{
+		Mode:             discovery.ModeStatic,
+		StaticPeers:      staticPeers,
+		StatefulSetName:  fiveNodeStatefulSet,
+		NodeID:           node.podID,
+		ExpectedReplicas: fiveNodeReplicas,
+		DNSName:          fiveNodeSuffix,
+	}
+	discMgr := discovery.NewManager(discCfg, nil, nil)
+	if err := discMgr.Start(ctx); err != nil {
+		t.Fatalf("%s: discovery Start: %v", node.podID, err)
+	}
+	t.Cleanup(discMgr.Shutdown)
+
+	// Gossip engine with the production bridge.
+	selector := gossip.NewDefaultPeerSelector(fiveNodeSuffix, addrOverrides)
+	delivery := gossip.NewRealDelivery(node.client)
+	engine := gossip.New(gossipCfg, selector, delivery, nil)
+	// Production bridge: discovery.Snapshot → gossip.PeerSnapshot
+	// (identical to main.go).
+	engine.SetSnapshotSource(func() gossip.PeerSnapshot {
+		ds := discMgr.Snapshot()
+		peers := make([]gossip.PeerInfo, len(ds.Peers))
+		for i, p := range ds.Peers {
+			peers[i] = gossip.PeerInfo{
+				Hostname:    p.Hostname,
+				PodIdentity: p.PodIdentity,
+				Address:     p.Address,
+				LastSeen:    p.LastSeen,
+			}
+		}
+		var localNode *gossip.PeerInfo
+		if ds.LocalNode != nil {
+			localNode = &gossip.PeerInfo{
+				Hostname:    ds.LocalNode.Hostname,
+				PodIdentity: ds.LocalNode.PodIdentity,
+				Address:     ds.LocalNode.Address,
+				LastSeen:    ds.LocalNode.LastSeen,
+			}
+		}
+		return gossip.PeerSnapshot{
+			Peers:     peers,
+			LocalNode: localNode,
+			Stale:     ds.Stale,
+			Mode:      string(ds.Mode),
+		}
+	})
+	if err := engine.Start(ctx); err != nil {
+		t.Fatalf("%s: gossip Start: %v", node.podID, err)
+	}
+	t.Cleanup(func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		engine.Stop(sctx)
+	})
+
+	node.engine = engine
+	node.discMgr = discMgr
+}
+
+// TestIntegrationFiveNodesGossip demonstrates Milestone 4B: automatic
+// epidemic gossip between five independent GossipGrid replicas with
+// real authenticated mTLS, separate SQLite databases, static peer discovery
+// through the production bridge, and the gossip engine's bounded fanout,
+// retry, and duplicate-suppression behavior.
+//
+// Scenarios covered:
+//  1. Healthy convergence: all five replicas online; a message posted to one
+//     propagates to all 5 with identical immutable records.
+//  2. One replica unavailable: node 4 is stopped while the remaining four
+//     continue operating; the down node's attempts are exhausted.
+//  3. Temporary unavailability + restoration: node 4 is restored on the same
+//     loopback address within the retry budget; a real authenticated retry
+//     succeeds and node 4 receives the message.
+//  4. Multiple message origins + duplicate suppression: messages from
+//     different origins propagate with no duplicate rows.
+//  5. Permanent exhaustion: a permanently unavailable node exhausts its
+//     configured attempt budget; no new retries occur after exhaustion.
+//  6. Clean shutdown: all five engines, listeners, and SQLite stores shut
+//     down cleanly; repeated Stop is safe; engine stats all read zero.
+//
+// The test uses real static discovery (discovery.Manager in static mode) and
+// the production gossip bridge (discMgr.Snapshot() → gossip.PeerSnapshot).
+// It does NOT claim that finite fanout guarantees convergence under
+// arbitrary failures; it demonstrates behavior under controlled conditions
+// with deterministic fanout selection. Real TLS handshakes are used for all
+// network delivery (no fake transport calls).
+func TestIntegrationFiveNodesGossip(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping five-node gossip integration test in short mode")
+	}
+
+	podIDs := []string{"gossipgrid-0", "gossipgrid-1", "gossipgrid-2", "gossipgrid-3", "gossipgrid-4"}
+	sharedCA := newTestCA(t, "workload-5n")
+
+	// Gossip configuration: fanout=4 contacts all eligible peers each round,
+	// guaranteeing convergence in a healthy 5-node cluster. Fast retries for
+	// test speed (RetryMax 200ms, MaxAttempts 3 → total per-peer retry budget
+	// ≈ 0.5-1.5s, well within the restoration window).
+	gossipCfg := gossip.Config{
+		Fanout:        4,
+		Rounds:        2,
+		Workers:       4,
+		QueueCapacity: 64,
+		MaxAttempts:   3,
+		RetryBase:     50 * time.Millisecond,
+		RetryMax:      200 * time.Millisecond,
+	}
+
+	// Phase 1: create all 5 nodes (without gossip engines) to learn addresses.
+	nodes := make([]*fiveNode, 5)
+	for i, podID := range podIDs {
+		nodes[i] = newFiveNodeBase(t, sharedCA, podID)
+	}
+
+	// Phase 2: wire static discovery + gossip engine for all 5 nodes, using
+	// the production bridge. All 5 nodes start online.
+	for i := 0; i < 5; i++ {
+		wireGossipForNode(t, nodes[i], nodes, gossipCfg)
+	}
+	t.Log("5 nodes started with real mTLS, static discovery, and gossip engines")
+
+	// Helper: wait until a condition is true or the deadline expires.
+	waitUntil := func(timeout time.Duration, cond func() bool) bool {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return cond()
+	}
+
+	// Helper: check if a node has a message.
+	hasMsg := func(n *fiveNode, id string) bool {
+		_, err := n.store.GetByID(id)
+		return err == nil
+	}
+
+	// Helper: record a message's immutable fields from a node's store.
+	recMsg := func(n *fiveNode, id string) store.Message {
+		m, err := n.store.GetByID(id)
+		if err != nil {
+			t.Fatalf("node %s: GetByID(%s): %v", n.podID, id, err)
+		}
+		return *m
+	}
+
+	// --- Scenario 1: healthy convergence among all 5 nodes ---
+	t.Run("healthy convergence on 5 nodes", func(t *testing.T) {
+		// All 5 DBs start empty.
+		for i := 0; i < 5; i++ {
+			var count int64
+			if err := nodes[i].store.DB().Model(&store.Message{}).Count(&count).Error; err != nil {
+				t.Fatalf("node %d: count: %v", i, err)
+			}
+			if count != 0 {
+				t.Fatalf("node %d: expected 0 messages, got %d", i, count)
+			}
+		}
+
+		// POST a message to node 0.
+		status, respBody, err := postPublicJSON(t, nodes[0].publicAddr, `{"body":"Hello five-node cluster"}`)
+		if err != nil {
+			t.Fatalf("POST to node 0: %v", err)
+		}
+		if status != http.StatusCreated {
+			t.Fatalf("POST to node 0: status %d, want 201; body: %s", status, respBody)
+		}
+		var msg store.Message
+		if err := json.Unmarshal([]byte(respBody), &msg); err != nil {
+			t.Fatalf("decoding POST response: %v", err)
+		}
+		t.Logf("created message %s on node 0", msg.ID)
+
+		// Wait for convergence to all 5 nodes.
+		if !waitUntil(15*time.Second, func() bool {
+			for i := 0; i < 5; i++ {
+				if !hasMsg(nodes[i], msg.ID) {
+					return false
+				}
+			}
+			return true
+		}) {
+			for i := 0; i < 5; i++ {
+				t.Errorf("node %d: message %s not present after 15s", i, msg.ID)
+			}
+			return
+		}
+		t.Log("message converged on all 5 nodes via static discovery bridge")
+
+		// Verify identical immutable records on all 5 nodes.
+		ref := recMsg(nodes[0], msg.ID)
+		for i := 1; i < 5; i++ {
+			m := recMsg(nodes[i], msg.ID)
+			if m.ID != ref.ID || m.Body != ref.Body || m.Origin != ref.Origin {
+				t.Errorf("node %d record = %+v, want id=%s body=%q origin=%q (identical to node 0)", i, m, ref.ID, ref.Body, ref.Origin)
+			}
+			if !m.CreatedAt.Equal(ref.CreatedAt) {
+				t.Errorf("node %d CreatedAt = %v, want %v (identical to node 0)", i, m.CreatedAt, ref.CreatedAt)
+			}
+		}
+
+		// Verify no duplicate rows (exactly 1 message per node).
+		for i := 0; i < 5; i++ {
+			var count int64
+			if err := nodes[i].store.DB().Model(&store.Message{}).Count(&count).Error; err != nil {
+				t.Fatalf("node %d: count: %v", i, err)
+			}
+			if count != 1 {
+				t.Errorf("node %d: message count = %d, want 1 (no duplicate forwarding)", i, count)
+			}
+		}
+	})
+
+	// msg2 is defined at function scope so later scenarios (3, 4) can
+	// reference it. It is assigned in scenario 2.
+	var msg2 store.Message
+
+	// --- Scenario 2: one replica unavailable; the other 4 continue ---
+	t.Run("one replica unavailable, others continue", func(t *testing.T) {
+		// Stop node 4's peer listener (temporarily unavailable). The node's
+		// store and mTLS manager remain open, so it can be restored later.
+		nodes[4].stopPeerListener(t)
+
+		// POST a second message to node 2 (node 4 is now down).
+		status, respBody, err := postPublicJSON(t, nodes[2].publicAddr, `{"body":"Second message"}`)
+		if err != nil {
+			t.Fatalf("POST to node 2: %v", err)
+		}
+		if status != http.StatusCreated {
+			t.Fatalf("POST to node 2: status %d, want 201", status)
+		}
+		if err := json.Unmarshal([]byte(respBody), &msg2); err != nil {
+			t.Fatalf("decoding POST response: %v", err)
+		}
+
+		// The 4 reachable nodes converge on the second message; node 4 is down.
+		if !waitUntil(15*time.Second, func() bool {
+			for i := 0; i < 4; i++ {
+				if !hasMsg(nodes[i], msg2.ID) {
+					return false
+				}
+			}
+			return true
+		}) {
+			for i := 0; i < 4; i++ {
+				t.Errorf("node %d: second message not present after 15s", i)
+			}
+		} else {
+			t.Log("second message converged on all 4 reachable nodes")
+		}
+
+		// Verify stored messages are intact on reachable nodes (exactly 2
+		// messages each: the scenario-1 message + msg2 from scenario 2).
+		for i := 0; i < 4; i++ {
+			var count int64
+			if err := nodes[i].store.DB().Model(&store.Message{}).Count(&count).Error; err != nil {
+				t.Fatalf("node %d: count: %v", i, err)
+			}
+			if count != 2 {
+				t.Errorf("node %d: message count = %d, want 2 (exactly 2 messages)", i, count)
+			}
+		}
+
+	})
+
+	// --- Scenario 3: temporary unavailability + restoration; a real retry succeeds ---
+	t.Run("temporary unavailability then restoration", func(t *testing.T) {
+		// Node 4 is currently down (stopped in scenario 2). msg2 was not
+		// delivered to node 4. Restore node 4 on the same loopback address
+		// within the retry budget.
+		nodes[4].restartPeerListener(t)
+
+		// Wait for node 4 to receive msg2 via a real authenticated retry from
+		// a peer. The 4 reachable nodes each have msg2 and retry toward node 4;
+		// with MaxAttempts=3 and RetryBase=50ms/RetryMax=200ms the per-peer
+		// retry budget is ~0.5-1.5s. The restoration must land within that
+		// window for a retry to succeed.
+		if !waitUntil(15*time.Second, func() bool {
+			return hasMsg(nodes[4], msg2.ID)
+		}) {
+			t.Fatal("node 4 did not receive msg2 after restoration (no successful retry within the retry budget)")
+		}
+		t.Log("node 4 received msg2 after restoration via a real authenticated retry")
+
+		// Verify the restored record is identical to the other nodes.
+		ref := recMsg(nodes[0], msg2.ID)
+		m4 := recMsg(nodes[4], msg2.ID)
+		if m4.ID != ref.ID || m4.Body != ref.Body || m4.Origin != ref.Origin {
+			t.Errorf("node 4 restored record = %+v, want identical to node 0", m4)
+		}
+		if !m4.CreatedAt.Equal(ref.CreatedAt) {
+			t.Errorf("node 4 restored CreatedAt = %v, want %v (identical to node 0)", m4.CreatedAt, ref.CreatedAt)
+		}
+	})
+
+	// --- Scenario 4: multiple origins + duplicate suppression ---
+	t.Run("multiple origins and duplicate suppression", func(t *testing.T) {
+		// All 5 nodes are now back online (node 4 restored in scenario 3).
+		// POST a third message to node 1 (a different origin than scenarios 1-2).
+		status, respBody, err := postPublicJSON(t, nodes[1].publicAddr, `{"body":"Third message from node 1"}`)
+		if err != nil {
+			t.Fatalf("POST to node 1: %v", err)
+		}
+		if status != http.StatusCreated {
+			t.Fatalf("POST to node 1: status %d, want 201", status)
+		}
+		var msg3 store.Message
+		if err := json.Unmarshal([]byte(respBody), &msg3); err != nil {
+			t.Fatalf("decoding POST response: %v", err)
+		}
+
+		// Wait for all 5 nodes to converge on the third message.
+		if !waitUntil(15*time.Second, func() bool {
+			for i := 0; i < 5; i++ {
+				if !hasMsg(nodes[i], msg3.ID) {
+					return false
+				}
+			}
+			return true
+		}) {
+			for i := 0; i < 5; i++ {
+				t.Errorf("node %d: third message not present after 15s", i)
+			}
+		} else {
+			t.Log("third message converged on all 5 nodes")
+		}
+
+		// Verify no duplicate rows: each node has exactly 3 distinct messages
+		// (the 3 original messages, one per origin).
+		for i := 0; i < 5; i++ {
+			var count int64
+			if err := nodes[i].store.DB().Model(&store.Message{}).Count(&count).Error; err != nil {
+				t.Fatalf("node %d: count: %v", i, err)
+			}
+			if count != 3 {
+				t.Errorf("node %d: message count = %d, want 3 (no duplicate forwarding; 3 distinct messages)", i, count)
+			}
+		}
+		t.Log("duplicate suppression verified: exactly 3 messages per node across 3 origins")
+	})
+
+	// --- Scenario 5: permanent exhaustion with no new retries after budget ---
+	t.Run("permanent exhaustion with no new retries", func(t *testing.T) {
+		// Stop node 4 again (permanently unavailable for this scenario).
+		nodes[4].stopPeerListener(t)
+
+		// POST a fourth message to node 3 (node 4 is down).
+		status, respBody, err := postPublicJSON(t, nodes[3].publicAddr, `{"body":"Fourth message while node 4 permanently down"}`)
+		if err != nil {
+			t.Fatalf("POST to node 3: %v", err)
+		}
+		if status != http.StatusCreated {
+			t.Fatalf("POST to node 3: status %d, want 201", status)
+		}
+		var msg4 store.Message
+		if err := json.Unmarshal([]byte(respBody), &msg4); err != nil {
+			t.Fatalf("decoding POST response: %v", err)
+		}
+
+		// The 4 reachable nodes converge on the fourth message.
+		if !waitUntil(15*time.Second, func() bool {
+			for i := 0; i < 4; i++ {
+				if !hasMsg(nodes[i], msg4.ID) {
+					return false
+				}
+			}
+			return true
+		}) {
+			for i := 0; i < 4; i++ {
+				t.Errorf("node %d: fourth message not present after 15s", i)
+			}
+		} else {
+			t.Log("fourth message converged on all 4 reachable nodes")
+		}
+
+		// Wait for the per-peer retry budget to fully exhaust. With
+		// MaxAttempts=3, RetryBase=50ms, RetryMax=200ms the total per-peer
+		// retry window is roughly 0.5-1.5s. Sleep 3s to be safely past it.
+		time.Sleep(3 * time.Second)
+
+		// Record RetryAttempts for each reachable node, then sleep and
+		// re-check: no new retries should occur after exhaustion.
+		before := make([]uint64, 5)
+		for i := 0; i < 4; i++ {
+			before[i] = nodes[i].engine.Stats().RetryAttempts
+		}
+		time.Sleep(1 * time.Second)
+		for i := 0; i < 4; i++ {
+			after := nodes[i].engine.Stats().RetryAttempts
+			if after > before[i] {
+				t.Errorf("node %d: RetryAttempts increased after exhaustion: before=%d after=%d", i, before[i], after)
+			}
+		}
+		t.Log("permanent exhaustion: no new retries after the attempt budget is exhausted")
+
+		// Restore node 4 so scenario 6 can shut down all 5 nodes cleanly.
+		nodes[4].restartPeerListener(t)
+	})
+
+	// --- Scenario 6: clean shutdown ---
+	t.Run("clean shutdown", func(t *testing.T) {
+		// Stop all 5 gossip engines.
+		for i := 0; i < 5; i++ {
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			nodes[i].engine.Stop(sctx)
+			cancel()
+			t.Logf("node %d gossip engine stopped", i)
+		}
+
+		// Shut down peer and public listeners on all 5 nodes.
+		for i := 0; i < 5; i++ {
+			nodes[i].peerShutdown()
+			nodes[i].publicShutdown()
+			t.Logf("node %d listeners shut down", i)
+		}
+
+		// Verify repeated Stop is safe (idempotent) — no panics.
+		for i := 0; i < 5; i++ {
+			sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			nodes[i].engine.Stop(sctx)
+			cancel()
+		}
+
+		// Verify engine stats are all zero after a completed shutdown
+		// (queued, pending, and delayed work all released).
+		for i := 0; i < 5; i++ {
+			s := nodes[i].engine.Stats()
+			if s.QueueDepth != 0 || s.PendingWork != 0 || s.DelayedRetries != 0 {
+				t.Errorf("node %d: after shutdown stats = %+v, want all zero", i, s)
+			}
+		}
+		t.Log("all 5 nodes shut down cleanly; repeated Stop is safe; engine stats all zero")
+	})
 }

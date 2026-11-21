@@ -47,6 +47,18 @@ const (
 	// does NOT enable automatic gossip, fanout, anti-entropy, or readiness
 	// gating (those belong to Milestones 4B/4C/5).
 	EnvPeerMessageExchangeEnabled = "GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED"
+
+	// Epidemic gossip (Milestone 4B). When enabled, local and replicated
+	// message commits trigger asynchronous fanout to authenticated peers.
+	// Requires peer mTLS, peer message exchange, and static or DNS discovery.
+	EnvGossipEnabled       = "GOSSIPGRID_GOSSIP_ENABLED"
+	EnvGossipFanout        = "GOSSIPGRID_GOSSIP_FANOUT"
+	EnvGossipRounds        = "GOSSIPGRID_GOSSIP_ROUNDS"
+	EnvGossipWorkers       = "GOSSIPGRID_GOSSIP_WORKERS"
+	EnvGossipQueueCapacity = "GOSSIPGRID_GOSSIP_QUEUE_CAPACITY"
+	EnvGossipMaxAttempts   = "GOSSIPGRID_GOSSIP_MAX_ATTEMPTS"
+	EnvGossipRetryBase     = "GOSSIPGRID_GOSSIP_RETRY_BASE"
+	EnvGossipRetryMax      = "GOSSIPGRID_GOSSIP_RETRY_MAX"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -83,6 +95,20 @@ type Config struct {
 	// idempotent replicated message inserts from authenticated replicas.
 	// Requires PeerTLSEnabled to be true (validated).
 	PeerMessageExchangeEnabled bool
+
+	// Epidemic gossip (Milestone 4B). When GossipEnabled is true, local and
+	// replicated message commits trigger asynchronous fanout to authenticated
+	// peers using bounded queues, workers, and exponential-backoff retries.
+	// Requires PeerTLSEnabled, PeerMessageExchangeEnabled, and discovery mode
+	// static or dns (all validated).
+	GossipEnabled       bool
+	GossipFanout        int
+	GossipRounds        int
+	GossipWorkers       int
+	GossipQueueCapacity int
+	GossipMaxAttempts   int
+	GossipRetryBase     time.Duration
+	GossipRetryMax      time.Duration
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -189,6 +215,53 @@ func load(lookup envFunc) (*Config, error) {
 		errs = append(errs, err)
 	}
 
+	// Epidemic gossip (Milestone 4B). Default disabled: when unset, no
+	// automatic peer message fanout occurs.
+	if v, ok := lookup(EnvGossipEnabled); ok {
+		b, perr := parseBoolEnv(v, EnvGossipEnabled)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.GossipEnabled = b
+	}
+	// When gossip is enabled, parse and validate the gossip parameters.
+	// When disabled, the fields retain their defaults and malformed values
+	// are ignored (gossip is a best-effort, opt-in feature).
+	if cfg.GossipEnabled {
+		var gerr error
+		cfg.GossipFanout, gerr = parseIntEnvGossip(lookup, EnvGossipFanout, 2)
+		if gerr != nil {
+			errs = append(errs, gerr)
+		}
+		cfg.GossipRounds, gerr = parseIntEnvGossip(lookup, EnvGossipRounds, 3)
+		if gerr != nil {
+			errs = append(errs, gerr)
+		}
+		cfg.GossipWorkers, gerr = parseIntEnvGossip(lookup, EnvGossipWorkers, 4)
+		if gerr != nil {
+			errs = append(errs, gerr)
+		}
+		cfg.GossipQueueCapacity, gerr = parseIntEnvGossip(lookup, EnvGossipQueueCapacity, 256)
+		if gerr != nil {
+			errs = append(errs, gerr)
+		}
+		cfg.GossipMaxAttempts, gerr = parseIntEnvGossip(lookup, EnvGossipMaxAttempts, 3)
+		if gerr != nil {
+			errs = append(errs, gerr)
+		}
+		cfg.GossipRetryBase, gerr = parseDurationEnvGossip(lookup, EnvGossipRetryBase, 250*time.Millisecond)
+		if gerr != nil {
+			errs = append(errs, gerr)
+		}
+		cfg.GossipRetryMax, gerr = parseDurationEnvGossip(lookup, EnvGossipRetryMax, 5*time.Second)
+		if gerr != nil {
+			errs = append(errs, gerr)
+		}
+		if err := validateGossipConfig(cfg); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
 	return cfg, errors.Join(errs...)
 }
 
@@ -197,6 +270,34 @@ func getEnv(lookup envFunc, key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// parseIntEnvGossip reads a gossip integer environment variable. Unset values
+// use the documented fallback; an explicitly supplied malformed value is an
+// error (a typo must not silently change a resource limit).
+func parseIntEnvGossip(lookup envFunc, key string, fallback int) (int, error) {
+	if v, ok := lookup(key); ok && v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %q is not a valid integer: %w", key, v, err)
+		}
+		return n, nil
+	}
+	return fallback, nil
+}
+
+// parseDurationEnvGossip reads a gossip duration environment variable. Unset
+// values use the documented fallback; an explicitly supplied malformed value is
+// an error (a typo must not silently change a backoff bound).
+func parseDurationEnvGossip(lookup envFunc, key string, fallback time.Duration) (time.Duration, error) {
+	if v, ok := lookup(key); ok && v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %q is not a valid duration: %w", key, v, err)
+		}
+		return d, nil
+	}
+	return fallback, nil
 }
 
 // validateAddr checks host/port syntax and the numeric port range without
@@ -334,6 +435,53 @@ func validatePeerMessageExchangeConfig(cfg *Config) error {
 	}
 	if !cfg.PeerTLSEnabled {
 		return fmt.Errorf("%s: peer message exchange requires peer mTLS to be enabled (%s=true)", EnvPeerMessageExchangeEnabled, EnvPeerTLSEnabled)
+	}
+	return nil
+}
+
+// validateGossipConfig checks the epidemic gossip fields (Milestone 4B).
+// Gossip is a best-effort, opt-in feature: it requires peer mTLS, peer
+// message exchange, and a discovery mode that can produce peer addresses
+// (static or dns). When disabled, all other gossip fields are ignored.
+// When enabled, all resource limits must be within documented bounds.
+func validateGossipConfig(cfg *Config) error {
+	if !cfg.GossipEnabled {
+		return nil
+	}
+	// Gossip requires peer mTLS (the transport for authenticated delivery).
+	if !cfg.PeerTLSEnabled {
+		return fmt.Errorf("%s: gossip requires peer mTLS to be enabled (%s=true)", EnvGossipEnabled, EnvPeerTLSEnabled)
+	}
+	// Gossip requires peer message exchange (the endpoint that receives
+	// forwarded messages over mTLS).
+	if !cfg.PeerMessageExchangeEnabled {
+		return fmt.Errorf("%s: gossip requires peer message exchange to be enabled (%s=true)", EnvGossipEnabled, EnvPeerMessageExchangeEnabled)
+	}
+	// Gossip requires a discovery mode that produces peer addresses.
+	if cfg.DiscoveryMode != "static" && cfg.DiscoveryMode != "dns" {
+		return fmt.Errorf("%s: gossip requires discovery mode static or dns (got %q)", EnvGossipEnabled, cfg.DiscoveryMode)
+	}
+	// Resource bounds (documented in docs/gossip-and-bootstrap.md).
+	if cfg.GossipFanout < 1 || cfg.GossipFanout > 32 {
+		return fmt.Errorf("%s: gossip fanout must be between 1 and 32 (got %d)", EnvGossipFanout, cfg.GossipFanout)
+	}
+	if cfg.GossipRounds < 1 || cfg.GossipRounds > 32 {
+		return fmt.Errorf("%s: gossip rounds must be between 1 and 32 (got %d)", EnvGossipRounds, cfg.GossipRounds)
+	}
+	if cfg.GossipWorkers < 1 || cfg.GossipWorkers > 64 {
+		return fmt.Errorf("%s: gossip workers must be between 1 and 64 (got %d)", EnvGossipWorkers, cfg.GossipWorkers)
+	}
+	if cfg.GossipQueueCapacity < 1 || cfg.GossipQueueCapacity > 1024 {
+		return fmt.Errorf("%s: gossip queue capacity must be between 1 and 1024 (got %d)", EnvGossipQueueCapacity, cfg.GossipQueueCapacity)
+	}
+	if cfg.GossipMaxAttempts < 1 || cfg.GossipMaxAttempts > 10 {
+		return fmt.Errorf("%s: gossip max attempts must be between 1 and 10 (got %d)", EnvGossipMaxAttempts, cfg.GossipMaxAttempts)
+	}
+	if cfg.GossipRetryBase <= 0 {
+		return fmt.Errorf("%s: gossip retry base must be a positive duration (got %v)", EnvGossipRetryBase, cfg.GossipRetryBase)
+	}
+	if cfg.GossipRetryMax < cfg.GossipRetryBase {
+		return fmt.Errorf("%s: gossip retry max (%v) must be >= retry base (%v)", EnvGossipRetryMax, cfg.GossipRetryMax, cfg.GossipRetryBase)
 	}
 	return nil
 }

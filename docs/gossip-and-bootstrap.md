@@ -85,16 +85,82 @@ Key properties:
 - **No epoch management.** Cluster genesis, epoch management, and recovery lockout are reserved for Milestone 5. This
   milestone is a provisional direct-exchange capability, not a complete safe cluster bootstrap protocol.
 
-## Epidemic gossip (Milestone 4B — pending)
+## Epidemic gossip (Milestone 4B — implemented 2026-11-20)
 
-- On locally committed message, enqueue an event; replication is asynchronous.
-- Pick up to two random peers (fanout configurable) per round; peer selection rotates and excludes self.
-- Receiver validates mTLS identity and epoch, validates payload bounds, inserts idempotently, and may forward a newly
-  accepted message.
-- Bound worker count and queue capacity. Retry with backoff and jitter; never allow infinite forwarding or unbounded
-  memory.
-- Repeated duplicates are normal and must not generate new messages or infinite requeues.
-- Failures are observable; regular anti-entropy is the correctness fallback.
+- On locally committed message (POST /api/messages) or newly received replicated message
+  (POST /internal/messages with inserted=true), enqueue a propagation event; replication
+  is asynchronous. The public API returns success after the local SQLite commit; it does
+  not wait for network replication.
+- The Engine selects up to fanout random peers per round (default 2), for up to rounds
+  rounds per message (default 3). Peer selection excludes self, the authenticated sender
+  (when a valid sender identity is present), and already-contacted peers (the excluded
+  set grows only on successful delivery, so transient-failure retries can re-contact
+  the same peer). Unknown sender identities are NOT added to the exclusion set.
+- Delivery uses the existing peertls.Client.SendMessage (TLS 1.3, mTLS, exact identity
+  verification, no redirects, bounded timeouts). The origin field is immutable and
+  unchanged through all forwarding hops.
+- Retries use exponential backoff with jitter (base 250ms, max 5s). MaxAttempts (default
+  3) is the TOTAL delivery attempts per peer, including the initial attempt. A peer that
+  exhausts its budget stops receiving attempts; a failing peer never prevents attempts
+  to other eligible peers. Permanent errors (HTTP 409, 400, 413, invalid acknowledgment)
+  are NOT retried. Transient errors (network, timeout, 5xx, 429) are retried. Ambiguous
+  failures (timeout after remote insert) are treated as transient: the receiver's
+  idempotent insert makes a bounded retry safe.
+- Duplicate suppression: the Engine maintains a pending set of in-flight message IDs.
+  A message already in the pending set is not re-enqueued. The pending entry is released
+  only when all in-flight work units for the message have completed (fanout rounds
+  and delayed retries), preventing premature release that would allow re-enqueue while
+  a retry is still in flight.
+- Bounded, non-blocking retry scheduling: workers never sleep for backoff. Delayed
+  retries are held in a bounded channel (same capacity as the work queue) and their
+  backoff is applied by short-lived timer goroutines that deliver onto that channel.
+  Queue pressure and delayed-retry exhaustion are observable via Stats().
+- Bounded resources: queue capacity (default 256), worker count (default 4), per-message
+  propagation budget (rounds x fanout), per-peer delivery budget (MaxAttempts). Queue
+  overflow drops the propagation event (not the committed message). A full queue is
+  observable via Stats().MessagesDropped.
+- Stale DNS membership: for dns discovery mode, a stale snapshot is not treated as
+  current discovery — no new fanout is performed while the snapshot is stale. Static
+  mode is deterministic and never stale, so its configured addresses remain usable.
+  After DNS membership recovers, newly enqueued messages use the refreshed snapshot.
+- Failure semantics: gossip is best-effort. A committed local message is never rolled back
+  due to gossip failure. In-memory queue items are lost on process restart; a late-joining
+  replica may miss messages until Milestone 4C anti-entropy repairs the gap.
+- Lifecycle: Start creates an engine-owned context derived from the caller's context.
+  Workers and network sends use that derived context. Stop cancels it promptly (aborting
+  in-flight deliveries) and waits for all workers to exit, bounded by the supplied
+  context. Stop is idempotent and safe to call from multiple goroutines. Stop before
+  Start returns promptly. A stopped engine cannot be restarted.
+- Configuration (all opt-in; gossip is disabled by default; malformed values are rejected
+  with errors that name the specific environment variable):
+  - GOSSIPGRID_GOSSIP_ENABLED (default false)
+  - GOSSIPGRID_GOSSIP_FANOUT (default 2, range 1-32)
+  - GOSSIPGRID_GOSSIP_ROUNDS (default 3, range 1-32)
+  - GOSSIPGRID_GOSSIP_WORKERS (default 4, range 1-64)
+  - GOSSIPGRID_GOSSIP_QUEUE_CAPACITY (default 256, range 1-1024)
+  - GOSSIPGRID_GOSSIP_MAX_ATTEMPTS (default 3, range 1-10)
+  - GOSSIPGRID_GOSSIP_RETRY_BASE (default 250ms, must be positive)
+  - GOSSIPGRID_GOSSIP_RETRY_MAX (default 5s, must be >= retry base)
+- Enabling gossip requires: peer mTLS enabled, peer message exchange enabled, and
+  discovery mode static or dns. When gossip is disabled, malformed gossip values are
+  ignored (gossip is a best-effort, opt-in feature).
+- Observability: Engine.Stats() returns counters for queued, dropped, delivery attempts,
+  successful acks, failures, retries, queue depth, delayed retries, and pending work.
+  Structured slog messages for queue overflow, delivery failures, and shutdown.
+- Five-node local integration test (TestIntegrationFiveNodesGossip): five independent
+  replicas with separate SQLite DBs, distinct workload certificates, real mTLS, and
+  static peer discovery through the production bridge (discMgr.Snapshot() →
+  gossip.PeerSnapshot). One node is permanently down from the start; the other 4
+  converge on two messages. The down node's attempts are exhausted; other nodes
+  remain responsive and their stored messages intact. All nodes shut down cleanly;
+  repeated Stop is safe. Transient-recovery-within-retry-budget is tested at the
+  unit level (internal/gossip/gossip_test.go) because the static discovery snapshot
+  has fixed addresses and a node that restarts on a new port is no longer reachable
+  at its original address.
+- Limitations: finite fanout does NOT guarantee convergence under arbitrary failures.
+  A message may not reach all nodes if the selected peers are partitioned or if the
+  fanout/rounds budget is exhausted before a reachable peer is selected. Milestone 4C
+  anti-entropy is required for full convergence guarantees.
 
 ## Anti-entropy
 

@@ -33,6 +33,14 @@ func New(node Node) http.Handler {
 // optional local message store. When store is nil, message endpoints are not
 // registered.
 func NewWithStore(node Node, s *store.Store) http.Handler {
+	return NewWithStoreAndCallback(node, s, nil)
+}
+
+// NewWithStoreAndCallback is like NewWithStore but also accepts an optional
+// MessageCallback that is invoked after each successful local message commit
+// (POST /api/messages). This is used by the gossip engine (Milestone 4B) to
+// trigger asynchronous peer fanout. The callback must be non-blocking.
+func NewWithStoreAndCallback(node Node, s *store.Store, onMessage MessageCallback) http.Handler {
 	mux := http.NewServeMux()
 	// "GET /{$}" matches the root path exactly ({$} = end-of-path), so
 	// unrecognized paths fall through to 404 rather than serving the root page.
@@ -45,6 +53,7 @@ func NewWithStore(node Node, s *store.Store) http.Handler {
 	if s != nil {
 		mh := newMessageHandler(s)
 		mh.nodeID = node.ID
+		mh.onMessage = onMessage
 		mux.HandleFunc("POST /api/messages", mh.postMessages)
 		mux.HandleFunc("GET /api/messages", mh.getMessages)
 		mux.HandleFunc("GET /api/messages/{id}", mh.getMessage)

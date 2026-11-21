@@ -24,6 +24,7 @@ import (
 
 	"gossipgrid/internal/config"
 	"gossipgrid/internal/discovery"
+	"gossipgrid/internal/gossip"
 	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/server"
 	"gossipgrid/internal/store"
@@ -133,7 +134,41 @@ func run() (retErr error) {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	srv := server.NewServer(cfg.HTTPAddr, server.NewWithStore(server.Node{ID: cfg.NodeID}, st))
+	// Milestone 4B: when gossip is enabled, build the gossip engine
+	// before the HTTP servers so the callbacks can reference it.
+	var gEngine *gossip.Engine
+	var gStop func(ctx context.Context)
+	if cfg.GossipEnabled {
+		gEngine = buildGossipEngine(cfg, logger)
+		if gEngine == nil {
+			return fmt.Errorf("gossip engine initialization failed (see logs)")
+		}
+		// Defer gossip engine shutdown (after the HTTP servers are stopped).
+		gStop = gEngine.Stop
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+			gStop(shutdownCtx)
+		}()
+	}
+
+	// Build the public server handler. When gossip is enabled, the
+	// onMessage callback enqueues new local messages for peer fanout.
+	var onMessage server.MessageCallback
+	if gEngine != nil {
+		onMessage = func(msg store.Message) {
+			gEngine.Enqueue(gossip.MessageEvent{
+				Message: peertls.MessageWire{
+					ID:        msg.ID,
+					Body:      msg.Body,
+					Origin:    msg.Origin,
+					CreatedAt: msg.CreatedAt.UTC().Format(time.RFC3339Nano),
+				},
+			})
+		}
+	}
+
+	srv := server.NewServer(cfg.HTTPAddr, server.NewWithStoreAndCallback(server.Node{ID: cfg.NodeID}, st, onMessage))
 
 	// Initialize the private peer mTLS transport (Milestone 3B). When peer TLS
 	// is enabled, load credentials and create the peer server. A credential
@@ -157,12 +192,30 @@ func run() (retErr error) {
 		if err := peerMgr.Start(ctx); err != nil {
 			return fmt.Errorf("starting peer TLS (initial credential load): %w", err)
 		}
-		// Milestone 4A: pass the local store and the opt-in flag so the
+		// Milestone 4A/4B: pass the local store and the opt-in flag so the
 		// private peer listener can register POST /internal/messages when
 		// the operator has explicitly enabled authenticated peer message
-		// exchange. When disabled (the default), only /internal/status is
-		// registered — no automatic replication before Milestone 5.
-		peerSrv = peertls.NewPeerServerWithStore(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled)
+		// exchange. When gossip is also enabled, the onNewMessage callback
+		// enqueues newly received messages for further fanout.
+		var onNewMsg func(msg *store.Message, senderPodID string)
+		if gEngine != nil {
+			onNewMsg = func(msg *store.Message, senderPodID string) {
+				gEngine.Enqueue(gossip.MessageEvent{
+					Message: peertls.MessageWire{
+						ID:        msg.ID,
+						Body:      msg.Body,
+						Origin:    msg.Origin,
+						CreatedAt: msg.CreatedAt.UTC().Format(time.RFC3339Nano),
+					},
+					SenderPodID: senderPodID,
+				})
+			}
+		}
+		if onNewMsg != nil {
+			peerSrv = peertls.NewPeerServerWithStoreAndCallback(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, onNewMsg)
+		} else {
+			peerSrv = peertls.NewPeerServerWithStore(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled)
+		}
 	}
 
 	// Start listening in a goroutine so we can watch for OS signals on the
@@ -197,6 +250,53 @@ func run() (retErr error) {
 			slog.String("addr", cfg.PeerAddr),
 			slog.String("identity_suffix", cfg.PeerIdentitySuffix),
 			slog.Bool("peer_message_exchange", cfg.PeerMessageExchangeEnabled),
+		)
+	}
+
+	// Milestone 4B: start the gossip engine now that the peer client and
+	// discovery are available. Set the delivery transport and snapshot
+	// source, then start the worker pool.
+	if gEngine != nil && peerMgr != nil {
+		peerClient := peertls.NewClient(peerMgr)
+		gEngine.SetDelivery(gossip.NewRealDelivery(peerClient))
+		// Set the snapshot source to bridge discovery.Snapshot into
+		// gossip.PeerSnapshot (avoiding a circular import).
+		gEngine.SetSnapshotSource(func() gossip.PeerSnapshot {
+			ds := discMgr.Snapshot()
+			peers := make([]gossip.PeerInfo, len(ds.Peers))
+			for i, p := range ds.Peers {
+				peers[i] = gossip.PeerInfo{
+					Hostname:    p.Hostname,
+					PodIdentity: p.PodIdentity,
+					Address:     p.Address,
+					LastSeen:    p.LastSeen,
+				}
+			}
+			var localNode *gossip.PeerInfo
+			if ds.LocalNode != nil {
+				localNode = &gossip.PeerInfo{
+					Hostname:    ds.LocalNode.Hostname,
+					PodIdentity: ds.LocalNode.PodIdentity,
+					Address:     ds.LocalNode.Address,
+					LastSeen:    ds.LocalNode.LastSeen,
+				}
+			}
+			return gossip.PeerSnapshot{
+				Peers:     peers,
+				LocalNode: localNode,
+				Stale:     ds.Stale,
+				Mode:      string(ds.Mode),
+			}
+		})
+		if err := gEngine.Start(ctx); err != nil {
+			return fmt.Errorf("starting gossip engine: %w", err)
+		}
+		logger.Info("gossip engine started",
+			slog.Int("fanout", cfg.GossipFanout),
+			slog.Int("rounds", cfg.GossipRounds),
+			slog.Int("workers", cfg.GossipWorkers),
+			slog.Int("queue_capacity", cfg.GossipQueueCapacity),
+			slog.Int("max_attempts", cfg.GossipMaxAttempts),
 		)
 	}
 
@@ -324,6 +424,34 @@ func splitTrimPeers(s string) []string {
 		}
 	}
 	return result
+}
+
+// buildGossipEngine constructs and returns the gossip engine for the
+// configured parameters. It does NOT start the engine (Start is called
+// after discovery is initialized, so the snapshot source can be set).
+// Returns nil on failure (the error is logged).
+func buildGossipEngine(cfg *config.Config, logger *slog.Logger) *gossip.Engine {
+	gossipCfg := gossip.Config{
+		Fanout:        cfg.GossipFanout,
+		Rounds:        cfg.GossipRounds,
+		Workers:       cfg.GossipWorkers,
+		QueueCapacity: cfg.GossipQueueCapacity,
+		MaxAttempts:   cfg.GossipMaxAttempts,
+		RetryBase:     cfg.GossipRetryBase,
+		RetryMax:      cfg.GossipRetryMax,
+	}
+	if err := gossipCfg.Validate(); err != nil {
+		logger.Error("gossip config validation failed", "error", err)
+		return nil
+	}
+
+	// Build the peer selector with the configured identity suffix.
+	selector := gossip.NewDefaultPeerSelector(cfg.PeerIdentitySuffix, nil)
+
+	// The delivery transport is set after the peer client is available.
+	// For now, create the engine with a placeholder; the real delivery
+	// is set via SetDelivery after the peer client exists.
+	return gossip.New(gossipCfg, selector, nil, logger)
 }
 
 // buildPeerTLSConfig converts the validated environment configuration into the

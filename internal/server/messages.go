@@ -17,10 +17,17 @@ const (
 	maxPageSize     = 100
 )
 
+// MessageCallback is an optional notification invoked after a successful
+// local message commit (POST /api/messages). The callback receives the
+// committed message. It must not block indefinitely; the HTTP handler does
+// not wait for the callback to complete.
+type MessageCallback func(msg store.Message)
+
 // messageHandler holds the dependencies for message API endpoints.
 type messageHandler struct {
-	store  *store.Store
-	nodeID string
+	store     *store.Store
+	nodeID    string
+	onMessage MessageCallback
 }
 
 // newMessageHandler creates a messageHandler with the given store.
@@ -112,6 +119,14 @@ func (h *messageHandler) postMessages(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, "failed to store message")
 		}
 		return
+	}
+
+	// Milestone 4B: notify the gossip engine of a new local message.
+	// The callback is non-blocking (it enqueues to a bounded channel).
+	// The HTTP response is returned after the local commit; it does not
+	// wait for network replication.
+	if h.onMessage != nil {
+		h.onMessage(*msg)
 	}
 
 	writeJSON(w, http.StatusCreated, msg)

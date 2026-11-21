@@ -41,6 +41,57 @@ import (
 // are small; 8 KiB is generous without risking unbounded memory.
 const maxResponseBodyBytes = 8192
 
+// PeerHTTPStatusError is returned by Client.SendMessage (and GetStatus) when a
+// peer responds with a non-success HTTP status. The exact status code is
+// carried as a typed field so callers (e.g. the gossip engine) can classify the
+// failure (e.g. a 409 conflict is permanent, a 503 is transient) without
+// string-matching the error, which is unreliable (a network error such as
+// "dial tcp 127.0.0.1:4090: connection refused" contains "409" but is a
+// transient transport failure, not an HTTP 409).
+type PeerHTTPStatusError struct {
+	identity string
+	status   int
+	body     string
+}
+
+func (e *PeerHTTPStatusError) Error() string {
+	if e.body == "" {
+		return fmt.Sprintf("peer %s rejected request: status %d", e.identity, e.status)
+	}
+	return fmt.Sprintf("peer %s rejected request: status %d: %s", e.identity, e.status, e.body)
+}
+
+// StatusCode returns the HTTP status code of the peer's non-success response.
+func (e *PeerHTTPStatusError) StatusCode() int { return e.status }
+
+// NewPeerHTTPStatusError returns a PeerHTTPStatusError for the given peer
+// identity, HTTP status code, and response body. It is exported so callers and
+// tests can construct the typed error without relying on a real HTTP exchange.
+func NewPeerHTTPStatusError(identity string, status int, body string) *PeerHTTPStatusError {
+	return &PeerHTTPStatusError{identity: identity, status: status, body: body}
+}
+
+// NewPeerAckError returns a PeerAckError for the given peer identity and
+// reason. It is exported so callers and tests can construct the typed error
+// without relying on a real HTTP exchange.
+func NewPeerAckError(identity, reason string) *PeerAckError {
+	return &PeerAckError{identity: identity, reason: reason}
+}
+
+// PeerAckError is returned by Client.SendMessage when a successful response
+// (200/201) carries an invalid message acknowledgment: a missing or null
+// message, or a mismatched/malformed ID, body, origin, or creation timestamp.
+// These are protocol defects (not transient network failures) and are
+// classified as permanent by callers.
+type PeerAckError struct {
+	identity string
+	reason   string
+}
+
+func (e *PeerAckError) Error() string {
+	return fmt.Sprintf("peer %s returned a successful response with an invalid acknowledgment: %s", e.identity, e.reason)
+}
+
 // Client is an authenticated peer HTTP client for the private peer endpoints.
 // It wraps the Manager's credential snapshot for the mTLS transport.
 type Client struct {
@@ -189,7 +240,7 @@ func (c *Client) GetStatus(ctx context.Context, dialAddr, expectedIdentity strin
 		return nil, err
 	}
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("peer %s returned status %d: %s", expectedIdentity, status, string(respBody))
+		return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
 	}
 	var out peerStatusResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -235,30 +286,30 @@ func (c *Client) SendMessage(ctx context.Context, dialAddr, expectedIdentity str
 		return nil, err
 	}
 	if status != http.StatusOK && status != http.StatusCreated {
-		return nil, fmt.Errorf("peer %s rejected message: status %d: %s", expectedIdentity, status, string(respBody))
+		return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
 	}
 	var out sendResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
-		return nil, fmt.Errorf("decoding send response from %s: %w", expectedIdentity, err)
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("decoding send response: %v", err)}
 	}
 	// A successful response must echo back a message acknowledgment. A 200/201
 	// without one is a protocol defect: the receiver must confirm what it
 	// persisted, and the caller cannot assume the insert happened.
 	if out.Message == nil {
-		return nil, fmt.Errorf("peer %s returned a successful response (status %d) without a message acknowledgment", expectedIdentity, status)
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("status %d returned without a message acknowledgment", status)}
 	}
 	ack := out.Message
 	if ack.ID != msg.ID {
-		return nil, fmt.Errorf("peer %s acknowledged message ID %q but submitted ID was %q", expectedIdentity, ack.ID, msg.ID)
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("acknowledged message ID %q but submitted ID was %q", ack.ID, msg.ID)}
 	}
 	if ack.Body != msg.Body {
-		return nil, fmt.Errorf("peer %s acknowledged message body %q but submitted body was %q", expectedIdentity, ack.Body, msg.Body)
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("acknowledged message body %q but submitted body was %q", ack.Body, msg.Body)}
 	}
 	if ack.Origin != msg.Origin {
-		return nil, fmt.Errorf("peer %s acknowledged message origin %q but submitted origin was %q", expectedIdentity, ack.Origin, msg.Origin)
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("acknowledged message origin %q but submitted origin was %q", ack.Origin, msg.Origin)}
 	}
 	if err := verifyAcknowledgedTimestamp(ack.CreatedAt, msg.CreatedAt); err != nil {
-		return nil, fmt.Errorf("peer %s acknowledged a mismatched message timestamp: %w", expectedIdentity, err)
+		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("acknowledged a mismatched message timestamp: %v", err)}
 	}
 	return ack, nil
 }

@@ -25,6 +25,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"gossipgrid/internal/store"
@@ -48,6 +49,12 @@ type PeerServer struct {
 	mgr *Manager
 
 	HTTPServer *http.Server
+
+	// onNewMessage is an optional callback invoked after a successfully
+	// inserted (new row) replicated message. It is NOT called for duplicate
+	// no-ops or conflicts. Used by the gossip engine (Milestone 4B) to
+	// forward newly received messages to other peers.
+	onNewMessage func(msg *store.Message, senderPodID string)
 }
 
 // maxPeerRequestBodyBytes bounds the inbound request body for
@@ -69,7 +76,7 @@ const maxPeerRequestBodyBytes = 8192
 // Timeouts are conservative: this is an internal endpoint with small payloads,
 // so slow connections are shed quickly.
 func NewPeerServer(mgr *Manager, addr, nodeID, version string) *PeerServer {
-	return newPeerServer(mgr, addr, nodeID, version, nil, false)
+	return newPeerServer(mgr, addr, nodeID, version, nil, false, nil)
 }
 
 // NewPeerServerWithStore builds a PeerServer with the given listen address,
@@ -79,26 +86,33 @@ func NewPeerServer(mgr *Manager, addr, nodeID, version string) *PeerServer {
 // Milestone 4A authenticated peer message exchange. The enable flag is a
 // hard opt-in: when false, only /internal/status is served.
 func NewPeerServerWithStore(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool) *PeerServer {
-	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange)
+	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange, nil)
+}
+
+// NewPeerServerWithStoreAndCallback is like NewPeerServerWithStore but also
+// accepts an optional callback invoked after a successfully inserted (new row)
+// replicated message. The callback receives the message and the authenticated
+// sender's pod identity (extracted from the mTLS client certificate). It is
+// NOT called for duplicate no-ops or conflicts.
+func NewPeerServerWithStoreAndCallback(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
+	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange, onNewMessage)
 }
 
 // newPeerServer is the shared builder for PeerServer variants.
-func newPeerServer(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool) *PeerServer {
+func newPeerServer(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /internal/status", newStatusHandler(mgr, nodeID, version))
 
-	// Milestone 4A: register the private message exchange endpoint only when
-	// (a) the message-exchange flag is enabled AND (b) a store is supplied.
-	// When disabled, the endpoint is NOT registered at all — a request to
-	// /internal/messages is a 404 (or 405, depending on method), not a
-	// 200. This is the explicit opt-in that prevents accidental cross-epoch
-	// replication before Milestone 5 establishes the safe bootstrap protocol.
+	// Milestone 4A/4B: register the private message exchange endpoint only
+	// when (a) the message-exchange flag is enabled AND (b) a store is
+	// supplied. When disabled, the endpoint is NOT registered at all.
 	if enabledMessageExchange && s != nil {
-		mux.HandleFunc("POST /internal/messages", newMessageExchangeHandler(mgr, s))
+		mux.HandleFunc("POST /internal/messages", newMessageExchangeHandler(mgr, s, onNewMessage))
 	}
 
 	return &PeerServer{
-		mgr: mgr,
+		mgr:          mgr,
+		onNewMessage: onNewMessage,
 		HTTPServer: &http.Server{
 			Addr:              addr,
 			Handler:           mux,
@@ -181,7 +195,7 @@ func newStatusHandler(mgr *Manager, nodeID, version string) http.HandlerFunc {
 // The message's origin field is immutable metadata identifying its original
 // creator (which may differ from the forwarding peer); mTLS alone does not
 // prove the historical origin of a forwarded message.
-func newMessageExchangeHandler(mgr *Manager, s *store.Store) http.HandlerFunc {
+func newMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessage func(msg *store.Message, senderPodID string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Reject oversized bodies before reading. MaxBytesReader provides a
 		// second line of defense for chunked requests without Content-Length.
@@ -270,11 +284,15 @@ func newMessageExchangeHandler(mgr *Manager, s *store.Store) http.HandlerFunc {
 			msg.CreatedAt = createdAt
 		}
 
-		// Reuse the store's validation and idempotent insert. The store
+		// Use the store's validation and idempotent insert. The store
 		// enforces canonical UUIDv7, nonempty body/origin, non-zero
 		// timestamp, bounded body (4096 bytes), and atomic ON CONFLICT DO
 		// NOTHING insert with conflict detection.
-		if err := s.InsertReplicatedMessage(&msg); err != nil {
+		// Milestone 4B: use InsertReplicatedMessageReturningInserted to
+		// distinguish "new row created" from "duplicate no-op" so that
+		// only genuinely new messages trigger gossip forwarding.
+		inserted, err := s.InsertReplicatedMessageReturningInserted(&msg)
+		if err != nil {
 			switch {
 			case errors.Is(err, store.ErrInvalidID):
 				writePeerJSONError(w, http.StatusBadRequest, "invalid message: id must be a canonical UUIDv7")
@@ -292,6 +310,16 @@ func newMessageExchangeHandler(mgr *Manager, s *store.Store) http.HandlerFunc {
 				writePeerJSONError(w, http.StatusInternalServerError, "failed to store message")
 			}
 			return
+		}
+
+		// Milestone 4B: if a new row was created and a callback is
+		// configured, notify the gossip engine to forward this message
+		// to other peers. The callback receives the message and the
+		// authenticated sender's pod identity (for duplicate suppression:
+		// avoid forwarding back to the peer we just received from).
+		if inserted && onNewMessage != nil {
+			senderPodID := extractSenderPodID(r, mgr)
+			onNewMessage(&msg, senderPodID)
 		}
 
 		// Echo the stored message for the caller to confirm what was
@@ -355,4 +383,31 @@ func writePeerJSONError(w http.ResponseWriter, status int, msg string) {
 	writePeerJSON(w, status, struct {
 		Error string `json:"error"`
 	}{Error: msg})
+}
+
+// extractSenderPodID extracts the authenticated sender's pod identity from
+// the mTLS client certificate in the request. The request is only received
+// after the mTLS handshake has completed (including the custom
+// VerifyPeerCertificate identity authorization), so the client certificate
+// is guaranteed to be an authorized GossipGrid replica.
+//
+// Returns an empty string when the TLS state is unavailable (e.g., in tests
+// that bypass the TLS layer) or when the certificate cannot be parsed.
+// The empty string is safe: the gossip engine treats it as "unknown sender"
+// and simply does not exclude any specific peer from forwarding.
+func extractSenderPodID(r *http.Request, mgr *Manager) string {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return ""
+	}
+	leaf := r.TLS.PeerCertificates[0]
+	if len(leaf.DNSNames) == 0 {
+		return ""
+	}
+	// The pod identity is the part before the identity suffix in the DNS SAN.
+	san := normalizeDNSName(leaf.DNSNames[0])
+	suffix := normalizeDNSName(mgr.cfg.IdentitySuffix)
+	if strings.HasSuffix(san, "."+suffix) {
+		return san[:len(san)-len(suffix)-1]
+	}
+	return ""
 }

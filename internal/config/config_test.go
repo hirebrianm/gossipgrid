@@ -442,6 +442,177 @@ func TestValidateAddr(t *testing.T) {
 	}
 }
 
+// gossipBaseVars returns the env vars needed to enable gossip with valid
+// prerequisites (peer mTLS, message exchange, static discovery).
+func gossipBaseVars() map[string]string {
+	return map[string]string{
+		EnvGossipEnabled:              "true",
+		EnvPeerTLSEnabled:             "true",
+		EnvPeerCertFile:               "/certs/tls.crt",
+		EnvPeerKeyFile:                "/certs/tls.key",
+		EnvPeerTrustBundleFile:        "/certs/ca-bundle.pem",
+		EnvPeerIdentitySuffix:         "gossipgrid-headless.default.svc.cluster.local",
+		EnvPeerMessageExchangeEnabled: "true",
+		EnvDiscoveryMode:              "static",
+		EnvStaticPeers:                "a:8443,b:8443",
+	}
+}
+
+func TestGossipConfigDefaults(t *testing.T) {
+	cfg, err := load(env(gossipBaseVars()))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.GossipEnabled {
+		t.Fatal("GossipEnabled should be true")
+	}
+	if cfg.GossipFanout != 2 {
+		t.Errorf("GossipFanout = %d, want 2", cfg.GossipFanout)
+	}
+	if cfg.GossipRounds != 3 {
+		t.Errorf("GossipRounds = %d, want 3", cfg.GossipRounds)
+	}
+	if cfg.GossipWorkers != 4 {
+		t.Errorf("GossipWorkers = %d, want 4", cfg.GossipWorkers)
+	}
+	if cfg.GossipQueueCapacity != 256 {
+		t.Errorf("GossipQueueCapacity = %d, want 256", cfg.GossipQueueCapacity)
+	}
+	if cfg.GossipMaxAttempts != 3 {
+		t.Errorf("GossipMaxAttempts = %d, want 3", cfg.GossipMaxAttempts)
+	}
+	if cfg.GossipRetryBase != 250*time.Millisecond {
+		t.Errorf("GossipRetryBase = %v, want 250ms", cfg.GossipRetryBase)
+	}
+	if cfg.GossipRetryMax != 5*time.Second {
+		t.Errorf("GossipRetryMax = %v, want 5s", cfg.GossipRetryMax)
+	}
+}
+
+func TestGossipDisabledIgnoresMalformedValues(t *testing.T) {
+	// When gossip is disabled, malformed gossip values are ignored.
+	vars := map[string]string{
+		EnvGossipFanout: "not-a-number",
+		EnvGossipRounds: "-5",
+	}
+	cfg, err := load(env(vars))
+	if err != nil {
+		t.Fatalf("expected no error when gossip disabled, got: %v", err)
+	}
+	if cfg.GossipEnabled {
+		t.Error("GossipEnabled should be false")
+	}
+}
+
+func TestGossipInvalidInteger(t *testing.T) {
+	cases := []struct {
+		name   string
+		vars   map[string]string
+		expect string
+	}{
+		{"fanout not a number", mergeVars(gossipBaseVars(), EnvGossipFanout, "abc"), EnvGossipFanout},
+		{"rounds negative", mergeVars(gossipBaseVars(), EnvGossipRounds, "-1"), EnvGossipRounds},
+		{"workers zero", mergeVars(gossipBaseVars(), EnvGossipWorkers, "0"), EnvGossipWorkers},
+		{"queue capacity zero", mergeVars(gossipBaseVars(), EnvGossipQueueCapacity, "0"), EnvGossipQueueCapacity},
+		{"max attempts zero", mergeVars(gossipBaseVars(), EnvGossipMaxAttempts, "0"), EnvGossipMaxAttempts},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := load(env(tc.vars))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !contains(err.Error(), tc.expect) {
+				t.Errorf("error should mention %s: %v", tc.expect, err)
+			}
+		})
+	}
+}
+
+func TestGossipOutOfRange(t *testing.T) {
+	cases := []struct {
+		name   string
+		vars   map[string]string
+		expect string
+	}{
+		{"fanout too high", mergeVars(gossipBaseVars(), EnvGossipFanout, "33"), EnvGossipFanout},
+		{"rounds too high", mergeVars(gossipBaseVars(), EnvGossipRounds, "33"), EnvGossipRounds},
+		{"workers too high", mergeVars(gossipBaseVars(), EnvGossipWorkers, "65"), EnvGossipWorkers},
+		{"queue capacity too high", mergeVars(gossipBaseVars(), EnvGossipQueueCapacity, "1025"), EnvGossipQueueCapacity},
+		{"max attempts too high", mergeVars(gossipBaseVars(), EnvGossipMaxAttempts, "11"), EnvGossipMaxAttempts},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := load(env(tc.vars))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !contains(err.Error(), tc.expect) {
+				t.Errorf("error should mention %s: %v", tc.expect, err)
+			}
+		})
+	}
+}
+
+func TestGossipInvalidDuration(t *testing.T) {
+	cases := []struct {
+		name   string
+		vars   map[string]string
+		expect string
+	}{
+		{"retry base not a duration", mergeVars(gossipBaseVars(), EnvGossipRetryBase, "soon"), EnvGossipRetryBase},
+		{"retry base zero", mergeVars(gossipBaseVars(), EnvGossipRetryBase, "0s"), EnvGossipRetryBase},
+		{"retry max not a duration", mergeVars(gossipBaseVars(), EnvGossipRetryMax, "x"), EnvGossipRetryMax},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := load(env(tc.vars))
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !contains(err.Error(), tc.expect) {
+				t.Errorf("error should mention %s: %v", tc.expect, err)
+			}
+		})
+	}
+}
+
+func TestGossipValidOverrides(t *testing.T) {
+	cfg, err := load(env(mergeVars(gossipBaseVars(),
+		EnvGossipFanout, "4",
+		EnvGossipRounds, "2",
+		EnvGossipWorkers, "8",
+		EnvGossipQueueCapacity, "512",
+		EnvGossipMaxAttempts, "5",
+		EnvGossipRetryBase, "100ms",
+		EnvGossipRetryMax, "2s",
+	)))
+	if err != nil {
+		t.Fatalf("expected valid config, got: %v", err)
+	}
+	if cfg.GossipFanout != 4 || cfg.GossipRounds != 2 || cfg.GossipWorkers != 8 {
+		t.Errorf("fanout/rounds/workers = %d/%d/%d, want 4/2/8", cfg.GossipFanout, cfg.GossipRounds, cfg.GossipWorkers)
+	}
+	if cfg.GossipQueueCapacity != 512 || cfg.GossipMaxAttempts != 5 {
+		t.Errorf("queue/maxAttempts = %d/%d, want 512/5", cfg.GossipQueueCapacity, cfg.GossipMaxAttempts)
+	}
+	if cfg.GossipRetryBase != 100*time.Millisecond || cfg.GossipRetryMax != 2*time.Second {
+		t.Errorf("retryBase/max = %v/%v, want 100ms/2s", cfg.GossipRetryBase, cfg.GossipRetryMax)
+	}
+}
+
+// mergeVars returns a new map with the given key-value pairs added to base.
+func mergeVars(base map[string]string, kv ...string) map[string]string {
+	out := make(map[string]string, len(base)+len(kv)/2)
+	for k, v := range base {
+		out[k] = v
+	}
+	for i := 0; i+1 < len(kv); i += 2 {
+		out[kv[i]] = kv[i+1]
+	}
+	return out
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (s == sub || len(s) > len(sub) && indexOf(s, sub) >= 0)
 }

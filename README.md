@@ -5,13 +5,14 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-> **Status: Milestone 4A implemented (November 2026).** A locally runnable single-instance Go service with configuration,
+> **Status: Milestone 4B implemented (November 2026).** A locally runnable single-instance Go service with configuration,
 > HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, peer discovery (static and
 > Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with certificate hot-reload**, **authenticated
-> peer message exchange (POST /internal/messages, opt-in)**, structured logging, graceful shutdown, a Makefile, a
-> static `scratch` Docker image, GitLab CI, GitHub Actions, and tests. Automatic gossip fanout, anti-entropy,
-> multi-node synchronization, and Kubernetes deployment are **not yet implemented** and remain planned milestones
-> (Milestones 4B, 4C, 5, and 7). No application-level FIPS certification or production-readiness claims are made.
+> peer message exchange (POST /internal/messages, opt-in)**, **automatic epidemic gossip fanout with bounded queues,
+> exponential-backoff retries, and duplicate suppression (opt-in)**, structured logging, graceful shutdown, a Makefile,
+> a static `scratch` Docker image, GitLab CI, GitHub Actions, and tests. Anti-entropy, multi-node synchronization,
+> and Kubernetes deployment are **not yet implemented** and remain planned milestones
+> (Milestones 4C, 5, and 7). No application-level FIPS certification or production-readiness claims are made.
 
 ## What it does (planned)
 
@@ -53,7 +54,8 @@ deliberate part of the testbed design.
 | Authenticated peer HTTP client (dial address vs expected identity) | ✅ |
 | Private `/internal/status` endpoint (mTLS-protected) | ✅ |
 | Authenticated peer message exchange (POST /internal/messages, opt-in) | ✅ |
-| Gossip replication protocol (automatic fanout, retries, anti-entropy) | 🔜 Milestone 4B/4C |
+| Epidemic gossip (automatic fanout, bounded queues, retries, duplicate suppression) | ✅ |
+| Anti-entropy (periodic inventory comparison, snapshot sync) | 🔜 Milestone 4C |
 | Bootstrap/sync lifecycle | 🔜 Milestone 5 |
 | Web UI and diagnostics | 🔜 Milestone 6 |
 | Kubernetes packaging (Helm) | 🔜 Milestone 7 |
@@ -172,6 +174,14 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_PEER_IDENTITY_SUFFIX` | (empty) | DNS suffix following the pod name in the cert SAN (e.g. `gossipgrid-headless.default.svc.cluster.local`) |
 | `GOSSIPGRID_PEER_TLS_RELOAD_INTERVAL` | `2s` | Polling interval for credential file changes |
 | `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED` | `false` | Enable the private peer message exchange endpoint (POST /internal/messages). Requires peer mTLS |
+| `GOSSIPGRID_GOSSIP_ENABLED` | `false` | Enable automatic epidemic gossip fanout (Milestone 4B). Requires peer mTLS, message exchange, and static or dns discovery |
+| `GOSSIPGRID_GOSSIP_FANOUT` | `2` | Peers contacted per propagation round (range 1-32) |
+| `GOSSIPGRID_GOSSIP_ROUNDS` | `3` | Fanout rounds per message (range 1-32) |
+| `GOSSIPGRID_GOSSIP_WORKERS` | `4` | Concurrent delivery workers (range 1-64) |
+| `GOSSIPGRID_GOSSIP_QUEUE_CAPACITY` | `256` | Work queue capacity (range 1-1024) |
+| `GOSSIPGRID_GOSSIP_MAX_ATTEMPTS` | `3` | Total delivery attempts per peer, including initial (range 1-10) |
+| `GOSSIPGRID_GOSSIP_RETRY_BASE` | `250ms` | Base duration for exponential backoff (must be positive) |
+| `GOSSIPGRID_GOSSIP_RETRY_MAX` | `5s` | Maximum backoff duration (must be >= retry base) |
 
 When `GOSSIPGRID_PEER_TLS_ENABLED` is `true`, all of the peer TLS file paths and the identity suffix are **required**; a
 missing or malformed value fails startup clearly (no silent fallback to unauthenticated communication). When it is
@@ -179,9 +189,10 @@ missing or malformed value fails startup clearly (no silent fallback to unauthen
 
 When `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED` is `true`, the private peer listener additionally registers
 `POST /internal/messages`, accepting idempotent replicated message inserts from authenticated replicas. This is a
-provisional, opt-in, direct-exchange capability: it does **not** enable automatic gossip, fanout, anti-entropy, or
-readiness gating (those belong to Milestones 4B, 4C, and 5). It **requires** `GOSSIPGRID_PEER_TLS_ENABLED=true`;
-enabling it without peer mTLS fails configuration validation.
+provisional, opt-in, direct-exchange capability: it does **not** enable anti-entropy or readiness gating
+(Milestones 4C and 5). It **requires** `GOSSIPGRID_PEER_TLS_ENABLED=true`; enabling it without peer mTLS fails
+configuration validation. Automatic epidemic gossip fanout is enabled separately via `GOSSIPGRID_GOSSIP_ENABLED`
+(Milestone 4B, implemented).
 
 ### Endpoints
 
@@ -194,9 +205,11 @@ enabling it without peer mTLS fails configuration validation.
 
 ### Peer discovery
 
-GossipGrid supports three discovery modes. Discovery is **observational** in this milestone: a failed DNS
-lookup does not affect the public HTTP service's readiness, and no peer connections are initiated.
-Peer connections (mTLS, gossip, synchronization) are implemented in subsequent milestones.
+GossipGrid supports three discovery modes. Discovery is **observational**: a failed DNS
+lookup does not affect the public HTTP service's readiness. When gossip is enabled
+(`GOSSIPGRID_GOSSIP_ENABLED=true`), the discovery snapshot feeds the gossip engine's
+peer selector through the production bridge. Peer synchronization (anti-entropy,
+Milestone 4C) is not yet implemented.
 
 | Mode | Use case | Behavior |
 | --- | --- | --- |
