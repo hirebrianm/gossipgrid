@@ -342,6 +342,9 @@ networkPolicy:
   # Do NOT use 0.0.0.0/0 — that defeats the purpose of the NetworkPolicy.
   # Empty by default (only Gateway and GossipGrid pods can reach the web port).
   additionalIngressCIDRs: []
+  # Use Cilium's reserved ingress identity for Gateway API traffic.
+  # Requires CiliumNetworkPolicy CRDs.
+  ciliumGatewayIngressEnabled: false
 
 # -- ServiceAccount.
 #

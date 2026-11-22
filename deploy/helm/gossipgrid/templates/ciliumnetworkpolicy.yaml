@@ -1,0 +1,27 @@
+
+{{- if and .Values.networkPolicy.enabled .Values.networkPolicy.ciliumGatewayIngressEnabled }}
+# Allow Cilium Gateway's Envoy proxy to reach GossipGrid's HTTP listener.
+# Peer mTLS and workload egress remain governed by the Kubernetes NetworkPolicy.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: gossipgrid-gateway-ingress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: network
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: gossipgrid
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: peer
+  ingress:
+    - fromEntities:
+        - ingress
+      toPorts:
+        - ports:
+            - port: {{ .Values.webPort | quote }}
+              protocol: TCP
+{{- end }}
