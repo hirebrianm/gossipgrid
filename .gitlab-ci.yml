@@ -11,6 +11,7 @@ variables:
   GOLANGCI_LINT_VERSION: "v2.15.0"
   GOSEC_VERSION: "v2.30.0"
   GOLDMARK_LINT_VERSION: "v0.6.3"
+  HELM_VERSION: "v3.22.1"
   FIPS_MODULE: "v1.0.0"
 
 stages:
@@ -40,10 +41,22 @@ workflow:
 image: golang:1.27-alpine
 
 before_script:
-  - apk add --no-cache build-base sqlite-static sqlite-dev bash git
+  - apk add --no-cache build-base sqlite-static sqlite-dev bash git curl
   - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}
   - go install github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}
   - go install github.com/mrueg/goldmark-lint/cmd/goldmark-lint@${GOLDMARK_LINT_VERSION}
+  # Install a pinned Helm release (used by `make helm-lint` and `make
+  # deploy-checks`). The golang alpine image has no `helm` binary, so it is
+  # fetched from the official get.helm.sh release tarball (static linux-amd64
+  # binary, no further deps) and installed on PATH under $GOPATH/bin, which is
+  # already on the default Go image PATH. A version is pinned so the install
+  # is reproducible and `helm version` can be verified below.
+  - "curl -fsSL -o /tmp/helm.tgz https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+  - "tar -xzf /tmp/helm.tgz -C /tmp linux-amd64/helm"
+  - "mkdir -p $GOPATH/bin && mv /tmp/linux-amd64/helm $GOPATH/bin/"
+  - "rm -f /tmp/helm.tgz && rmdir /tmp/linux-amd64"
+  # Verify Helm is available and is the pinned version before the QA run.
+  - "helm version"
 
 qa:
   stage: qa

@@ -240,7 +240,7 @@ make version     # show the resolved build version, FIPS module, and image refer
 make clean       # remove build outputs
 ```
 
-The `make qa` target runs: `fmt-check` → `go vet` → `golangci-lint` → `gosec` → `docs-lint` → `go test` → `go test -race`.
+The `make qa` target runs: `fmt-check` → `go vet` → `golangci-lint` → `gosec` → `docs-lint` → `diagrams-check` → `helm-lint` → `deploy-checks` → `go test` → `go test -race` → `test-version-injection`.
 
 ### FIPS 140-3 builds
 
