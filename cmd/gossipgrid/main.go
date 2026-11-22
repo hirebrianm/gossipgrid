@@ -26,6 +26,7 @@ import (
 	"gossipgrid/internal/config"
 	"gossipgrid/internal/discovery"
 	"gossipgrid/internal/gossip"
+	"gossipgrid/internal/lifecycle"
 	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/server"
 	"gossipgrid/internal/store"
@@ -169,8 +170,6 @@ func run() (retErr error) {
 		}
 	}
 
-	srv := server.NewServer(cfg.HTTPAddr, server.NewWithStoreAndCallback(server.Node{ID: cfg.NodeID}, st, onMessage))
-
 	// Initialize the private peer mTLS transport (Milestone 3B). When peer TLS
 	// is enabled, load credentials and create the peer server. A credential
 	// load failure must fail startup clearly — no silent fallback to
@@ -178,6 +177,7 @@ func run() (retErr error) {
 	// running indefinitely.
 	var peerMgr *peertls.Manager
 	var peerSrv *peertls.PeerServer
+	var lifeCtrl *lifecycle.Controller
 	if cfg.PeerTLSEnabled {
 		peerCfg, perr := buildPeerTLSConfig(cfg)
 		if perr != nil {
@@ -193,6 +193,46 @@ func run() (retErr error) {
 		if err := peerMgr.Start(ctx); err != nil {
 			return fmt.Errorf("starting peer TLS (initial credential load): %w", err)
 		}
+
+		// Milestone 5A: when lifecycle protection is enabled, create the
+		// lifecycle controller. The controller owns the state machine, the
+		// accepted metadata, and the local database binding. It runs a
+		// metadata worker that periodically reads the authoritative source.
+		//
+		// In Milestone 5A there is no production Kubernetes metadata
+		// provider. The metadata source is a no-op that always returns
+		// ErrMetadataUnavailable. This is the correct fail-closed behavior:
+		// without an authoritative observation, the replica cannot establish
+		// its epoch and must remain unready.
+		if cfg.LifecycleEnabled {
+			machine := lifecycle.NewMachine(nil)
+			// A no-op metadata source: always unavailable. The future
+			// Kubernetes provider will replace this with a real
+			// resourceVersion-based reader.
+			metadataSource := lifecycle.NewFakeMetadataSourceUnavailable()
+			lcCfg := lifecycle.Config{
+				MetadataPollInterval: 30 * time.Second,
+				NodeID:               cfg.NodeID,
+				Enabled:              true,
+			}
+			lifeCtrl = lifecycle.NewController(lcCfg, machine, metadataSource, st, logger)
+			// Defer the controller shutdown on every exit path.
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+				defer cancel()
+				lifeCtrl.Stop(shutdownCtx)
+			}()
+			if err := lifeCtrl.Start(ctx); err != nil {
+				return fmt.Errorf("starting lifecycle controller: %w", err)
+			}
+			lSnap := lifeCtrl.Snapshot()
+			logger.Info("lifecycle controller started",
+				slog.String("state", lSnap.State.String()),
+				slog.String("reason", lSnap.Reason),
+				slog.String("authority_state", lSnap.AuthorityState),
+			)
+		}
+
 		// Milestone 4A/4B: pass the local store and the opt-in flag so the
 		// private peer listener can register POST /internal/messages when
 		// the operator has explicitly enabled authenticated peer message
@@ -212,20 +252,51 @@ func run() (retErr error) {
 				})
 			}
 		}
-		// Milestone 4C: when anti-entropy is enabled, use the sync-aware
+		// Milestone 4C/5A: when anti-entropy is enabled, use the sync-aware
 		// constructor which also registers the private sync endpoints.
+		// When lifecycle protection is enabled (lifeCtrl != nil), use the
+		// lifecycle-aware constructor which fences all replication
+		// endpoints on the controller's accepted metadata and state.
 		if cfg.AntiEntropyEnabled {
 			if onNewMsg != nil {
-				peerSrv = peertls.NewPeerServerWithSync(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, onNewMsg)
+				if lifeCtrl != nil {
+					peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, onNewMsg, lifeCtrl)
+				} else {
+					peerSrv = peertls.NewPeerServerWithSync(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, onNewMsg)
+				}
 			} else {
-				peerSrv = peertls.NewPeerServerWithSync(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, nil)
+				if lifeCtrl != nil {
+					peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, nil, lifeCtrl)
+				} else {
+					peerSrv = peertls.NewPeerServerWithSync(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, nil)
+				}
 			}
 		} else if onNewMsg != nil {
-			peerSrv = peertls.NewPeerServerWithStoreAndCallback(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, onNewMsg)
+			if lifeCtrl != nil {
+				peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, false, onNewMsg, lifeCtrl)
+			} else {
+				peerSrv = peertls.NewPeerServerWithStoreAndCallback(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, onNewMsg)
+			}
 		} else {
-			peerSrv = peertls.NewPeerServerWithStore(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled)
+			if lifeCtrl != nil {
+				peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, false, nil, lifeCtrl)
+			} else {
+				peerSrv = peertls.NewPeerServerWithStore(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled)
+			}
 		}
 	}
+
+	// Build the public server handler. When lifecycle protection is enabled
+	// (lifeCtrl != nil), use the lifecycle-aware constructor which gates
+	// readiness on the controller's state and rejects public writes while
+	// unready. Otherwise, use the legacy constructor (always ready).
+	var publicHandler http.Handler
+	if lifeCtrl != nil {
+		publicHandler = server.NewWithStoreAndCallbackAndLifecycle(server.Node{ID: cfg.NodeID}, st, onMessage, lifeCtrl)
+	} else {
+		publicHandler = server.NewWithStoreAndCallback(server.Node{ID: cfg.NodeID}, st, onMessage)
+	}
+	srv := server.NewServer(cfg.HTTPAddr, publicHandler)
 
 	// Start listening in a goroutine so we can watch for OS signals on the
 	// main goroutine. ListenAndServe returns nil when Shutdown has been called.
@@ -262,12 +333,45 @@ func run() (retErr error) {
 		)
 	}
 
+	// Milestone 4B/5A: create the peer client (shared by gossip and
+	// anti-entropy). When lifecycle protection is enabled, set the
+	// client's local epoch context so that all replication requests carry
+	// the caller's accepted cluster and epoch headers.
+	var peerClient *peertls.Client
+	if peerMgr != nil {
+		peerClient = peertls.NewClient(peerMgr)
+		// Milestone 5A: source the outbound epoch context from the lifecycle
+		// controller's CURRENT authorization decision, not a one-time startup
+		// copy. The provider returns the authorized cluster/epoch when the
+		// snapshot is authorized (ready state + fresh, valid, matching
+		// observation + matching durable binding, no lockout, not stopped),
+		// and an error otherwise (a lockout or no fresh observation blocks
+		// outbound requests). A metadata change between two requests is
+		// reflected in the next request (or the request is blocked), rather
+		// than using a stale startup copy.
+		if lifeCtrl != nil {
+			peerClient.SetEpochProvider(newControllerEpochProvider(lifeCtrl))
+		}
+	}
+
 	// Milestone 4B: start the gossip engine now that the peer client and
 	// discovery are available. Set the delivery transport and snapshot
 	// source, then start the worker pool.
 	if gEngine != nil && peerMgr != nil {
-		peerClient := peertls.NewClient(peerMgr)
 		gEngine.SetDelivery(gossip.NewRealDelivery(peerClient))
+		// Milestone 5A: set the admission check for outbound gossip.
+		// When lifecycle protection is enabled, the check blocks Enqueue
+		// when the replica is unready or has no accepted metadata.
+		if lifeCtrl != nil {
+			admission := lifeCtrl.Admission()
+			gEngine.SetAdmissionCheck(func(ctx context.Context) error {
+				decision := admission.CheckReplicationOutbound(ctx)
+				if !decision.Allowed {
+					return fmt.Errorf("lifecycle admission: %s", decision.Reason)
+				}
+				return nil
+			})
+		}
 		// Set the snapshot source to bridge discovery.Snapshot into
 		// gossip.PeerSnapshot (avoiding a circular import).
 		gEngine.SetSnapshotSource(func() gossip.PeerSnapshot {
@@ -324,10 +428,36 @@ func run() (retErr error) {
 			aEngine.Stop(shutdownCtx)
 		}()
 
-		peerClient := peertls.NewClient(peerMgr)
 		aEngine.SetInventoryClient(peerClient)
 		aEngine.SetMessageFetcher(peerClient)
 		aEngine.SetLocalStore(st)
+		// Milestone 5A: set the admission check for outbound anti-entropy.
+		if lifeCtrl != nil {
+			admission := lifeCtrl.Admission()
+			aEngine.SetAdmissionCheck(func(ctx context.Context) error {
+				decision := admission.CheckReplicationOutbound(ctx)
+				if !decision.Allowed {
+					return fmt.Errorf("lifecycle admission: %s", decision.Reason)
+				}
+				return nil
+			})
+			// Milestone 5A: set the commit guard so that the cursor commit
+			// (advancement or full-sweep completion) is executed under the
+			// controller's authorization read lock. The guard evaluates the
+			// complete authorization decision ONCE, from a single non-
+			// recursive snapshot (no second c.mu acquisition, no SQLite
+			// read while the lock is held), and only runs the short
+			// in-memory cursor mutation when that decision is authorized.
+			// A revocation that completes before the guard enters is
+			// observed and the cursor is not advanced; a revocation after
+			// the commit linearizes is a normal, permitted revocation. The
+			// non-recursive evaluation (one authorization evaluation, one
+			// protected commit boundary) prevents the deadlock that a
+			// recursive RLock (a callback re-reading the admission check
+			// under the controller's read lock) would cause when a writer
+			// (Stop or a metadata update) is waiting for the write lock.
+			aEngine.SetCommitGuard(lifeCtrl)
+		}
 		// Set the peer source to bridge discovery.Snapshot into
 		// antientropy.PeerSourceSnapshot (avoiding a circular import).
 		aEngine.SetPeerSource(antientropy.NewDiscoveryPeerSource(cfg.PeerIdentitySuffix, func() antientropy.PeerSourceSnapshot {
@@ -425,6 +555,44 @@ func run() (retErr error) {
 	// modify it after this point, so a close error is propagated to the caller
 	// without masking any earlier startup or shutdown error.
 	return
+}
+
+// controllerEpochProvider adapts a lifecycle controller to the peertls
+// EpochProvider interface. It returns the controller's currently authorized
+// cluster/epoch from its Authorization() snapshot when authorized (and not
+// stopped), and an error otherwise, so the peer client blocks outbound
+// requests when the current epoch cannot be established safely. This keeps the
+// outbound epoch context in sync with metadata changes instead of using a
+// one-time startup copy.
+type controllerEpochProvider struct {
+	ctrl     *lifecycle.Controller
+	enforced bool
+}
+
+func (p controllerEpochProvider) Context() (lifecycle.RequestContext, error) {
+	snap := p.ctrl.Authorization()
+	if snap.Stopped {
+		return lifecycle.RequestContext{}, fmt.Errorf("lifecycle controller stopped")
+	}
+	if snap.Metadata == nil {
+		return lifecycle.RequestContext{}, fmt.Errorf("no authoritative metadata observation")
+	}
+	if snap.AuthorityState != "fresh" || snap.Stale {
+		return lifecycle.RequestContext{}, fmt.Errorf("authoritative metadata not fresh (authority=%s)", snap.AuthorityState)
+	}
+	if snap.Binding == nil || !snap.Binding.MatchesMetadata(*snap.Metadata) {
+		return lifecycle.RequestContext{}, fmt.Errorf("local database binding does not match authorized epoch")
+	}
+	return lifecycle.RequestContext{
+		ClusterID: snap.Metadata.ClusterID,
+		EpochID:   snap.Metadata.EpochID,
+	}, nil
+}
+
+func (p controllerEpochProvider) Enforcement() bool { return p.enforced }
+
+func newControllerEpochProvider(ctrl *lifecycle.Controller) controllerEpochProvider {
+	return controllerEpochProvider{ctrl: ctrl, enforced: true}
 }
 
 func levelFromName(name string) slog.Level {

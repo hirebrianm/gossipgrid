@@ -44,6 +44,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -356,6 +357,12 @@ type Engine struct {
 	// caller observes the same completion rather than each spawning its own
 	// WaitGroup-waiting goroutine.
 	doneWG sync.WaitGroup
+
+	// admissionCheck is an optional lifecycle admission guard. When set
+	// (Milestone 5A), Enqueue checks it before publishing work. A nil
+	// admissionCheck means lifecycle protection is disabled (all operations
+	// are permitted).
+	admissionCheck func(ctx context.Context) error
 }
 
 // New creates an Engine with the given configuration, peer selector,
@@ -401,6 +408,35 @@ func (e *Engine) SetDelivery(d Delivery) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.delivery = d
+}
+
+// SetAdmissionCheck configures the lifecycle admission guard for outbound
+// gossip (Milestone 5A). When set, Enqueue checks the guard before publishing
+// work. A nil check means lifecycle protection is disabled.
+//
+// The check function receives the caller's context and returns an error when
+// the operation is not permitted. It must be non-blocking (a fast in-process
+// check, not a network call).
+func (e *Engine) SetAdmissionCheck(check func(ctx context.Context) error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.admissionCheck = check
+}
+
+// admissionOK returns nil when outbound gossip is currently authorized, or an
+// error when the lifecycle admission guard rejects the operation. A nil guard
+// (lifecycle protection disabled) always permits. It is checked both at
+// enqueue time and immediately before each network send (attemptDelivery), so
+// a queue entry admitted while authorized does not bypass a subsequent
+// lockout. The check must be non-blocking (a fast in-process check).
+func (e *Engine) admissionOK(ctx context.Context) error {
+	e.mu.Lock()
+	check := e.admissionCheck
+	e.mu.Unlock()
+	if check == nil {
+		return nil
+	}
+	return check(ctx)
 }
 
 // Start creates the engine-owned context (derived from the supplied ctx) and
@@ -556,6 +592,21 @@ func (e *Engine) Enqueue(event MessageEvent) {
 		e.startMu.Unlock()
 		return
 	}
+
+	// Milestone 5A: check the lifecycle admission guard before publishing
+	// work. An unready or unauthorized replica must not send gossip. The same
+	// guard is re-checked immediately before each network send (attemptDelivery)
+	// so a queue entry admitted while authorized does not bypass a subsequent
+	// lockout.
+	if err := e.admissionOK(context.Background()); err != nil {
+		e.startMu.Unlock()
+		e.logger.Debug("gossip outbound blocked by lifecycle admission",
+			slog.String("message_id", event.Message.ID),
+			slog.Any("error", err),
+		)
+		return
+	}
+
 	// Reserve the message's pending entry and publish the work item while
 	// holding startMu so that Stop (which also takes startMu for its drain)
 	// cannot interleave between the admission check and the publication.
@@ -906,20 +957,40 @@ func (e *Engine) attemptDelivery(ctx context.Context, st *msgState, target PeerT
 	// concurrent round or retry cannot start an overlapping send to the same
 	// peer/message while this attempt is in progress.
 	defer e.clearPeerInFlight(st, key)
+
+	// Milestone 5A: re-check the lifecycle admission guard immediately before
+	// the network send, not only at enqueue time. A queue entry admitted while
+	// READY must not bypass a subsequent lockout: work admitted before a
+	// revocation must not send after authorization has changed. A rejection
+	// here is treated as a permanent, non-retried rejection (not transient),
+	// so it does not generate an endless retry chain. The reservation is
+	// released by the deferred clearPeerInFlight; the peer is marked
+	// permanently rejected so no further attempts are made to it.
+	if err := e.admissionOK(ctx); err != nil {
+		e.st.addFailure()
+		st.mu.Lock()
+		st.permanent[key] = true
+		delete(st.pendingRetry, key)
+		st.mu.Unlock()
+		e.logger.Debug("gossip delivery blocked by lifecycle admission before send",
+			slog.String("message_id", st.id()),
+			slog.String("peer", target.ExpectedIdentity),
+			slog.Any("error", err),
+		)
+		return
+	}
+
 	ack, err := e.delivery.Send(ctx, target, st.wire())
 	if err != nil {
 		reason := classifyError(err)
 		e.st.addFailure()
 		st.mu.Lock()
 		attempt := st.attempts[key]
-		if reason == errPermanent {
+		if reason == errPermanent || reason == errEpochMismatch {
 			st.permanent[key] = true
-			// A permanent rejection supersedes any delayed retry: a queued
-			// retry for this peer (scheduled by a concurrent or earlier
-			// transient failure) must not execute after the rejection, so the
-			// peer's pending-retry marker is cleared now. The queued unit is
-			// discarded when the worker consumes it (tryReserveAttempt rejects
-			// it) or on the final drain, each releasing its reservation once.
+			// A permanent rejection (including an epoch mismatch)
+			// supersedes any delayed retry: a queued retry for this peer
+			// must not execute after the rejection.
 			delete(st.pendingRetry, key)
 		} else {
 			// A transient failure in a fanout round: mark the peer as failed
@@ -936,7 +1007,12 @@ func (e *Engine) attemptDelivery(ctx context.Context, st *msgState, target PeerT
 			slog.Int("attempt", attempt),
 			slog.String("reason", string(reason)),
 		)
-		if reason == errPermanent {
+		// Milestone 5A: an epoch mismatch is NOT retried. It is a
+		// permanent rejection: the peer belongs to a different epoch and
+		// will not accept messages until the local epoch is corrected.
+		// Retrying indefinitely would be wasteful and could mask a
+		// configuration error.
+		if reason == errPermanent || reason == errEpochMismatch {
 			return
 		}
 		if attempt < e.cfg.MaxAttempts {
@@ -1318,8 +1394,9 @@ func (e *Engine) releasePendingDelayed() {
 type errorClass string
 
 const (
-	errTransient errorClass = "transient"
-	errPermanent errorClass = "permanent"
+	errTransient     errorClass = "transient"
+	errPermanent     errorClass = "permanent"
+	errEpochMismatch errorClass = "epoch_mismatch"
 )
 
 // classifyError classifies a delivery error as transient or permanent using
@@ -1341,8 +1418,23 @@ func classifyError(err error) errorClass {
 	if err == nil {
 		return errTransient
 	}
+	// Milestone 5A: a local block (the EpochProvider refused to authorize the
+	// outbound request — a lockout, no fresh observation, or no matching
+	// binding) is a permanent, non-retried condition: no request was sent,
+	// and retrying would not succeed until the local authorization recovers.
+	var blockedErr *peertls.PeerBlockedError
+	if errors.As(err, &blockedErr) {
+		return errPermanent
+	}
 	var httpErr *peertls.PeerHTTPStatusError
 	if errors.As(err, &httpErr) {
+		// Milestone 5A: an HTTP 409 with an epoch-mismatch body is a
+		// distinct category from a normal content conflict. The receiver
+		// returns 409 with a body containing "epoch" when the caller's
+		// epoch context does not match its authorized metadata.
+		if httpErr.StatusCode() == http.StatusConflict && strings.Contains(httpErr.Error(), "epoch") {
+			return errEpochMismatch
+		}
 		switch httpErr.StatusCode() {
 		case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict,
 			http.StatusRequestEntityTooLarge, http.StatusUnsupportedMediaType:
@@ -1358,6 +1450,12 @@ func classifyError(err error) errorClass {
 	}
 	var ackErr *peertls.PeerAckError
 	if errors.As(err, &ackErr) {
+		// Milestone 5A: a PeerAckError with an epoch-mismatch reason
+		// (e.g., a status response reporting a different epoch) is a
+		// distinct category from a normal protocol defect.
+		if strings.Contains(ackErr.Error(), "epoch") || strings.Contains(ackErr.Error(), "cluster") {
+			return errEpochMismatch
+		}
 		return errPermanent
 	}
 	return errTransient

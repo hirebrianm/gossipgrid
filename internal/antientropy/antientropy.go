@@ -72,10 +72,16 @@ func (c Config) Validate() error {
 		return fmt.Errorf("page size must be between 1 and 1024 (got %d)", c.PageSize)
 	}
 	// The fetch batch size is bounded to 8 so that a batch of 8 records at
-	// the per-record wire-size bound (32768 = the absolute worst-case
-	// JSON-encoded body for a 4096-byte stored body, plus the origin/ID/
-	// timestamp overhead) serializes to ~256 KiB, within the sync client's
-	// 256 KiB response bound. The peer server enforces the same bound
+	// the per-record wire-size allowance (32768 = conservative headroom above
+	// the worst-case JSON-encoded body — a 4096-byte stored body escaping to
+	// 24576 bytes via 6-byte \uXXXX sequences — plus origin/ID/timestamp
+	// overhead) serializes to 8 x 32768 = 262144 = 256 KiB, within the sync
+	// client's 256 KiB response bound (9 records would exceed it). This is a
+	// conservative sizing of the validated field bounds, not a proof the
+	// final encoded envelope always fits: the server additionally marshals
+	// the full response and rejects it explicitly (500) if the JSON envelope
+	// overhead plus records exceeds the limit, and the client rejects
+	// oversized individual records. The peer server enforces the same bound
 	// server-side, so an authenticated client cannot request an excessive
 	// response.
 	if c.FetchBatchSize < 1 || c.FetchBatchSize > 8 {
@@ -158,6 +164,28 @@ type MessageFetcher interface {
 type LocalStore interface {
 	FindMissingIDs(ctx context.Context, ids []string) ([]string, error)
 	InsertReplicatedMessageReturningInserted(msg *store.Message) (bool, error)
+}
+
+// CommitGuard executes a short, nonblocking commit callback while holding the
+// lifecycle controller's authorization read lock (c.mu RLock) and the lifecycle
+// state machine's read lock (m.mu RLock). This establishes the shared
+// synchronization boundary between lifecycle authorization and the in-memory
+// cursor commit: a revocation that completes before the guard enters is
+// observed and the callback is not executed (the returned error signals the
+// rejection); a revocation that follows an already-linearized commit is a
+// normal, permitted revocation.
+//
+// Lock-order contract: Controller.mu (RLock) → Machine.mu (RLock) →
+// Engine.mu (Lock). The callback may take the engine's mutex but must NOT
+// acquire the controller's or machine's mutex, perform network I/O, or
+// execute SQLite queries. A nil CommitGuard (lifecycle protection disabled)
+// executes the callback directly.
+//
+// The callback returns a non-nil error when the commit is rejected (revocation
+// observed at commit time). The caller (commitCursor) propagates that error to
+// syncPeer, which does NOT advance the cursor or increment CompletedPasses.
+type CommitGuard interface {
+	CommitUnderAuthorization(fn func() error) error
 }
 
 // syncStats holds concurrency-safe counters for observability.
@@ -261,6 +289,19 @@ type Engine struct {
 
 	doneWG sync.WaitGroup
 	st     syncStats
+
+	// admissionCheck is an optional lifecycle admission guard (Milestone 5A).
+	// When set, syncPeer checks it before performing any network operations.
+	// A nil check means lifecycle protection is disabled.
+	admissionCheck func(ctx context.Context) error
+
+	// commitGuard is the lifecycle commit guard (Milestone 5A). When set,
+	// commitCursor executes the cursor mutation while holding the controller's
+	// authorization read lock (c.mu RLock) and the lifecycle state machine's
+	// read lock (m.mu RLock), closing the window between the admission
+	// decision and the in-memory commit. A nil guard (lifecycle protection
+	// disabled) executes the commit directly under e.mu.
+	commitGuard CommitGuard
 }
 
 // New creates an Engine with the given configuration and dependencies.
@@ -316,6 +357,134 @@ func (e *Engine) SetLocalStore(s LocalStore) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.localStore = s
+}
+
+// SetAdmissionCheck configures the lifecycle admission guard for outbound
+// anti-entropy (Milestone 5A). When set, syncPeer checks the guard before
+// performing any network operations. A nil check means lifecycle protection
+// is disabled.
+func (e *Engine) SetAdmissionCheck(check func(ctx context.Context) error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.admissionCheck = check
+}
+
+// SetCommitGuard configures the lifecycle commit guard (Milestone 5A). When
+// set, commitCursor executes the cursor mutation while holding the controller's
+// authorization read lock (c.mu RLock) and the lifecycle state machine's read
+// lock (m.mu RLock), so a revocation that completes before the guard enters
+// is observed and the cursor is not advanced. A nil guard (lifecycle
+// protection disabled) executes the commit directly under e.mu. Must be called
+// before Start.
+func (e *Engine) SetCommitGuard(guard CommitGuard) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.commitGuard = guard
+}
+
+// admissionOK returns nil when outbound anti-entropy is currently authorized,
+// or an error when the lifecycle admission guard rejects the operation. A nil
+// guard (lifecycle protection disabled) always permits. It is checked both at
+// the entry to a synchronization pass and immediately before each network
+// request (inventory fetch, message fetch) and before each local insert, so
+// a pass admitted while authorized does not advance its cursor or insert
+// records after a subsequent lockout. The check must be non-blocking (a fast
+// in-process check).
+func (e *Engine) admissionOK(ctx context.Context) error {
+	e.mu.Lock()
+	check := e.admissionCheck
+	e.mu.Unlock()
+	if check == nil {
+		return nil
+	}
+	return check(ctx)
+}
+
+// commitCursor is the local linearization point for a successful page
+// progression (Milestone 5A). When the lifecycle commit guard is set, it
+// executes the in-memory cursor mutation while holding the controller's
+// authorization read lock (c.mu RLock) and the lifecycle state machine's
+// read lock (m.mu RLock), and the commit is rejected (the guard returns an
+// error) when the controller's authorization is no longer valid.
+//
+// The commit guard (Controller.CommitUnderAuthorization) evaluates the
+// complete authorization decision — ready state, not stopped, fresh valid
+// metadata with Initialized=true, and a matching durable binding with no
+// recovery lockout — from a single locked snapshot (authorizationSnapshotLocked,
+// one c.mu RLock + one m.mu RLock, no database read) and only runs the
+// callback when that decision is authorized. The RLocks are held until the
+// callback's in-memory cursor mutation completes. The callback therefore
+// performs ONLY the short, in-memory cursor mutation and does NOT re-read
+// the admission check or any other method that acquires Controller.mu or
+// Machine.mu (both RWMutexes are non-reentrant, so a callback that
+// re-reads the authorization would deadlock a writer waiting for the lock).
+//
+// Lock-order contract: Controller.mu (RLock) → Machine.mu (RLock) →
+// Engine.mu (Lock). The commit guard acquires c.mu RLock, then m.mu RLock,
+// then the callback takes e.mu. A revocation (Stop or a state/metadata
+// change) must acquire c.mu Lock or m.mu Lock; it is blocked while the
+// commit guard holds the RLocks. A revocation that completes before the
+// commit guard enters is observed (the stopped flag is set or the authority
+// no longer authorized) and the callback is not executed. A revocation that
+// follows an already-linearized commit is a normal, permitted revocation.
+//
+// All lifecycle state transitions (SetRecoveryRequired, SetReady, SetDegraded,
+// SetDiscovering, SetSyncing, and the metadata-driven reevaluateState)
+// acquire c.mu RLock before m.mu Lock, matching this lock order. This ensures
+// that a readiness-revoking transition cannot linearize while a cursor commit
+// holds the RLocks: the transition is queued behind the commit's RLocks and
+// is observed as a revocation by the next authorization evaluation.
+//
+// When the commit guard is nil (lifecycle protection disabled), the commit
+// proceeds directly under e.mu, preserving the existing M4 behavior.
+//
+// The caller (syncPeer) must hold the cursor pointer but NOT e.mu when
+// calling this method. If the method returns a non-nil error, the caller
+// must NOT advance the cursor and must NOT increment CompletedPasses or
+// update LastSuccess.
+func (e *Engine) commitCursor(cursor *peerCursor, nextCursor string, fullSweep bool) error {
+	// Read the commit guard under e.mu (short critical section; no
+	// controller lock is held here).
+	e.mu.Lock()
+	guard := e.commitGuard
+	e.mu.Unlock()
+
+	if guard != nil {
+		// Execute the in-memory cursor mutation under the controller's
+		// authorization read lock and the machine's read lock. The guard has
+		// already evaluated the complete authorization decision (a single
+		// locked snapshot: c.mu RLock + m.mu RLock) and rejected the commit
+		// when the authority was no longer valid; the callback performs only
+		// the cursor mutation. Lock order: Controller.mu RLock (held by
+		// guard) → Machine.mu RLock (held by guard) → Engine.mu Lock (held
+		// by the callback).
+		return guard.CommitUnderAuthorization(func() error {
+			e.mu.Lock()
+			cursor.lastError = ""
+			if fullSweep {
+				cursor.cursor = ""
+				cursor.sweepDone = true
+				cursor.lastSuccess = e.now()
+			} else {
+				cursor.cursor = nextCursor
+			}
+			e.mu.Unlock()
+			return nil
+		})
+	}
+
+	// Lifecycle protection disabled: commit directly under e.mu.
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cursor.lastError = ""
+	if fullSweep {
+		cursor.cursor = ""
+		cursor.sweepDone = true
+		cursor.lastSuccess = e.now()
+	} else {
+		cursor.cursor = nextCursor
+	}
+	return nil
 }
 
 // Start creates the engine-owned context and launches the periodic scheduler
@@ -529,6 +698,20 @@ func (e *Engine) syncPeer(ctx context.Context, target PeerTarget) {
 		key = target.ExpectedIdentity
 	}
 
+	// Milestone 5A: check the lifecycle admission guard before performing
+	// any network operations. An unready or unauthorized replica must not
+	// retrieve or insert messages from peers. The same guard is re-checked
+	// immediately before each inventory request, each message-fetch request,
+	// and before each local insert, so a pass admitted while authorized does
+	// not advance its cursor or insert records after a subsequent lockout.
+	if err := e.admissionOK(ctx); err != nil {
+		e.logger.Debug("anti-entropy outbound blocked by lifecycle admission",
+			slog.String("peer", key),
+			slog.Any("error", err),
+		)
+		return
+	}
+
 	// Check for concurrent sync on the same peer.
 	e.mu.Lock()
 	if e.activePeers[key] {
@@ -564,6 +747,22 @@ func (e *Engine) syncPeer(ctx context.Context, target PeerTarget) {
 			return
 		}
 
+		// Milestone 5A: re-check the lifecycle admission guard before each
+		// inventory request, not only at pass entry. A pass admitted while
+		// authorized must not request inventory after a subsequent lockout.
+		// A lockout here fails the pass without advancing the cursor (the
+		// same behavior as an inventory fetch error), so the cursor is not
+		// advanced and the pass is not reported as completed.
+		if err := e.admissionOK(ctx); err != nil {
+			e.recordPeerProgress(key, after, "lifecycle lockout: "+err.Error())
+			e.st.failedPasses.Add(1)
+			e.logger.Debug("anti-entropy inventory blocked by lifecycle admission",
+				slog.String("peer", key),
+				slog.Any("error", err),
+			)
+			return // cursor not advanced; pass not completed
+		}
+
 		// Bound each request with the configured timeout.
 		reqCtx, cancel := context.WithTimeout(ctx, e.cfg.RequestTimeout)
 
@@ -576,7 +775,13 @@ func (e *Engine) syncPeer(ctx context.Context, target PeerTarget) {
 				slog.String("peer", key),
 				slog.Any("error", err),
 			)
-			return // cursor not advanced; retry next cycle
+			// Milestone 5A: an epoch mismatch is NOT a transient failure
+			// to be retried. The peer belongs to a different epoch and
+			// will not supply inventory until the local epoch is corrected.
+			// The cursor is not advanced (the pass is not completed), but
+			// the error is recorded so the operator can diagnose the
+			// mismatch.
+			return // cursor not advanced
 		}
 
 		e.st.inventoryPages.Add(1)
@@ -619,27 +824,39 @@ func (e *Engine) syncPeer(ctx context.Context, target PeerTarget) {
 			}
 		}
 
-		// Page processed successfully (no unresolved conflict). Track page
-		// progress via the per-peer LastCursor (the cursor position advanced
-		// to). LastSuccess is NOT set here: it represents a genuinely
-		// completed successful synchronization (see the has_more=false block
-		// and the budget-exhausted comment), not merely one processed page.
+		// Page processed successfully (no unresolved conflict). Before
+		// committing any pagination progress (cursor advancement or
+		// completed-sweep reset), call commitCursor: the local
+		// linearization point that atomically re-checks the lifecycle
+		// admission guard and performs the in-memory cursor mutation while
+		// holding e.mu. A revocation that occurs after page processing
+		// but before the admission read inside commitCursor is observed
+		// and the cursor is NOT advanced. Already-committed immutable
+		// records are preserved (no rollback).
+		if err := e.commitCursor(cursor, page.NextCursor, !page.HasMore); err != nil {
+			e.recordPeerProgress(key, after, "lifecycle lockout at cursor commit: "+err.Error())
+			e.st.failedPasses.Add(1)
+			e.logger.Debug("anti-entropy cursor commit blocked by lifecycle admission",
+				slog.String("peer", key),
+				slog.Any("error", err),
+			)
+			return // cursor not advanced; pass not completed
+		}
+
 		pagesProcessed++
-		e.mu.Lock()
-		cursor.lastError = ""
-		e.mu.Unlock()
 
 		// No more pages: full sweep complete. Reset cursor for future cycles
 		// so a later-inserted lower-sorting ID is eventually found. This is
 		// the only path that counts a CompletedPass and updates LastSuccess.
+		//
+		// Accounting ordering: commitCursor returned nil (the cursor mutation
+		// linearized under the authorization boundary), so the commit is
+		// already authorized. The completedPasses increment and the
+		// recordPeerProgress call below are diagnostics published immediately
+		// after an already-authorized commit. A revocation that completes
+		// after the commit linearized is a normal, permitted revocation and
+		// does not retroactively invalidate the completed-sweep accounting.
 		if !page.HasMore {
-			now := e.now()
-			e.mu.Lock()
-			cursor.cursor = ""
-			cursor.sweepDone = true
-			cursor.lastSuccess = now
-			cursor.lastError = ""
-			e.mu.Unlock()
 			e.st.completedPasses.Add(1)
 			e.recordPeerProgress(key, "", "")
 			return
@@ -648,10 +865,6 @@ func (e *Engine) syncPeer(ctx context.Context, target PeerTarget) {
 		// Advance the cursor to the last ID in this page (page-level
 		// progress; LastSuccess is not updated — a page budget or a later
 		// failed page means the sweep is not complete).
-		e.mu.Lock()
-		cursor.cursor = page.NextCursor
-		e.mu.Unlock()
-
 		after = page.NextCursor
 		e.recordPeerProgress(key, page.NextCursor, "")
 	}
@@ -678,6 +891,15 @@ func (e *Engine) fetchAndInsert(ctx context.Context, target PeerTarget, missing 
 	for i := 0; i < len(missing); i += e.cfg.FetchBatchSize {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+
+		// Milestone 5A: re-check the lifecycle admission guard before each
+		// message-fetch request, not only at pass entry. A pass admitted
+		// while authorized must not fetch records after a subsequent lockout.
+		// Returning an error here fails the page (the caller does not advance
+		// the cursor) without inserting any records.
+		if err := e.admissionOK(ctx); err != nil {
+			return fmt.Errorf("lifecycle lockout before message fetch from peer %s: %w", target.PodIdentity, err)
 		}
 
 		end := i + e.cfg.FetchBatchSize
@@ -714,6 +936,16 @@ func (e *Engine) fetchAndInsert(ctx context.Context, target PeerTarget, missing 
 				return fmt.Errorf("message %q has malformed timestamp: %v", m.ID, err)
 			}
 			msg.CreatedAt = ts
+
+			// Milestone 5A: re-check the lifecycle admission guard before each
+			// local insert, so a lockout that occurs mid-batch does not insert
+			// additional records under an invalidated authorization. Returning
+			// an error fails the page (the caller does not advance the cursor);
+			// already-inserted records in this batch are preserved (no rollback),
+			// matching the existing conflict/insert-error behavior.
+			if err := e.admissionOK(ctx); err != nil {
+				return fmt.Errorf("lifecycle lockout before inserting message %q from peer %s: %w", m.ID, target.PodIdentity, err)
+			}
 
 			inserted, err := e.localStore.InsertReplicatedMessageReturningInserted(msg)
 			if err != nil {

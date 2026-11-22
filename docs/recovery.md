@@ -6,6 +6,10 @@ Each pod stores SQLite in `emptyDir`, so replacing a pod discards its messages. 
 self-healing from surviving peers. **No design without durable copies can restore data after every copy is lost.**
 Recovery of *availability* is not recovery of *lost data*.
 
+Milestone 5A (implemented 2026-11-21) adds the lifecycle state machine, durable epoch binding, epoch fencing, and
+fail-closed admission that underpin the recovery model described below. The Kubernetes metadata provider, automatic
+genesis, and automatic epoch reset are deferred to Milestone 5B and later milestones.
+
 ## Failure cases
 
 | Situation | Required behavior |
@@ -63,9 +67,78 @@ improvement over treating `all currently reachable pods are empty` as a sufficie
 - Later opt-in experiment: strict automatic reset gate with explicit operator-configured threshold, conditional
   control-plane update, and tests for partitions, racing resets, stale pods, and uncommitted messages.
 
+## Epoch change behavior (Milestone 5A)
+
+When the authoritative metadata changes to a different cluster or epoch than the local database binding:
+
+1. The controller's `reevaluateState` detects the mismatch.
+2. The state machine transitions to `RECOVERY_REQUIRED` (if not already there).
+3. All writes and replication are rejected (503 for unready, 409 for epoch mismatch).
+4. The local database and its messages are **preserved** — no data is deleted.
+5. The binding row in `local_metadata` is **intact** — it still records the original cluster/epoch.
+6. The replica cannot return to `READY` without an operator-performed recovery procedure (reserved for future
+   milestones).
+
+This is a **lockout**, not a data-loss event. The replica is safe: it will not merge data from a different epoch
+or inject old-epoch messages into a new one.
+
+## Legacy database handling
+
+A database that predates the lifecycle feature (no `local_metadata` row) is handled gracefully:
+
+- `GetBinding()` returns nil (no error) when no binding row exists.
+- The replica operates in `DISCOVERING` (if metadata is available) or fails closed.
+- No binding is automatically created; the operator must explicitly bind the database to a cluster epoch
+  (reserved for future milestones).
+- All existing Milestone 4 behavior is preserved when lifecycle protection is disabled (the default).
+
+## Why mTLS alone is not sufficient for epoch membership
+
+mTLS proves that a peer is an authorized workload within the trust domain. It does **not** prove:
+
+- That the peer's local database belongs to the same cluster epoch.
+- That the peer has not been replaced with a new pod carrying old-epoch data from an `emptyDir` volume.
+- That the cluster metadata has not changed to a new epoch since the peer last synchronized.
+
+Epoch fencing (Milestone 5A) adds a second layer: even if a peer is mTLS-authorized, its data is not merged unless
+its epoch context matches the local binding. This is a **fencing** mechanism, not an authentication mechanism —
+mTLS remains the sole basis for peer identity.
+
+In addition, a lifecycle-enabled **client** validates the peer's **response envelope**
+(`X-GossipGrid-Lifecycle-Active: true` + matching cluster/epoch). A legacy peer (lifecycle disabled) that returns a
+successful response without the envelope is rejected as a synchronization source. This prevents a lifecycle-enabled
+replica from ingesting data from a peer that does not run the epoch-fencing protocol, even if the peer's mTLS
+certificate is valid. The outbound epoch context is sourced from the controller's current authorization decision
+(via the `EpochProvider`), not a one-time startup copy: a revoked node blocks its outbound requests rather than
+using a stale epoch.
+
+## Why an epoch ID is not an authorization secret
+
+The epoch ID (a UUID or similar unique identifier) is **metadata**, not a credential. It is:
+
+- Visible in peer status responses and HTTP headers.
+- Not signed, not encrypted, not hashed.
+- Not a bearer token: possessing an epoch ID does not grant access to any resource.
+
+Authorization is established by mTLS (client certificate) + identity policy (SAN, EKU, StatefulSet name). The epoch
+ID only determines whether the data from an authenticated peer is eligible for merging.
+
 ## Limitations
 
 The metadata resource is not a backup of messages. It is a coordination and audit mechanism. Its own deletion or
 restoration from an out-of-date snapshot is an administrative incident, not a signal to create a new cluster. Cluster
 disaster recovery and safe split-brain prevention would require stronger assumptions and/or durable storage than this
 testbed intentionally provides.
+
+**Milestone 5A limitations (not yet implemented):**
+
+- No production Kubernetes metadata provider: the controller uses a no-op source that always reports metadata
+  unavailable. In production, replicas with lifecycle enabled will stay unready until the 5B provider is deployed.
+- No automatic genesis: a fresh replica with no binding cannot automatically initialize an empty epoch.
+- No automatic epoch reset: a `RECOVERY_REQUIRED` replica cannot automatically return to `READY`; operator
+  intervention is required.
+- No snapshot transfer: the initial data baseline (the path from `SYNCING` to `READY`) is not yet implemented;
+  `SetReady` is provided for test purposes and future 5B implementation.
+- 5A alone does **not** make GossipGrid safe for catastrophic cluster recovery. It provides the fencing and
+  admission framework; the full recovery protocol requires the 5B metadata provider, snapshot transfer, and
+  operator recovery procedures.

@@ -11,9 +11,11 @@ import (
 	"context"
 	"encoding/json"
 	"html/template"
+	"net"
 	"net/http"
 	"time"
 
+	"gossipgrid/internal/lifecycle"
 	"gossipgrid/internal/store"
 )
 
@@ -41,6 +43,19 @@ func NewWithStore(node Node, s *store.Store) http.Handler {
 // (POST /api/messages). This is used by the gossip engine (Milestone 4B) to
 // trigger asynchronous peer fanout. The callback must be non-blocking.
 func NewWithStoreAndCallback(node Node, s *store.Store, onMessage MessageCallback) http.Handler {
+	return NewWithStoreAndCallbackAndLifecycle(node, s, onMessage, nil)
+}
+
+// NewWithStoreAndCallbackAndLifecycle is like NewWithStoreAndCallback but
+// also accepts an optional lifecycle.Controller. When the controller is
+// non-nil and lifecycle protection is enabled, readiness is gated on the
+// controller's state, and public message writes are rejected while the
+// replica is unready.
+//
+// When the controller is nil (or lifecycle protection is disabled), the
+// existing Milestone 4 behavior is preserved: /readyz always returns 200
+// and POST /api/messages is always accepted.
+func NewWithStoreAndCallbackAndLifecycle(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller) http.Handler {
 	mux := http.NewServeMux()
 	// "GET /{$}" matches the root path exactly ({$} = end-of-path), so
 	// unrecognized paths fall through to 404 rather than serving the root page.
@@ -48,12 +63,23 @@ func NewWithStoreAndCallback(node Node, s *store.Store, onMessage MessageCallbac
 	// restrictions to those exact paths, returning 405 for other methods.
 	mux.HandleFunc("GET /{$}", rootHandler(node))
 	mux.HandleFunc("GET /healthz", healthHandler)
-	mux.HandleFunc("GET /readyz", readyHandler)
+
+	// Readiness: when a lifecycle controller is provided, use the
+	// lifecycle-aware ready handler; otherwise, use the legacy handler
+	// (always 200).
+	if ctrl != nil && ctrl.Admission().Enabled() {
+		mux.HandleFunc("GET /readyz", lifecycleReadyHandler(ctrl))
+	} else {
+		mux.HandleFunc("GET /readyz", readyHandler)
+	}
 
 	if s != nil {
 		mh := newMessageHandler(s)
 		mh.nodeID = node.ID
 		mh.onMessage = onMessage
+		if ctrl != nil && ctrl.Admission().Enabled() {
+			mh.lifecycleCtrl = ctrl
+		}
 		mux.HandleFunc("POST /api/messages", mh.postMessages)
 		mux.HandleFunc("GET /api/messages", mh.getMessages)
 		mux.HandleFunc("GET /api/messages/{id}", mh.getMessage)
@@ -81,6 +107,41 @@ func readyHandler(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// lifecycleReadyHandler reports readiness based on the lifecycle
+// controller's single consistent authorization decision. It returns HTTP 200
+// only when the replica is authorized (ready state plus a fresh, valid,
+// matching authoritative observation plus a matching durable database binding,
+// no lockout, not stopped); HTTP 503 otherwise. It includes a structured
+// response with readiness, state, and reason.
+//
+// Using the same authorization decision as the public and private handlers
+// guarantees that a replica reported "ready" by /readyz is one that the
+// handlers would actually authorize to serve: the two cannot diverge (e.g. a
+// stale metadata observation or a missing binding that makes the state READY
+// but the authorization fail closed).
+//
+// It does NOT hold a lifecycle mutex while performing network operations
+// (there are none in this handler). It does NOT synchronously probe every
+// peer on every readiness request.
+func lifecycleReadyHandler(ctrl *lifecycle.Controller) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		snap := ctrl.Authorization()
+		ready := snap.Authorized()
+
+		status := http.StatusServiceUnavailable
+		if ready {
+			status = http.StatusOK
+		}
+
+		writeJSON(w, status, lifecycleReadyResponse{
+			Service: "gossipgrid",
+			Ready:   ready,
+			State:   snap.State.String(),
+			Reason:  snap.Reason,
+		})
+	}
+}
+
 // rootHandler returns a small HTML page identifying the service and node.
 // The node ID is rendered through html/template, which escapes dynamic
 // values, so a node ID containing HTML/script markup is neutralised.
@@ -106,6 +167,13 @@ type healthResponse struct {
 type readyResponse struct {
 	Service string `json:"service"`
 	Ready   bool   `json:"ready"`
+}
+
+type lifecycleReadyResponse struct {
+	Service string `json:"service"`
+	Ready   bool   `json:"ready"`
+	State   string `json:"state"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 var rootTmpl = template.Must(template.New("root").Parse(`<!doctype html>
@@ -154,6 +222,14 @@ func NewServer(addr string, handler http.Handler) *Server {
 // ListenAndServe starts the HTTP server on the configured address.
 func (s *Server) ListenAndServe() error {
 	return s.HTTPServer.ListenAndServe()
+}
+
+// Serve starts the HTTP server on the supplied listener. It is provided so
+// tests (and other callers) can bind a listener once and serve through the
+// retained net.Listener, avoiding the race of closing a port-reservation
+// listener and re-binding the same address.
+func (s *Server) Serve(ln net.Listener) error {
+	return s.HTTPServer.Serve(ln)
 }
 
 // Shutdown gracefully stops the server, giving in-flight requests the supplied

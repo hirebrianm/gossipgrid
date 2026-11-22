@@ -105,7 +105,13 @@ func New(path string) (*Store, error) {
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
 
-	if err := db.AutoMigrate(&Message{}); err != nil {
+	// AutoMigrate creates or updates the schema for both the messages table
+	// and the local_metadata table (Milestone 5A). The local_metadata table
+	// is a singleton row that binds the entire SQLite database to exactly
+	// one cluster and one epoch. It is backward-compatible: a database from
+	// before Milestone 5A simply has no local_metadata row, and the
+	// binding functions handle the "no binding" case explicitly.
+	if err := db.AutoMigrate(&Message{}, &localMetadata{}); err != nil {
 		return nil, fmt.Errorf("auto-migrating schema: %w", err)
 	}
 

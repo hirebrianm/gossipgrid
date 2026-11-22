@@ -5,18 +5,24 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-> **Status: Milestones 4A, 4B, and 4C implemented (November 2026).** A locally runnable single-instance Go service with
+> **Status: Milestones 4A, 4B, 4C, and 5A implemented (November 2026).** A locally runnable single-instance Go service with
 > configuration, HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, peer discovery
 > (static and Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with certificate hot-reload**
 > (Milestone 3B), **authenticated peer message exchange (POST /internal/messages, opt-in)** (Milestone 4A),
 > **automatic epidemic gossip fanout with bounded queues, exponential-backoff retries, and duplicate suppression
-> (opt-in)** (Milestone 4B), and **periodic anti-entropy synchronization with inventory comparison, keyset pagination,
-> and cursor progression (opt-in)** (Milestone 4C). Gossip and anti-entropy are implemented and operational in
-> standalone multi-process deployments. Structured logging, graceful shutdown, a Makefile, a static `scratch` Docker
-> image, GitLab CI, GitHub Actions, and tests are in place. Cluster genesis (the bootstrap/sync lifecycle), epoch
-> management, recovery safeguards, and Kubernetes deployment are **not yet implemented** and remain planned
-> milestones (Milestones 5, 6, 7, and 9). No application-level FIPS certification or production-readiness claims
-> are made.
+> (opt-in)** (Milestone 4B), **periodic anti-entropy synchronization with inventory comparison, keyset pagination,
+> and cursor progression (opt-in)** (Milestone 4C), and a **lifecycle state machine with durable SQLite epoch
+> binding, opt-in readiness gating, epoch fencing (request headers + response envelope), single-snapshot
+> fail-closed admission, a non-recursive commit guard with a fixed lock order, outbound epoch provider (per-send
+> re-check), and legacy-peer rejection (opt-in)** (Milestone 5A). Gossip and anti-entropy are implemented and
+> operational in standalone multi-process deployments. Structured logging, graceful shutdown, a Makefile, a static
+> `scratch` Docker image, GitLab CI, GitHub Actions, and tests are in place. Milestone 5A provides the **fencing
+> and admission framework** and an **implemented RECOVERY_REQUIRED lockout** (a fail-closed state on epoch
+> mismatch that preserves data and rejects all writes/replication); it does **not** provide the **operator-
+> authorized recovery/reset procedure** that returns a locked-out replica to READY, nor automatic cluster genesis,
+> initial snapshot transfer, or the Kubernetes metadata provider — those are planned milestones (Milestones 5B, 6,
+> 7, and 9). 5A alone does not make GossipGrid safe for catastrophic cluster recovery. No application-level FIPS
+> certification or production-readiness claims are made.
 
 ## What it does (planned)
 
@@ -60,7 +66,14 @@ deliberate part of the testbed design.
 | Authenticated peer message exchange (POST /internal/messages, opt-in) | ✅ |
 | Epidemic gossip (automatic fanout, bounded queues, retries, duplicate suppression) | ✅ |
 | Anti-entropy (periodic inventory comparison, keyset pagination, cursor progression) | ✅ |
-| Bootstrap/sync lifecycle | 🔜 Milestone 5 |
+| Lifecycle state machine (7 states, concurrency-safe, opt-in) | ✅ |
+| Durable SQLite epoch binding (local_metadata singleton row) | ✅ |
+| Readiness gating (503 when unready, 200 for READY/DEGRADED) | ✅ |
+| Epoch fencing (request headers + response envelope, 409 on mismatch, permanent) | ✅ |
+| Single-snapshot fail-closed admission (reads, writes, replication; per-send re-check) | ✅ |
+| Outbound epoch provider (current authorization, not stale) | ✅ |
+| Legacy-peer rejection (response envelope validation; mTLS alone does not prove epoch membership) | ✅ |
+| Initial snapshot transfer and automatic genesis | 🔜 Milestone 5B |
 | Web UI and diagnostics | 🔜 Milestone 6 |
 | Kubernetes packaging (Helm) | 🔜 Milestone 7 |
 | Fault injection and resilience lab | 🔜 Milestone 9 |
@@ -189,10 +202,11 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_ANTI_ENTROPY_ENABLED` | `false` | Enable periodic anti-entropy reconciliation (Milestone 4C). Requires peer mTLS, message exchange, and static or dns discovery |
 | `GOSSIPGRID_ANTI_ENTROPY_INTERVAL` | `30s` | Synchronization cycle period (range 1s–10m) |
 | `GOSSIPGRID_ANTI_ENTROPY_PAGE_SIZE` | `128` | Maximum IDs per inventory page (range 1–1024) |
-| `GOSSIPGRID_ANTI_ENTROPY_FETCH_BATCH_SIZE` | `12` | Maximum messages fetched per batch (range 1–12, ≤ page size) |
+| `GOSSIPGRID_ANTI_ENTROPY_FETCH_BATCH_SIZE` | `8` | Maximum messages fetched per batch (range 1–8, ≤ page size) |
 | `GOSSIPGRID_ANTI_ENTROPY_MAX_PAGES_PER_PEER` | `4` | Maximum inventory pages per peer per cycle (range 1–64) |
 | `GOSSIPGRID_ANTI_ENTROPY_WORKERS` | `2` | Concurrent synchronization workers (range 1–16) |
 | `GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT` | `5s` | Per-request timeout for sync HTTP calls (range 1ms–60s) |
+| `GOSSIPGRID_LIFECYCLE_ENABLED` | `false` | Enable lifecycle state machine, epoch fencing, and fail-closed admission (Milestone 5A). Requires peer mTLS |
 
 When `GOSSIPGRID_PEER_TLS_ENABLED` is `true`, all of the peer TLS file paths and the identity suffix are **required**; a
 missing or malformed value fails startup clearly (no silent fallback to unauthenticated communication). When it is
@@ -200,11 +214,81 @@ missing or malformed value fails startup clearly (no silent fallback to unauthen
 
 When `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED` is `true`, the private peer listener additionally registers
 `POST /internal/messages`, accepting idempotent replicated message inserts from authenticated replicas. This is a
-provisional, opt-in, direct-exchange capability: it does **not** by itself enable readiness gating (Milestone 5). It
+provisional, opt-in, direct-exchange capability: it does **not** by itself enable readiness gating. It
 **requires** `GOSSIPGRID_PEER_TLS_ENABLED=true`; enabling it without peer mTLS fails configuration validation.
 Automatic epidemic gossip fanout is enabled separately via `GOSSIPGRID_GOSSIP_ENABLED` (Milestone 4B, implemented).
 Periodic anti-entropy synchronization is enabled separately via `GOSSIPGRID_ANTI_ENTROPY_ENABLED` (Milestone 4C,
 implemented); it uses the message-exchange endpoint for inventory comparison and batched fetches.
+
+### Lifecycle and epoch fencing (Milestone 5A)
+
+When `GOSSIPGRID_LIFECYCLE_ENABLED=true` (and peer mTLS is enabled), the application enforces a lifecycle state
+machine that gates readiness, admission, and epoch fencing. The feature is **opt-in**; when disabled (the default),
+all existing behavior is preserved.
+
+**What it provides:**
+
+- A **concurrency-safe state machine** with 7 states (`STARTING`, `DISCOVERING`, `GENESIS`, `SYNCING`, `READY`,
+  `DEGRADED`, `RECOVERY_REQUIRED`). Invalid transitions are rejected; no caller can silently force `READY`.
+- A **durable SQLite epoch binding** (singleton row in `local_metadata`) that ties the database to a specific
+  cluster ID and epoch ID. Rebinding to a different epoch fails; a nonempty database without a binding is rejected.
+- **Readiness gating**: `GET /readyz` returns 503 when the replica is not in `READY` or `DEGRADED` state.
+  `GET /healthz` remains 200.
+- **Fail-closed admission**: `POST /api/messages` returns 503 (no message inserted) when the replica is unready.
+  Private replication (inbound gossip, anti-entropy) is rejected when unready.
+- **Epoch fencing**: peer status and sync endpoints carry request headers
+  (`X-GossipGrid-Cluster-ID`, `X-GossipGrid-Epoch-ID`) and a response envelope
+  (`X-GossipGrid-Resp-Cluster-ID`, `X-GossipGrid-Resp-Epoch-ID`,
+  `X-GossipGrid-Lifecycle-Active`). A replica whose local binding does not match the peer's epoch receives 409
+  (permanent, no retry) and does not merge data. A lifecycle-enabled client additionally validates the response
+  envelope: a legacy peer (lifecycle disabled) that omits `X-GossipGrid-Lifecycle-Active: true` is rejected as a
+  synchronization source, even with a valid mTLS certificate.
+- **RECOVERY_REQUIRED lockout (implemented)**: when the local database binding does not match the authoritative
+  metadata (an epoch mismatch), the replica transitions to `RECOVERY_REQUIRED` — a **fail-closed lockout**. All
+  writes and replication are rejected (503 unready / 409 epoch mismatch), local data is **preserved** (never
+  deleted), and the binding row is intact. This is the lockout *itself*; it is distinct from the **operator-
+  authorized recovery/reset procedure** that actually returns the replica to `READY`, which is **not** implemented
+  in 5A (deferred to 5B and later). A `RECOVERY_REQUIRED` replica cannot automatically return to `READY`.
+- **Outbound epoch provider**: the peer client sources its outbound epoch context from the controller's current
+  authorization decision (via the `EpochProvider`), not a one-time startup copy. A revoked node blocks its outbound
+  requests rather than using a stale epoch. Gossip and anti-entropy re-check admission at send/sync time; there is
+  no retry on a revocation.
+- **Commit authorization (lock-order guarantee)**: the anti-entropy cursor commit
+  (`Controller.CommitUnderAuthorization`) evaluates the complete authorization decision — ready state,
+  not stopped, fresh valid metadata with `Initialized=true`, and a matching durable binding with no
+  recovery lockout — from a single locked snapshot that reads all authorization fields under one
+  controller read lock and one state-machine read lock (no second lock acquisition, no SQLite read
+  while the locks are held). The RLocks are held until the in-memory cursor mutation completes, so a
+  revocation (Stop or a state/metadata change) that linearizes before the commit is observed and the
+  callback is not executed; a revocation that linearizes after the callback completes is a normal,
+  permitted revocation. All lifecycle state transitions acquire the controller read lock before the
+  state-machine write lock, matching the commit's lock order, so a readiness-revoking transition cannot
+  linearize while a cursor commit holds the RLocks: the transition is queued behind the commit. Lock
+  order is `Controller.mu` (RLock) → `Machine.mu` (RLock) → `Engine.mu` (Lock). A cached binding that
+  is absent or does not match the accepted metadata fails closed (no database read inside the protected
+  commit). A completed revocation prevents a subsequent commit; a commit that linearizes before a
+  revocation may complete normally.
+
+**What it does NOT provide (deferred to Milestone 5B and later):**
+
+- No production Kubernetes metadata provider (the controller uses a no-op source that always reports metadata
+  unavailable; replicas with lifecycle enabled fail closed).
+- No automatic cluster genesis (a fresh replica with no binding cannot automatically initialize an empty epoch).
+- No initial snapshot transfer (the path from `SYNCING` to `READY` is not yet implemented).
+- No automatic epoch reset or operator reset endpoints.
+- mTLS alone does **not** prove a peer's epoch membership; the response envelope is a second, independent check.
+- 5A alone does **not** make GossipGrid safe for catastrophic cluster recovery.
+
+**Local testing.** The `cmd/gossipgrid` package includes controller-driven integration tests
+(`TestControllerDriven*` — 14 scenarios covering matching/missing/invalid metadata, epoch A→B transitions,
+revocation fencing, legacy-peer rejection, and lifecycle-disabled convergence) and real-mTLS mixed-mode tests
+(`TestMixedMode*` — 7 scenarios) that start GossipGrid nodes with lifecycle enabled, distinct identities, and
+loopback mTLS listeners. All scenarios pass under the race detector.
+
+**Security note.** mTLS remains the sole basis for peer identity. Epoch headers are fencing metadata, not
+credentials: possessing an epoch ID does not grant access to any resource. A peer with a valid mTLS certificate
+but a different epoch is rejected (409) — its data is not merged. mTLS alone does not prove epoch membership;
+the response envelope provides a second, independent validation layer.
 
 ### Endpoints
 
@@ -272,11 +356,22 @@ The **network dial address and the expected authenticated peer identity are dist
 `gossipgrid-1.gossipgrid-headless.default.svc.cluster.local` (the in-cluster FQDN). This is the mechanism that lets the
 application be tested as independent local processes without Kubernetes.
 
-For this milestone the peer listener exposes a single private endpoint:
+The peer listener exposes the following private endpoints (all mTLS-protected, none exposed on the public HTTP
+router):
 
 - `GET /internal/status` — returns the authenticated server's node identity, application version, pod identity, and a
-  safe certificate fingerprint (no private key or PEM content). This endpoint is **not** exposed on the public HTTP
-  router and requires a successful client-certificate handshake.
+  safe certificate fingerprint (no private key or PEM content). Always available (200 even when unready).
+- `POST /internal/messages` — (opt-in via `GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED`) accepts an authenticated peer's
+  message for idempotent replicated storage.
+- `GET /internal/sync/ids` — (opt-in via `GOSSIPGRID_ANTI_ENTROPY_ENABLED`) returns a bounded, keyset-paginated page
+  of message IDs for inventory comparison.
+- `POST /internal/sync/messages` — (opt-in via `GOSSIPGRID_ANTI_ENTROPY_ENABLED`) fetches a bounded batch of messages
+  by ID for anti-entropy reconciliation.
+
+When lifecycle protection is enabled (`GOSSIPGRID_LIFECYCLE_ENABLED=true`), all private replication endpoints carry
+epoch fencing headers (`X-GossipGrid-Cluster-ID`, `X-GossipGrid-Epoch-ID`) and a response envelope
+(`X-GossipGrid-Resp-Cluster-ID`, `X-GossipGrid-Resp-Epoch-ID`, `X-GossipGrid-Lifecycle-Active`); a 409 epoch mismatch
+is permanent (no retry).
 
 **Certificate identity convention.** Each replica's certificate DNS identity is
 `<replica>.<GOSSIPGRID_PEER_IDENTITY_SUFFIX>`, for example
@@ -350,12 +445,14 @@ accept a supplied HTTP header as proof of peer identity. The message's `origin` 
 identifying its original creator, which may differ from the forwarding peer. mTLS alone does **not**
 cryptographically prove the historical origin of a forwarded message.
 
-**Scope limitation.** This is a provisional, direct, caller-initiated exchange. It does **not** by itself implement
-automatic gossip fanout, bounded queues, retry scheduling, anti-entropy, snapshot transfer, epoch management, or
-production cluster-reset and epoch-isolation guarantees. Automatic gossip fanout and anti-entropy are implemented in
-Milestones 4B and 4C and build on this endpoint. `POST /api/messages` does **not** automatically replicate;
-replication is driven by the gossip engine (Milestone 4B) and anti-entropy worker (Milestone 4C), both of which are
-opt-in and require this endpoint plus peer mTLS.
+**Scope of 4A.** This is a provisional, direct, caller-initiated exchange. At the time of Milestone 4A, automatic
+gossip fanout, bounded queues, retry scheduling, anti-entropy, snapshot transfer, epoch management, and
+production cluster-reset guarantees were not yet implemented. Milestones 4B and 4C (both completed 2026-11-20)
+subsequently implemented automatic epidemic gossip fanout and periodic anti-entropy reconciliation on top of this
+endpoint. When `GOSSIPGRID_GOSSIP_ENABLED=true` (Milestone 4B, opt-in), successful local writes
+(`POST /api/messages`) **do** initiate automatic propagation to eligible peers. When
+`GOSSIPGRID_ANTI_ENTROPY_ENABLED=true` (Milestone 4C, opt-in), periodic inventory comparison and record retrieval
+repair missed gossip. Both features are opt-in and require this endpoint plus peer mTLS.
 
 **Local testing.** The `cmd/gossipgrid` package includes a repeatable integration test
 (`TestIntegrationTwoNodesMessageExchange`) that starts two GossipGrid nodes with distinct identities, SQLite

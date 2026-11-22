@@ -33,9 +33,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
+
+	"gossipgrid/internal/lifecycle"
 )
 
 // maxResponseBodyBytes bounds the response body read from a peer (for
@@ -105,6 +108,30 @@ func NewPeerAckError(identity, reason string) *PeerAckError {
 	return &PeerAckError{identity: identity, reason: reason}
 }
 
+// PeerBlockedError is returned by Client methods when the LOCAL EpochProvider
+// refuses to authorize the outbound request (the current epoch cannot be
+// established safely: a lockout, no fresh authoritative observation, no
+// matching durable binding, or the controller is stopped). It is distinct from
+// a peer rejection: no request was sent to the remote peer. It is a permanent,
+// non-retried condition (retried it would not succeed until the local
+// authorization recovers) and is classified as permanent by callers (the gossip
+// and anti-entropy engines).
+type PeerBlockedError struct {
+	identity string
+	reason   string
+}
+
+func (e *PeerBlockedError) Error() string {
+	return fmt.Sprintf("outbound request to %s blocked locally: %s", e.identity, e.reason)
+}
+
+// NewPeerBlockedError returns a PeerBlockedError for the given peer identity
+// and reason. It is exported so callers and tests can construct the typed
+// error without a real HTTP exchange.
+func NewPeerBlockedError(identity, reason string) *PeerBlockedError {
+	return &PeerBlockedError{identity: identity, reason: reason}
+}
+
 // PeerAckError is returned by Client.SendMessage when a successful response
 // (200/201) carries an invalid message acknowledgment: a missing or null
 // message, or a mismatched/malformed ID, body, origin, or creation timestamp.
@@ -119,10 +146,48 @@ func (e *PeerAckError) Error() string {
 	return fmt.Sprintf("peer %s returned a successful response with an invalid acknowledgment: %s", e.identity, e.reason)
 }
 
+// EpochProvider supplies the local, currently authorized cluster and epoch
+// context for outbound replication requests. It is the narrow interface the
+// client uses to source its outbound epoch headers from the LIFECYCLE
+// CONTROLLER'S CURRENT AUTHORIZATION DECISION, not a one-time startup copy.
+//
+//   - Context returns the currently authorized cluster/epoch context, or an
+//     error when the current epoch cannot be established safely (no fresh
+//     authoritative observation, no matching durable binding, a lockout, or
+//     the controller is stopped). When an error is returned, the client must
+//     NOT send the request (outbound replication is blocked).
+//   - Enforcement reports whether lifecycle protection is enabled locally.
+//     When false, the client sends no epoch headers and performs no
+//     response-envelope validation (legacy behavior preserved).
+//
+// In production, main.go wires this to a closure that reads the lifecycle
+// controller's Authorization() snapshot: the context is the snapshot's
+// authorized metadata when the snapshot is authorized (and not stopped), and
+// an error otherwise. This keeps the outbound context in sync with metadata
+// changes: a metadata change between two requests is reflected in the next
+// request (or the request is blocked), rather than using a stale startup copy.
+type EpochProvider interface {
+	// Context returns the currently authorized cluster/epoch context, or an
+	// error when the current epoch cannot be established safely.
+	Context() (lifecycle.RequestContext, error)
+	// Enforcement reports whether local lifecycle protection is enabled.
+	Enforcement() bool
+}
+
 // Client is an authenticated peer HTTP client for the private peer endpoints.
-// It wraps the Manager's credential snapshot for the mTLS transport.
+// It wraps the Manager's credential snapshot for the mTLS transport. When an
+// EpochProvider is configured (lifecycle protection enabled), outbound
+// replication requests carry the locally authorized epoch headers and
+// successful responses are validated for the response epoch envelope (mixed-mode
+// fencing). When no provider is configured (lifecycle disabled), legacy
+// behavior is preserved: no epoch headers, no response validation.
 type Client struct {
 	mgr *Manager
+
+	// mu protects provider (set by SetEpochProvider, read by doRequest and the
+	// response validators).
+	mu       sync.RWMutex
+	provider EpochProvider
 }
 
 // NewClient creates a Client bound to the given Manager. The Manager must have
@@ -131,12 +196,205 @@ func NewClient(mgr *Manager) *Client {
 	return &Client{mgr: mgr}
 }
 
-// peerStatusResponse is the JSON response from GET /internal/status.
+// SetEpochProvider configures the EpochProvider that supplies the local,
+// currently authorized epoch context for outbound replication requests. When
+// enforcement is true, requests carry the epoch headers and successful
+// responses are validated for the response epoch envelope. When nil, legacy
+// behavior is preserved (no epoch headers, no response validation).
+func (c *Client) SetEpochProvider(p EpochProvider) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.provider = p
+}
+
+// getProvider returns the configured EpochProvider, or nil when none is set.
+func (c *Client) getProvider() EpochProvider {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.provider
+}
+
+// peerStatusResponse is the JSON response from GET /internal/status. It
+// carries the existing fields plus the lifecycle fields (Milestone 5A).
+// The lifecycle fields are empty/zero when the remote peer has lifecycle
+// protection disabled.
 type peerStatusResponse struct {
 	NodeID          string `json:"node_id"`
 	Version         string `json:"version"`
 	PodID           string `json:"pod_id,omitempty"`
 	CertFingerprint string `json:"cert_fingerprint,omitempty"`
+
+	// Lifecycle fields (Milestone 5A).
+	ClusterID               string `json:"cluster_id,omitempty"`
+	EpochID                 string `json:"epoch_id,omitempty"`
+	Generation              int    `json:"generation,omitempty"`
+	LifecycleState          string `json:"lifecycle_state,omitempty"`
+	Readiness               bool   `json:"readiness,omitempty"`
+	BootstrapSourceEligible bool   `json:"bootstrap_source_eligible,omitempty"`
+	DiagnosticReason        string `json:"diagnostic_reason,omitempty"`
+}
+
+// PeerStatusInfo is the exported form of the peer status response. It is
+// returned by Client.GetStatus and carries both the existing fields and the
+// lifecycle fields (when present).
+type PeerStatusInfo struct {
+	NodeID          string
+	Version         string
+	PodID           string
+	CertFingerprint string
+
+	// Lifecycle fields (Milestone 5A). Empty/zero when the remote peer has
+	// lifecycle protection disabled.
+	ClusterID               string
+	EpochID                 string
+	Generation              int
+	LifecycleState          string
+	Readiness               bool
+	BootstrapSourceEligible bool
+	DiagnosticReason        string
+}
+
+// validateResponseEnvelope checks the response epoch envelope carried in the
+// response headers against the local EpochProvider and the captured request
+// epoch context when local lifecycle enforcement is enabled. It returns an
+// error (to be wrapped in a PeerAckError by the caller) when:
+//
+//   - the remote peer is legacy (lifecycle disabled — it did not set the
+//     X-GossipGrid-Lifecycle-Active header): a lifecycle-enabled client must
+//     reject it as a synchronization source, because the peer cannot
+//     demonstrate compatible epoch-fencing protocol behavior. A valid mTLS
+//     certificate is necessary but not sufficient for epoch authorization.
+//   - the response does not carry exactly one nonempty ClusterID header.
+//   - the response does not carry exactly one nonempty EpochID header.
+//   - the response carries duplicate or contradictory epoch headers.
+//   - the response reports a cluster/epoch that contradicts the captured
+//     request context (a wrong-epoch or conflicting peer).
+//
+// reqCtx is the immutable authorized context captured when the request was
+// sent. The response is validated against this captured context (not a fresh
+// re-read of the EpochProvider), so a response from epoch B is never
+// accepted as the acknowledgment for a request authorized under epoch A even
+// if the local epoch changed while the request was in flight.
+//
+// When local enforcement is disabled (no provider or provider.Enforcement()
+// false), no validation is performed and the response is accepted (legacy
+// behavior preserved). The envelope is auditable: the headers are bounded and
+// the values are compared against the local authorized metadata, not treated
+// as bearer credentials.
+func validateResponseEnvelope(respHeaders http.Header, identity string, p EpochProvider, reqCtx lifecycle.RequestContext) error {
+	if p == nil || !p.Enforcement() {
+		return nil // local lifecycle disabled: legacy behavior preserved
+	}
+	// Determine whether the remote peer is lifecycle-capable.
+	activeVals := respHeaders.Values(lifecycle.HeaderLifecycleActive)
+	if len(activeVals) != 1 {
+		return fmt.Errorf("peer %s response carries %d Lifecycle-Active headers (expected exactly 1)", identity, len(activeVals))
+	}
+	if activeVals[0] != "true" {
+		return fmt.Errorf("peer %s does not enforce the lifecycle/epoch protocol (Lifecycle-Active=%q); rejected as a synchronization source", identity, activeVals[0])
+	}
+	// The response must carry exactly one nonempty ClusterID header.
+	rcVals := respHeaders.Values(lifecycle.HeaderRespClusterID)
+	if len(rcVals) == 0 {
+		return fmt.Errorf("peer %s response is missing the %s header", identity, lifecycle.HeaderRespClusterID)
+	}
+	if len(rcVals) > 1 {
+		return fmt.Errorf("peer %s response carries %d duplicate %s headers", identity, len(rcVals), lifecycle.HeaderRespClusterID)
+	}
+	if rcVals[0] == "" {
+		return fmt.Errorf("peer %s response carries an empty %s header", identity, lifecycle.HeaderRespClusterID)
+	}
+	if len(rcVals[0]) > lifecycle.MaxEpochHeaderBytes {
+		return fmt.Errorf("peer %s response %s header exceeds %d bytes", identity, lifecycle.HeaderRespClusterID, lifecycle.MaxEpochHeaderBytes)
+	}
+	// The response must carry exactly one nonempty EpochID header.
+	reVals := respHeaders.Values(lifecycle.HeaderRespEpochID)
+	if len(reVals) == 0 {
+		return fmt.Errorf("peer %s response is missing the %s header", identity, lifecycle.HeaderRespEpochID)
+	}
+	if len(reVals) > 1 {
+		return fmt.Errorf("peer %s response carries %d duplicate %s headers", identity, len(reVals), lifecycle.HeaderRespEpochID)
+	}
+	if reVals[0] == "" {
+		return fmt.Errorf("peer %s response carries an empty %s header", identity, lifecycle.HeaderRespEpochID)
+	}
+	if len(reVals[0]) > lifecycle.MaxEpochHeaderBytes {
+		return fmt.Errorf("peer %s response %s header exceeds %d bytes", identity, lifecycle.HeaderRespEpochID, lifecycle.MaxEpochHeaderBytes)
+	}
+	// Compare the response's reported epoch against the captured request
+	// context. A mismatch indicates the response is from a different cluster
+	// or epoch than the one that authorized the request.
+	if reqCtx.ClusterID != "" && rcVals[0] != reqCtx.ClusterID {
+		return fmt.Errorf("peer %s reports cluster ID %q in response but request was authorized under cluster %q", identity, rcVals[0], reqCtx.ClusterID)
+	}
+	if reqCtx.EpochID != "" && reVals[0] != reqCtx.EpochID {
+		return fmt.Errorf("peer %s reports epoch ID %q in response but request was authorized under epoch %q", identity, reVals[0], reqCtx.EpochID)
+	}
+	return nil
+}
+
+// validateDiagnosticEnvelope is the validation used for GET /internal/status
+// responses. It is less strict than validateResponseEnvelope because the
+// diagnostic status endpoint must remain accessible to diagnose an unready
+// replica that has no accepted metadata (and therefore cannot yet report
+// epoch information). It requires:
+//
+//   - exactly one Lifecycle-Active header with value "true" (the peer must
+//     be lifecycle-capable);
+//   - if ClusterID or EpochID headers are present, they must be nonempty,
+//     non-duplicate, and within the byte bound;
+//   - if both are present, they must be consistent with the local authorized
+//     context (a mismatch is an error); if only one is present, it is
+//     tolerated (an unready replica may report a partial envelope).
+//
+// This preserves diagnostic-status accessibility for uninitialized peers
+// while still rejecting contradictory or malformed envelopes.
+func validateDiagnosticEnvelope(respHeaders http.Header, identity string, p EpochProvider, reqCtx lifecycle.RequestContext) error {
+	if p == nil || !p.Enforcement() {
+		return nil
+	}
+	activeVals := respHeaders.Values(lifecycle.HeaderLifecycleActive)
+	if len(activeVals) != 1 {
+		return fmt.Errorf("peer %s status response carries %d Lifecycle-Active headers (expected exactly 1)", identity, len(activeVals))
+	}
+	if activeVals[0] != "true" {
+		return fmt.Errorf("peer %s does not enforce the lifecycle/epoch protocol (Lifecycle-Active=%q); rejected", identity, activeVals[0])
+	}
+	// Check ClusterID: if present, must be nonempty, non-duplicate, within
+	// bounds, and consistent with the request context.
+	rcVals := respHeaders.Values(lifecycle.HeaderRespClusterID)
+	if len(rcVals) > 1 {
+		return fmt.Errorf("peer %s status response carries %d duplicate %s headers", identity, len(rcVals), lifecycle.HeaderRespClusterID)
+	}
+	if len(rcVals) == 1 {
+		if rcVals[0] == "" {
+			return fmt.Errorf("peer %s status response carries an empty %s header", identity, lifecycle.HeaderRespClusterID)
+		}
+		if len(rcVals[0]) > lifecycle.MaxEpochHeaderBytes {
+			return fmt.Errorf("peer %s status response %s header exceeds %d bytes", identity, lifecycle.HeaderRespClusterID, lifecycle.MaxEpochHeaderBytes)
+		}
+		if reqCtx.ClusterID != "" && rcVals[0] != reqCtx.ClusterID {
+			return fmt.Errorf("peer %s status reports cluster %q but request context is %q", identity, rcVals[0], reqCtx.ClusterID)
+		}
+	}
+	// Check EpochID: if present, must be nonempty, non-duplicate, within
+	// bounds, and consistent with the request context.
+	reVals := respHeaders.Values(lifecycle.HeaderRespEpochID)
+	if len(reVals) > 1 {
+		return fmt.Errorf("peer %s status response carries %d duplicate %s headers", identity, len(reVals), lifecycle.HeaderRespEpochID)
+	}
+	if len(reVals) == 1 {
+		if reVals[0] == "" {
+			return fmt.Errorf("peer %s status response carries an empty %s header", identity, lifecycle.HeaderRespEpochID)
+		}
+		if len(reVals[0]) > lifecycle.MaxEpochHeaderBytes {
+			return fmt.Errorf("peer %s status response %s header exceeds %d bytes", identity, lifecycle.HeaderRespEpochID, lifecycle.MaxEpochHeaderBytes)
+		}
+		if reqCtx.EpochID != "" && reVals[0] != reqCtx.EpochID {
+			return fmt.Errorf("peer %s status reports epoch %q but request context is %q", identity, reVals[0], reqCtx.EpochID)
+		}
+	}
+	return nil
 }
 
 // sendResponse is the JSON response from POST /internal/messages on a
@@ -203,10 +461,47 @@ func buildClient(tlsCfg *tls.Config) *http.Client {
 // GET). The caller supplies the exact expected peer identity; the TLS layer
 // verifies the server presents a certificate whose single DNS SAN exactly
 // matches expectedIdentity. responseLimit bounds the response body read.
-func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expectedIdentity string, body []byte, responseLimit int64) ([]byte, int, error) {
+//
+// Milestone 5A mixed-mode fencing: when an EpochProvider with enforcement
+// enabled is configured, the request carries the locally authorized epoch
+// headers and the caller is expected to validate the response envelope (via
+// validateResponseEnvelope). When the provider's Context() returns an error
+// (the current epoch cannot be established safely — a lockout, no fresh
+// observation, or no matching binding), the request is NOT sent: a block is
+// returned as a typed error so the caller does not proceed. When no provider
+// is configured (lifecycle disabled), no epoch headers are sent and no
+// response validation is performed (legacy behavior preserved).
+// doRequest performs an authenticated request against a private peer endpoint.
+// It is the shared plumbing for GetStatus, SendMessage, FetchInventoryPage,
+// and FetchMessages.
+//
+// method is the HTTP method (GET or POST). body is the request body (nil for
+// GET). The caller supplies the exact expected peer identity; the TLS layer
+// verifies the server presents a certificate whose single DNS SAN exactly
+// matches expectedIdentity. responseLimit bounds the response body read.
+//
+// Milestone 5A mixed-mode fencing: when an EpochProvider with enforcement
+// enabled is configured, the request carries the locally authorized epoch
+// headers and the caller is expected to validate the response envelope (via
+// validateResponseEnvelope). The epoch context is captured ONCE at request
+// construction time (before the network I/O) and returned to the caller so
+// the response can be validated against the SAME context that authorized the
+// request — not a fresh re-read that could reflect a concurrent epoch
+// change. After reading the response body, doRequest rechecks the current
+// authorization: if the local authorization was revoked or the epoch changed
+// while the request was in flight, the response is rejected (the data must
+// not be consumed after authority is invalidated). When no provider is
+// configured (lifecycle disabled), no epoch headers are sent and no response
+// validation is performed (legacy behavior preserved).
+//
+// The returned reqCtx is the immutable authorized context captured when the
+// request was sent. The caller must pass it to validateResponseEnvelope (or
+// validateDiagnosticEnvelope for status) so the response is validated against
+// the original request epoch, not a potentially-changed current epoch.
+func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expectedIdentity string, body []byte, responseLimit int64) ([]byte, int, http.Header, lifecycle.RequestContext, error) {
 	tlsCfg, err := c.mgr.TLSConfigForClient(dialAddr, expectedIdentity)
 	if err != nil {
-		return nil, 0, fmt.Errorf("building peer TLS client config: %w", err)
+		return nil, 0, nil, lifecycle.RequestContext{}, fmt.Errorf("building peer TLS client config: %w", err)
 	}
 
 	var req *http.Request
@@ -216,12 +511,37 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 		req, err = http.NewRequestWithContext(ctx, method, "https://"+dialAddr+path, bytes.NewReader(body))
 	}
 	if err != nil {
-		return nil, 0, fmt.Errorf("building request: %w", err)
+		return nil, 0, nil, lifecycle.RequestContext{}, fmt.Errorf("building request: %w", err)
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
+
+	// Milestone 5A: source the outbound epoch context from the current
+	// EpochProvider (the lifecycle controller's authorization decision), not
+	// a one-time startup copy. The context is captured ONCE here (before any
+	// network I/O) and returned to the caller for response validation. A
+	// metadata change between two requests is reflected in the next request.
+	// When the provider is configured with enforcement enabled but cannot
+	// establish the current epoch safely, the request is blocked (not sent) —
+	// a block is a typed, permanent error so the caller does not retry
+	// indefinitely.
+	var reqCtx lifecycle.RequestContext
+	p := c.getProvider()
+	if p != nil && p.Enforcement() {
+		localCtx, cerr := p.Context()
+		if cerr != nil {
+			return nil, 0, nil, lifecycle.RequestContext{}, NewPeerBlockedError(expectedIdentity, cerr.Error())
+		}
+		reqCtx = lifecycle.RequestContext{ClusterID: localCtx.ClusterID, EpochID: localCtx.EpochID}
+		if localCtx.ClusterID != "" {
+			req.Header.Set(lifecycle.HeaderClusterID, localCtx.ClusterID)
+		}
+		if localCtx.EpochID != "" {
+			req.Header.Set(lifecycle.HeaderEpochID, localCtx.EpochID)
+		}
+	}
 
 	client := buildClient(tlsCfg)
 
@@ -231,7 +551,7 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 		// leaking idle TLS connections. The transport is discarded after
 		// this call, so any idle connections would otherwise be abandoned.
 		client.Transport.(*http.Transport).CloseIdleConnections()
-		return nil, 0, fmt.Errorf("requesting peer %s at %s: %w", expectedIdentity, dialAddr, err)
+		return nil, 0, nil, lifecycle.RequestContext{}, fmt.Errorf("requesting peer %s at %s: %w", expectedIdentity, dialAddr, err)
 	}
 	// The close error is ignored: after the response body is read (or the
 	// request fails) there is no useful recovery for a broken client
@@ -250,12 +570,35 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 	lr := io.LimitReader(resp.Body, responseLimit+1)
 	respBody, err := io.ReadAll(lr)
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("reading peer response body: %w", err)
+		return nil, resp.StatusCode, nil, reqCtx, fmt.Errorf("reading peer response body: %w", err)
 	}
 	if int64(len(respBody)) > responseLimit {
-		return nil, resp.StatusCode, fmt.Errorf("peer response exceeds maximum of %d bytes", responseLimit)
+		return nil, resp.StatusCode, nil, reqCtx, fmt.Errorf("peer response exceeds maximum of %d bytes", responseLimit)
 	}
-	return respBody, resp.StatusCode, nil
+	respHeaders := resp.Header.Clone()
+
+	// Milestone 5A (Issue 3): recheck the current authorization BEFORE
+	// returning the response. If the local authorization was revoked or the
+	// epoch changed while the request was in flight, the response must NOT be
+	// consumed (the data is from an epoch that no longer has authority).
+	// This prevents accepting a response from epoch B as the acknowledgment
+	// for a request authorized under epoch A.
+	if p != nil && p.Enforcement() {
+		currentCtx, cerr := p.Context()
+		if cerr != nil {
+			return nil, resp.StatusCode, respHeaders, reqCtx, NewPeerBlockedError(expectedIdentity, "local authorization was revoked while the request was in flight: "+cerr.Error())
+		}
+		if currentCtx.ClusterID != reqCtx.ClusterID || currentCtx.EpochID != reqCtx.EpochID {
+			return nil, resp.StatusCode, respHeaders, reqCtx, NewPeerBlockedError(expectedIdentity,
+				fmt.Sprintf("local epoch changed while the request was in flight (request=%s/%s, current=%s/%s); response is not authorized",
+					reqCtx.ClusterID, reqCtx.EpochID, currentCtx.ClusterID, currentCtx.EpochID))
+		}
+	}
+
+	// Return the response headers and the captured request context so the
+	// caller can validate the response epoch envelope (validateResponseEnvelope
+	// or validateDiagnosticEnvelope) against the original request epoch.
+	return respBody, resp.StatusCode, respHeaders, reqCtx, nil
 }
 
 // GetStatus requests the private status endpoint from a specific expected peer.
@@ -269,8 +612,8 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 // identity, an untrusted client certificate, or a server whose SAN does not
 // match expectedIdentity all cause the handshake to fail and this method to
 // return an error.
-func (c *Client) GetStatus(ctx context.Context, dialAddr, expectedIdentity string) (*peerStatusResponse, error) {
-	respBody, status, err := c.doRequest(ctx, http.MethodGet, "/internal/status", dialAddr, expectedIdentity, nil, maxResponseBodyBytes)
+func (c *Client) GetStatus(ctx context.Context, dialAddr, expectedIdentity string) (*PeerStatusInfo, error) {
+	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodGet, "/internal/status", dialAddr, expectedIdentity, nil, maxResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +624,33 @@ func (c *Client) GetStatus(ctx context.Context, dialAddr, expectedIdentity strin
 	if err := json.Unmarshal(respBody, &out); err != nil {
 		return nil, fmt.Errorf("decoding peer status: %w", err)
 	}
-	return &out, nil
+
+	// Validate the diagnostic-status response envelope (Milestone 5A). The
+	// diagnostic status endpoint must remain accessible to diagnose an
+	// unready replica that has no accepted metadata (and therefore cannot
+	// yet report a full epoch envelope). The diagnostic validator is less
+	// strict than the replication-response validator: it requires the
+	// Lifecycle-Active header to be present and "true", but tolerates
+	// absent ClusterID/EpochID headers (an uninitialized peer may not be
+	// able to report them yet). A contradictory or malformed envelope is
+	// still rejected.
+	if err := validateDiagnosticEnvelope(respHeaders, expectedIdentity, c.getProvider(), reqCtx); err != nil {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: err.Error()}
+	}
+
+	return &PeerStatusInfo{
+		NodeID:                  out.NodeID,
+		Version:                 out.Version,
+		PodID:                   out.PodID,
+		CertFingerprint:         out.CertFingerprint,
+		ClusterID:               out.ClusterID,
+		EpochID:                 out.EpochID,
+		Generation:              out.Generation,
+		LifecycleState:          out.LifecycleState,
+		Readiness:               out.Readiness,
+		BootstrapSourceEligible: out.BootstrapSourceEligible,
+		DiagnosticReason:        out.DiagnosticReason,
+	}, nil
 }
 
 // SendMessage posts an existing message to a specific expected peer over mTLS.
@@ -316,12 +685,22 @@ func (c *Client) SendMessage(ctx context.Context, dialAddr, expectedIdentity str
 	if err != nil {
 		return nil, fmt.Errorf("encoding send request: %w", err)
 	}
-	respBody, status, err := c.doRequest(ctx, http.MethodPost, "/internal/messages", dialAddr, expectedIdentity, body, maxResponseBodyBytes)
+	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodPost, "/internal/messages", dialAddr, expectedIdentity, body, maxResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}
 	if status != http.StatusOK && status != http.StatusCreated {
 		return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
+	}
+	// Validate the response epoch envelope against the captured request
+	// context (Milestone 5A mixed-mode fencing). A legacy peer (no envelope),
+	// a missing/duplicate/contradictory epoch header, or an epoch mismatch
+	// with the request's authorized context is rejected. The response is
+	// validated against the SAME context that authorized the request (not a
+	// fresh re-read), so a concurrent epoch change cannot cause a
+	// wrong-epoch response to be accepted.
+	if err := validateResponseEnvelope(respHeaders, expectedIdentity, c.getProvider(), reqCtx); err != nil {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: err.Error()}
 	}
 	var out sendResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -408,12 +787,21 @@ func (c *Client) FetchInventoryPage(ctx context.Context, dialAddr, expectedIdent
 	if after != "" {
 		path += "&after=" + after
 	}
-	respBody, status, err := c.doRequest(ctx, http.MethodGet, path, dialAddr, expectedIdentity, nil, maxSyncResponseBodyBytes)
+	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodGet, path, dialAddr, expectedIdentity, nil, maxSyncResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}
 	if status != http.StatusOK {
 		return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
+	}
+	// Validate the response epoch envelope against the captured request
+	// context (Milestone 5A mixed-mode fencing). A legacy peer (no envelope),
+	// a missing/duplicate/contradictory epoch header, or an epoch mismatch
+	// with the request's authorized context is rejected, so inventory from a
+	// peer that cannot demonstrate compatible protocol behavior is not
+	// accepted as a synchronization source.
+	if err := validateResponseEnvelope(respHeaders, expectedIdentity, c.getProvider(), reqCtx); err != nil {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: err.Error()}
 	}
 	var out InventoryPageResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {
@@ -486,12 +874,21 @@ func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity s
 	if err != nil {
 		return nil, fmt.Errorf("encoding fetch request: %w", err)
 	}
-	respBody, status, err := c.doRequest(ctx, http.MethodPost, "/internal/sync/messages", dialAddr, expectedIdentity, body, maxSyncResponseBodyBytes)
+	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodPost, "/internal/sync/messages", dialAddr, expectedIdentity, body, maxSyncResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}
 	if status != http.StatusOK {
 		return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
+	}
+	// Validate the response epoch envelope against the captured request
+	// context (Milestone 5A mixed-mode fencing). A legacy peer (no envelope),
+	// a missing/duplicate/contradictory epoch header, or an epoch mismatch
+	// with the request's authorized context is rejected, so fetched records
+	// from a peer that cannot demonstrate compatible protocol behavior are
+	// not inserted as a synchronization source.
+	if err := validateResponseEnvelope(respHeaders, expectedIdentity, c.getProvider(), reqCtx); err != nil {
+		return nil, &PeerAckError{identity: expectedIdentity, reason: err.Error()}
 	}
 	var out fetchMessagesResponse
 	if err := json.Unmarshal(respBody, &out); err != nil {

@@ -71,6 +71,12 @@ const (
 	EnvAntiEntropyMaxPagesPerPeer = "GOSSIPGRID_ANTI_ENTROPY_MAX_PAGES_PER_PEER"
 	EnvAntiEntropyWorkers         = "GOSSIPGRID_ANTI_ENTROPY_WORKERS"
 	EnvAntiEntropyRequestTimeout  = "GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT"
+
+	// Lifecycle (Milestone 5A). When enabled, the replica lifecycle state
+	// machine is active, public writes are gated on readiness, and
+	// replication requires epoch fencing. When disabled (the default),
+	// all existing Milestone 4 behavior is preserved.
+	EnvLifecycleEnabled = "GOSSIPGRID_LIFECYCLE_ENABLED"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -134,6 +140,12 @@ type Config struct {
 	AntiEntropyMaxPagesPerPeer int
 	AntiEntropyWorkers         int
 	AntiEntropyRequestTimeout  time.Duration
+
+	// Lifecycle (Milestone 5A). When LifecycleEnabled is true, the replica
+	// lifecycle state machine is active. Requires PeerTLSEnabled (validates
+	// peer identity configuration). When false (default), all existing
+	// behavior is preserved and no epoch protection is claimed.
+	LifecycleEnabled bool
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -325,6 +337,20 @@ func load(lookup envFunc) (*Config, error) {
 		if err := validateAntiEntropyConfig(cfg); err != nil {
 			errs = append(errs, err)
 		}
+	}
+
+	// Lifecycle (Milestone 5A). Default disabled: when unset, the
+	// lifecycle state machine is not active and all existing Milestone 4
+	// behavior is preserved.
+	if v, ok := lookup(EnvLifecycleEnabled); ok {
+		b, perr := parseBoolEnv(v, EnvLifecycleEnabled)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.LifecycleEnabled = b
+	}
+	if err := validateLifecycleConfig(cfg); err != nil {
+		errs = append(errs, err)
 	}
 
 	return cfg, errors.Join(errs...)
@@ -742,6 +768,25 @@ func validateDiscoveryConfig(cfg *Config) error {
 		return fmt.Errorf("%s: stateful set name is required when expected replicas exceeds 1", EnvStatefulSetName)
 	}
 
+	return nil
+}
+
+// validateLifecycleConfig checks the lifecycle protection flag (Milestone 5A).
+// Lifecycle protection requires peer mTLS to be enabled (the peer identity
+// configuration must be valid). It does NOT require gossip or anti-entropy to
+// be enabled; those are independent opt-in features.
+//
+// When lifecycle protection is disabled (the default), no additional
+// validation is performed and all existing Milestone 4 behavior is preserved.
+func validateLifecycleConfig(cfg *Config) error {
+	if !cfg.LifecycleEnabled {
+		return nil
+	}
+	// Lifecycle protection requires peer mTLS (the transport for
+	// authenticated peer identity).
+	if !cfg.PeerTLSEnabled {
+		return fmt.Errorf("%s: lifecycle protection requires peer mTLS to be enabled (%s=true)", EnvLifecycleEnabled, EnvPeerTLSEnabled)
+	}
 	return nil
 }
 

@@ -1,7 +1,48 @@
 # Gossip and bootstrap protocol
 
 **Intent:** A compact, inspectable protocol that teaches real replication behavior without a separate broker or
-leader. This is a design spec; no wire protocol has been implemented.
+leader. Milestones 4A–4C implement the gossip and anti-entropy wire protocols; Milestone 5A (implemented 2026-11-21)
+adds the lifecycle state machine, durable epoch binding, epoch fencing, and fail-closed admission.
+
+## Milestone 5A — what is enforced vs. deferred to 5B
+
+Milestone 5A provides the **foundations** for fail-closed authority and epoch fencing. It does **not** implement
+the **procedures** for safe bootstrap and recovery, which are reserved for Milestone 5B:
+
+| Enforced in 5A | Deferred to 5B |
+| --- | --- |
+| 7-state lifecycle machine with a transition table | Authorized genesis (control-plane-coordinated; empty SQLite state alone is never sufficient) |
+| Durable SQLite `local_metadata` binding (atomic, idempotent, exclusive) | Cluster epoch creation/reset (operator endpoints) |
+| Fail-closed admission (single consistent authorization snapshot) | Initial snapshot promotion (SYNCING → READY) |
+| Epoch fencing via HTTP request headers (409 permanent / 503 unready) | Snapshot-source selection (which peer to sync from) |
+| Response-envelope validation (lifecycle-enabled client rejects legacy peers) | K8s ConfigMap-backed metadata provider |
+| Public read/write quarantine (503 when unauthorized; records preserved) | Operator reset endpoints |
+| Outbound epoch context sourced from the current controller decision | |
+| Per-send admission re-check (gossip + anti-entropy) | |
+| Metadata freshness (bounded: 2× poll interval; stale observations fail closed) | |
+
+**Key clarifications (guarantees actually enforced):**
+
+- **Stale observations fail closed.** A metadata observation older than 2× the poll interval is considered stale
+  and does NOT authorize operations, even if the state is READY. This is enforced by the authorization snapshot's
+  `Stale` flag.
+- **Inserts do NOT re-verify the epoch binding.** The store's `Bind` operation is the only binding check. A message
+  insert (via `ON CONFLICT DO NOTHING`) does not re-check the epoch binding; the fail-closed admission guard is the
+  line of defense before the insert.
+- **Queued replication is fenced at the moment of the check.** A gossip or anti-entropy work item admitted while
+  authorized (the admission check passed at enqueue or at the per-send re-check) may be delivered if it was
+  authorized when the check passed. The guarantee is that **no NEW work is authorized after a revocation**: the
+  admission check is re-read before every network send and every insert, and a revoked node blocks all new work.
+  An already-in-flight send (authorized when it started) may complete in the bounded in-flight window.
+- **mTLS alone does NOT prove epoch membership.** A valid mTLS certificate is necessary but not sufficient. A
+  lifecycle-enabled client additionally requires the peer's **response envelope** (`X-GossipGrid-Lifecycle-Active:
+  true` + matching cluster/epoch headers) to confirm the peer runs the epoch-fencing protocol. A legacy peer
+  (lifecycle disabled) that returns a successful response without the envelope is rejected as a synchronization
+  source.
+- **5A does NOT provide full safe bootstrap or recovery.** The state machine, binding, and fencing are in place,
+  but the procedures to establish a new cluster (genesis), promote a snapshot (SYNCING → READY), or recover from a
+  lockout (operator reset) are deferred to 5B. A 5A replica with a conflicting binding enters `RECOVERY_REQUIRED`
+  and stays there until an operator (5B) performs a recovery procedure.
 
 ## Membership
 
@@ -14,7 +55,11 @@ leader. This is a design spec; no wire protocol has been implemented.
 - For the initial StatefulSet design, expected ordinal members can be derived from the configured replica count. Later
   scaling and peer IDs need careful reconciliation.
 
-## Lifecycle
+## Lifecycle (Milestone 5A — implemented 2026-11-21)
+
+The `internal/lifecycle` package implements the state machine defined below. It is **opt-in** via
+`GOSSIPGRID_LIFECYCLE_ENABLED=true` (requires `GOSSIPGRID_PEER_TLS_ENABLED=true`). When disabled (the default), all
+existing Milestone 4 behavior is preserved.
 
 ```mermaid
 stateDiagram-v2
@@ -22,8 +67,9 @@ stateDiagram-v2
   STARTING --> DISCOVERING: SQLite + credentials initialized
   DISCOVERING --> SYNCING: eligible peer found
   DISCOVERING --> GENESIS: authorized initial cluster creation
+  DISCOVERING --> READY: metadata available; no local binding; cluster initialized
   DISCOVERING --> RECOVERY_REQUIRED: known cluster, no safe sync source
-  GENESIS --> READY: empty epoch established
+  GENESIS --> READY: authorized epoch established (operator action, 5B)
   SYNCING --> READY: snapshot ingested + initial catch-up
   SYNCING --> DISCOVERING: source unavailable
   RECOVERY_REQUIRED --> DISCOVERING: peer recovers / epoch changes
@@ -31,12 +77,146 @@ stateDiagram-v2
   DEGRADED --> READY: reconciliation recovers
 ```
 
+**Transition table** (all other transitions are rejected with `ErrInvalidTransition`):
+
+| From | Permitted to |
+| --- | --- |
+| `STARTING` | `DISCOVERING`, `RECOVERY_REQUIRED` |
+| `DISCOVERING` | `GENESIS`, `SYNCING`, `RECOVERY_REQUIRED`, `READY` |
+| `GENESIS` | `READY`, `RECOVERY_REQUIRED` |
+| `SYNCING` | `DISCOVERING`, `READY`, `RECOVERY_REQUIRED` |
+| `READY` | `DEGRADED`, `RECOVERY_REQUIRED` |
+| `DEGRADED` | `READY`, `RECOVERY_REQUIRED` |
+| `RECOVERY_REQUIRED` | `DISCOVERING` |
+
+**State semantics:**
+
+- `STARTING`: local SQLite, configuration, and credentials are initializing. Not ready.
+- `DISCOVERING`: local dependencies are available, but the replica has not established authorization to participate
+  in a valid cluster epoch. Not ready.
+- `GENESIS`: explicitly authorized first initialization. Entered only by an explicit controller method, never
+  inferred from missing peers or empty data. Not ready.
+- `SYNCING`: the replica has an authorized epoch and is obtaining an initial data baseline. Not an authoritative
+  bootstrap source. Not ready.
+- `READY`: the replica has established its permitted epoch and completed the required initialization criteria. May
+  accept normal requests and supply synchronization data.
+- `DEGRADED`: previously became `READY` and retains valid local authority but is experiencing a peer or convergence
+  failure. May remain ready when the problem is only peer availability.
+- `RECOVERY_REQUIRED`: the replica cannot safely establish or continue participation (epoch mismatch, uncertain
+  metadata, incompatible local database binding). Data is preserved; not ready.
+
 `DEGRADED` is a ready operational status for surviving local functionality unless local store or TLS fails. Do not
 equate it with a globally consistent membership snapshot.
 
 `SYNCING` replicas may advertise state and accept sync-related control requests, but **must not act as a bootstrap
 data source** for other unsynced pods. They do not enter the user-facing Service until ready. The public diagnostics
 path can remain accessible via port-forward during bootstrap failures.
+
+**Concurrency guarantees:**
+
+- The state machine uses `RWMutex`: `State()` and `Snapshot()` take a read lock; `transition` takes a write lock.
+- Concurrent `Snapshot()` calls never observe an inconsistent state.
+- Concurrent transitions are serialized; invalid transitions return an error (never silently dropped).
+- The transition log is bounded (64 entries, newest first) and independently locked.
+- The Controller does NOT hold a lock across network operations; it publishes immutable snapshots atomically.
+
+**Admission gating (fail-closed):**
+
+When lifecycle protection is enabled, an `Admission` guard is checked at every replication protocol boundary. The
+guard reads the controller's **single, internally consistent `AuthorizationSnapshot`** (one read lock) and applies
+the full fail-closed policy: ready state + a **fresh** (not stale), valid authoritative observation + a matching
+durable database binding + no recovery lockout + not stopped. A state, metadata, or binding change cannot
+interleave between reading the state and reading the metadata or binding.
+
+- **Public writes** (`POST /api/messages`): rejected with 503 when the authorization snapshot is not authorized.
+  No message is inserted.
+- **Public reads** (`GET /api/messages`, `GET /api/messages/{id}`): rejected with 503 ("message database
+  quarantined") when the authorization snapshot is not authorized. The local records are **preserved** (never
+  deleted) but are not exposed as ordinary current-epoch API data.
+- **Inbound replication** (`POST /internal/messages`, sync endpoints): rejected with 503 (unready) or 409 (epoch
+  mismatch). A 409 response includes the peer's epoch in the response; the receiving client classifies epoch
+  mismatch as a **permanent** error (no retry).
+- **Outbound replication** (gossip engine, anti-entropy engine): the admission check is read **before every network
+  send** (not only at enqueue) and **before every insert**. A work item admitted while authorized may be delivered
+  (it was authorized when the check passed); a revoked node blocks all new work. No endless retries: a 409
+  epoch mismatch or a `PeerBlockedError` is classified as a permanent error (the peer is marked permanently
+  rejected and no further attempts are made).
+
+**Readiness and peer status reflect the same decision.** `GET /readyz` and the peer `/internal/status` handler
+both read the controller's `Authorization()` snapshot and use `snapshot.Authorized()` — the same decision the
+admission guard uses. They cannot diverge.
+
+**Epoch fencing protocol:**
+
+Each peer's status response and sync endpoints carry epoch context via HTTP headers. The **request** carries the
+caller's accepted epoch context; the **response** carries the peer's self-reported authorization context (the
+response envelope).
+
+| Header (request) | Value |
+| --- | --- |
+| `X-GossipGrid-Cluster-ID` | The cluster ID from the caller's authoritative metadata |
+| `X-GossipGrid-Epoch-ID` | The epoch ID from the caller's authoritative metadata |
+
+| Header (response envelope) | Value |
+| --- | --- |
+| `X-GossipGrid-Resp-Cluster-ID` | The peer's authorized ClusterID (from its authorization snapshot) |
+| `X-GossipGrid-Resp-Epoch-ID` | The peer's authorized EpochID |
+| `X-GossipGrid-Lifecycle-Active` | `"true"` when the peer has lifecycle protection enabled (a legacy peer never sets this) |
+
+- Headers are bounded to 64 bytes each; duplicate or oversized headers are rejected.
+- A receiving replica compares the caller's epoch against its own local database binding. A mismatch returns 409
+  and the data is not merged.
+- mTLS remains the sole basis for peer identity. Epoch headers are **not** proof of identity; they are fencing
+  metadata that prevent cross-epoch data transfer.
+- A replica with no local binding cannot validate an epoch; it fails closed.
+- **Response-envelope validation (mixed-mode fencing).** A lifecycle-enabled **client** requires the peer's
+  response to carry `X-GossipGrid-Lifecycle-Active: true` and a cluster/epoch matching the client's request
+  context. A **legacy** peer (lifecycle disabled) that returns a successful response without the envelope is
+  rejected as a synchronization source: a valid mTLS certificate is necessary but not sufficient. This prevents a
+  lifecycle-enabled replica from ingesting data from a peer that does not run the epoch-fencing protocol. When
+  both peers have lifecycle disabled (legacy-legacy), the envelope is not required and the exchange proceeds as
+  before (legacy behavior preserved).
+- **Outbound epoch context.** The peer client's outbound epoch is sourced from the controller's **current**
+  authorization decision (via the `EpochProvider`), not a one-time startup copy. When the controller is not
+  authorized (lockout, no fresh observation, or stopped), the client blocks the outbound request with a
+  `PeerBlockedError` rather than using a stale or missing epoch.
+
+**Durable local binding:**
+
+The `local_metadata` SQLite table stores a singleton row (ID=1) binding the database to a cluster ID, epoch ID, and
+generation. Binding is:
+
+- **Atomic:** `INSERT ... ON CONFLICT DO NOTHING` — only one row can exist.
+- **Idempotent:** rebinding to the same values is a no-op.
+- **Exclusivity:** rebinding to different values fails with `ErrBindingMismatch`; a nonempty database without a
+  binding fails with `ErrBindingNonempty`.
+- **Backward-compatible:** legacy databases (no binding row) simply have no binding; `GetBinding` returns nil.
+
+**Metadata authority:**
+
+The `MetadataSource` interface provides a narrow, read-only view of authoritative cluster metadata:
+
+```go
+type MetadataSource interface {
+    Read(ctx context.Context) (ClusterMetadata, error)
+}
+```
+
+`ClusterMetadata` fields: `ClusterID`, `EpochID`, `Generation`, `Initialized`, `EverAcceptedMessages`, `Revision`.
+
+In Milestone 5A, the production path uses `NewFakeMetadataSourceUnavailable()` — a no-op source that always returns
+`ErrMetadataUnavailable`. The controller correctly fails closed (stays in `DISCOVERING` or transitions to
+`RECOVERY_REQUIRED`) without inventing an epoch. The Kubernetes ConfigMap-backed provider is reserved for Milestone
+5B.
+
+**Readiness semantics:**
+
+- `GET /readyz`: returns 200 only when the controller's authorization snapshot is **authorized** (ready state +
+  fresh, valid, matching observation + matching binding + no lockout + not stopped); all other cases return 503
+  with a structured JSON body (`{"service":"gossipgrid","ready":false,"state":"STARTING","reason":"..."}`). The
+  readiness check uses the **same** `AuthorizationSnapshot` the admission guard uses, so they cannot diverge.
+- `GET /healthz`: always 200 when the process is alive, regardless of lifecycle state.
+- When lifecycle is disabled (default), `GET /readyz` always returns 200 (existing behavior preserved).
 
 ## First installation (genesis)
 
@@ -80,10 +260,16 @@ Key properties:
   conflicting content returns 409 without altering the original row.
 - **Opt-in.** Default is `false`. When disabled, the endpoint is not registered (404/405). Enabling it requires
   `GOSSIPGRID_PEER_TLS_ENABLED=true`; otherwise configuration validation fails.
-- **No automatic replication.** This milestone does NOT implement automatic gossip fanout, bounded queues, retry
-  scheduling, anti-entropy, or readiness gating. `POST /api/messages` does not automatically replicate.
-- **No epoch management.** Cluster genesis, epoch management, and recovery lockout are reserved for Milestone 5. This
-  milestone is a provisional direct-exchange capability, not a complete safe cluster bootstrap protocol.
+- **4A scope.** At the time of Milestone 4A, automatic gossip fanout, bounded queues, retry scheduling, anti-entropy,
+  and readiness gating were not yet implemented. `POST /api/messages` did not automatically replicate in 4A.
+  Milestone 4B (2026-11-20) subsequently implemented automatic epidemic gossip fanout; when
+  `GOSSIPGRID_GOSSIP_ENABLED=true` (opt-in), successful local writes **do** initiate automatic propagation.
+  Milestone 4C (2026-11-20) added periodic anti-entropy reconciliation. Milestone 5A (2026-11-21) added readiness
+  gating and epoch fencing. All three are opt-in and build on this endpoint.
+- **No epoch management in 4A.** Cluster genesis and recovery lockout were reserved for Milestones 5A/5B.
+  Milestone 5A (2026-11-21) implemented epoch fencing: when lifecycle protection is enabled, the message exchange
+  endpoint checks the peer's epoch context against the local binding and rejects mismatches with 409.
+  Automatic genesis is still deferred to 5B.
 
 ## Epidemic gossip (Milestone 4B — implemented 2026-11-20)
 
@@ -178,13 +364,15 @@ information moves in both directions without a separate push-based implementatio
 - **Cursor progression.** Per-peer in-memory cursors resume across cycles. When a full sweep completes
   (`has_more=false`), the cursor resets to the beginning so later-inserted lower-sorting IDs are eventually
   found. In-memory cursors reset on process restart; correctness does not depend on their persistence.
-- **Bounded resources.** Page size (default 128, max 1024), fetch batch size (default 12, max 12),
+- **Bounded resources.** Page size (default 128, max 1024), fetch batch size (default 8, max 8),
   max pages per peer per cycle (default 4, max 64), worker count (default 2, max 16), request timeout
   (default 5s, max 60s). No unbounded goroutines, timers, or memory allocations.
 - **Conflict handling.** A fetched message whose ID exists locally with different immutable fields is never
-  overwritten. The conflict is recorded via a counter and structured warning; the engine continues processing
-  other IDs in the same page. An ID-only inventory cannot detect different contents for an ID that already
-  exists on both nodes (no content digests in this milestone).
+  overwritten. The conflict fails the affected page: the cursor is NOT advanced past the conflicting page,
+  and the pass is NOT reported as completed. Already-committed unrelated records in the same batch are
+  preserved (no rollback). The failed page is retried on a future cycle (cursor unchanged). An ID-only
+  inventory cannot detect different contents for an ID that already exists on both nodes (no content
+  digests in this milestone).
 - **Independence.** Anti-entropy operates independently from the gossip queue and retry scheduler. It can
   repair data even when epidemic gossip is disabled. A duplicate anti-entropy insert does NOT trigger a new
   gossip propagation event (the callback is only invoked for the message-exchange endpoint, not the sync
@@ -195,7 +383,7 @@ information moves in both directions without a separate push-based implementatio
   - GOSSIPGRID_ANTI_ENTROPY_ENABLED (default false)
   - GOSSIPGRID_ANTI_ENTROPY_INTERVAL (default 30s, range 1s–10m)
   - GOSSIPGRID_ANTI_ENTROPY_PAGE_SIZE (default 128, range 1–1024)
-  - GOSSIPGRID_ANTI_ENTROPY_FETCH_BATCH_SIZE (default 12, range 1–12, ≤ page size)
+  - GOSSIPGRID_ANTI_ENTROPY_FETCH_BATCH_SIZE (default 8, range 1–8, ≤ page size)
   - GOSSIPGRID_ANTI_ENTROPY_MAX_PAGES_PER_PEER (default 4, range 1–64)
   - GOSSIPGRID_ANTI_ENTROPY_WORKERS (default 2, range 1–16)
   - GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT (default 5s, range 1ms–60s)
@@ -205,21 +393,34 @@ information moves in both directions without a separate push-based implementatio
     ascending order, `next_cursor`, and `has_more`.
   - `POST /internal/sync/messages` — accepts `{"ids":[...]}` (bounded count, canonical UUIDv7, no duplicates)
     and returns complete message records in ascending ID order. Missing IDs return 404 (no silent partial results).
-- **Response limits.** Sync requests use a 256 KiB response limit (vs. 8 KiB for status/single-message);
-  oversized responses are rejected explicitly. The per-record wire-size bound is 20480 bytes (a 4096-byte
-  message body that escapes 5× in JSON, plus origin, ID, and timestamp overhead). The origin field is
-  bounded to 253 bytes (the DNS name cap). The fetch batch limit of 12 ensures that 12 records at the
-  per-record bound (12 × 20480 = 245,760 bytes) stay within the 256 KiB response limit. Both the client
-  and the server enforce these bounds: the client rejects oversized individual records and the server
-  rejects oversized responses before writing.
+- **Response limits.** Sync requests use a 256 KiB (262,144 bytes) response limit (vs. 8 KiB for
+  status/single-message); oversized responses are rejected explicitly. The **validated field bounds** that
+  establish the limit are: a message body of at most 4,096 stored bytes, which can escape up to 6× in JSON
+  when every byte becomes a 6-byte `\uXXXX` sequence (e.g. `<` → `\u003c`) for a worst-case encoded body of
+  24,576 bytes; an `origin` field bounded to 253 bytes (the DNS name cap); a 36-byte canonical UUIDv7 `id`;
+  and an RFC3339 `created_at` timestamp. These bounds are enforced at store insert, at client fetch
+  validation, and at the server (413/404/500 above the bound), so an authenticated client cannot request an
+  unbounded response. The per-record wire-size **allowance** is 32,768 bytes, sized with headroom above the
+  worst-case body plus the `origin`/`id`/`timestamp` overhead.
+  - The fetch batch limit of 8 keeps a batch of 8 records at the per-record allowance within the response
+    limit (8 × 32,768 = 262,144 = 256 KiB); 9 records (294,912) would exceed it. This is a conservative
+    sizing of the validated field bounds, **not** a proof that the final encoded envelope always fits:
+    `8 × 32,768` counts only the per-record allowance and omits the JSON envelope overhead (the enclosing
+    object, the `message`/`records` array, and per-field name/quote/comma tokens). The actual final encoded
+    response is bounded to 256 KiB by the server, which marshals the full response and rejects it explicitly
+    (500) if it exceeds the limit; the client likewise rejects oversized individual records. The
+    conservative per-record headroom (32,768 vs. the ~25,000-byte worst-case record) provides the margin that
+    keeps a fully-populated 8-record response within the limit.
 - **Five-node integration test.** Five independent replicas with separate SQLite DBs, distinct workload
   certificates, real mTLS, static discovery, and the production peer client. Scenarios: repair gossip misses
   (node down → recovery), replica replacement (convergence on identical message sets), concurrent writers,
   pagination stress (cursor advances across multiple cycles), recovery and isolation (disconnect → verify
   responsiveness → reconnect → repair). All nodes shut down cleanly; repeated Stop is safe.
 - **Limitations.** ID-only inventory cannot detect same-ID content divergence. No Merkle trees or content
-  digests in this milestone. A previously authorized replica carrying old-epoch data could reintroduce it
-  until Milestone 5 is implemented. In-memory cursors reset on process restart.
+  digests in this milestone. In-memory cursors reset on process restart. A previously authorized replica
+  carrying old-epoch data is prevented from reintroducing it by the Milestone 5A epoch fencing: when
+  lifecycle protection is enabled, the anti-entropy engine checks admission before network operations and
+  classifies epoch mismatch (409) as a permanent error (no retry).
 
 ## Proposed API behavior (not final wire contract)
 
