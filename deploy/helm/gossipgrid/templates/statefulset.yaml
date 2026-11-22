@@ -364,7 +364,7 @@ spec:
               # The Vault-backed Issuer (or ClusterIssuer) that signs the
               # per-pod peer mTLS certificates. This is a cluster-wide
               # prerequisite owned by the cluster operations track.
-              csi.cert-manager.io/issuer-name: {{ .Values.peerTLS.certManagerIssuerName }}
+              csi.cert-manager.io/issuer-name: {{ .Values.peerTLS.certManagerClusterIssuerName | default .Values.peerTLS.certManagerIssuerName }}
               csi.cert-manager.io/issuer-kind: {{ if .Values.peerTLS.certManagerClusterIssuerName }}ClusterIssuer{{ else }}Issuer{{ end }}
               # The per-pod DNS SAN: the pod's StatefulSet DNS name.
               # ${POD_NAME} and ${POD_NAMESPACE} are substituted by the CSI
