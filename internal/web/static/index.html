@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GossipGrid</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="container">
+    <header class="app-header">
+      <h1>GossipGrid</h1>
+      <div class="status-pill unready" id="status-pill">
+        <span class="dot"></span>
+        <span id="status-text">loading…</span>
+      </div>
+    </header>
+
+    <div class="banner" id="banner"></div>
+
+    <div class="layout">
+      <!-- Left column: messages -->
+      <div>
+        <div class="panel">
+          <h2>Messages</h2>
+          <div class="panel-meta" id="msg-count">Loading…</div>
+          <form id="msg-form" class="form-row">
+            <label for="msg-body">Submit a message</label>
+            <textarea id="msg-body" name="body" rows="3" maxlength="4096" placeholder="Message body (max 4096 bytes)"></textarea>
+            <button type="submit" id="msg-submit">Submit</button>
+          </form>
+          <div class="form-row" style="display:flex; gap:8px;">
+            <button type="button" id="msg-refresh" class="btn-secondary">Refresh</button>
+          </div>
+          <ul class="msg-list" id="msg-list"></ul>
+          <div class="empty" id="msg-empty" hidden>No messages yet.</div>
+        </div>
+      </div>
+
+      <!-- Right column: peers + diagnostics -->
+      <div>
+        <div class="panel">
+          <h2>Peers</h2>
+          <div class="panel-meta" id="peer-meta">Loading…</div>
+          <ul class="peer-list" id="peer-list"></ul>
+          <div class="empty" id="peer-empty" hidden>No peers discovered.</div>
+        </div>
+
+        <div class="panel">
+          <h2>Diagnostics</h2>
+          <table class="diag-table" id="diag-table">
+            <tbody>
+              <tr><th>Node</th><td id="d-node">…</td></tr>
+              <tr><th>Version</th><td id="d-version">…</td></tr>
+              <tr><th>FIPS module</th><td id="d-fips">…</td></tr>
+              <tr><th>FIPS enabled</th><td id="d-fips-enabled">…</td></tr>
+              <tr><th>Lifecycle state</th><td id="d-lifecycle">n/a</td></tr>
+              <tr><th>Lifecycle reason</th><td id="d-lifecycle-reason">n/a</td></tr>
+              <tr><th>Peer mTLS</th><td id="d-peertls">n/a</td></tr>
+              <tr><th>Peer cert fingerprint</th><td id="d-cert-fp">n/a</td></tr>
+              <tr><th>Peer reload count</th><td id="d-reload-count">n/a</td></tr>
+              <tr><th>Credential state</th><td id="d-cred-state">n/a</td></tr>
+              <tr><th>Credential generation</th><td id="d-cred-gen">n/a</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

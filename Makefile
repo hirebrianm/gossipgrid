@@ -178,6 +178,26 @@ security: ## Run gosec security scan (fails on actionable findings)
 # angle-bracket placeholders, so fixes are never applied automatically).
 MD_LINT_CONFIG := .markdownlint.yml
 
+# Architecture diagrams: docs/diagrams/*.mmd are the authoritative Mermaid
+# sources, each rendered to a pair of outputs under docs/diagrams/generated/:
+#   <name>.svg  (scalable, preferred)
+#   <name>.png  (raster convenience)
+# The Mermaid CLI version is pinned so regeneration is reproducible and the
+# generated outputs are stable enough for reasonable version-control diffs. If
+# the pinned version is unavailable, update MERMAID_CLI_VERSION and re-run.
+#
+# Each .mmd file must contain exactly one Mermaid diagram (no markdown
+# front-matter, no multiple diagrams in a file) — mmdc renders a single diagram
+# per input. Companion diagrams (e.g. the lifecycle sequence diagram) are
+# separate .mmd files and are rendered independently.
+MERMAID_CLI_VERSION := 11.4.1
+DIAGRAM_DIR    := docs/diagrams
+DIAGRAM_GEN    := $(DIAGRAM_DIR)/generated
+# The set of rendered diagram bases. system-architecture is the main diagram
+# embedded in the README; the rest are linked from the documentation pages.
+DIAGRAM_BASES  := system-architecture gossip-replication lifecycle-recovery \
+                  lifecycle-recovery-sequence security-credentials gitops-delivery
+
 .PHONY: docs-lint
 docs-lint: ## Lint repository Markdown documents (fails on violations; does not modify files)
 	$(call check_tool,goldmark-lint,go install github.com/mrueg/goldmark-lint/cmd/goldmark-lint@v0.6.3)
@@ -188,8 +208,111 @@ docs-fix-preview: ## Show Markdown fixes --fix would apply (does not modify file
 	$(call check_tool,goldmark-lint,go install github.com/mrueg/goldmark-lint/cmd/goldmark-lint@v0.6.3)
 	goldmark-lint --no-cache --fix-dry-run --config $(MD_LINT_CONFIG) '**/*.md'
 
+# Architecture diagram generation. Uses npx to run a pinned version of
+# @mermaid-js/mermaid-cli (mmdc). The npx package is fetched on first use and
+# cached in the npm cache; no global install is required. A puppeteer config
+# is passed so mmdc can run in a headless environment.
+#
+# The -b option sets the background to white so the PNG is not transparent.
+# The -w option sets the PNG width for a readable raster image.
+#
+# Regenerate all diagrams:   make architecture
+# Regenerate one:            make architecture DIAGRAM=system-architecture
+#
+# Determinism: mmdc output for a given .mmd source and pinned version is stable
+# across runs (same coordinates, same text), so committed SVG/PNG diffs reflect
+# only genuine source changes. Re-run after editing a .mmd to refresh outputs.
+
+.PHONY: architecture
+architecture: ## Render all docs/diagrams/*.mmd to SVG+PNG in docs/diagrams/generated/ (use DIAGRAM=<base> for one)
+	$(call check_tool,npx,install Node.js >= 18 and npm)
+	@mkdir -p $(DIAGRAM_GEN)
+	@targets="$(DIAGRAM_BASES)"; \
+	if [ -n "$(DIAGRAM)" ]; then targets="$(DIAGRAM)"; fi; \
+	config="$(DIAGRAM_DIR)/mermaid-config.json"; \
+	for base in $$targets; do \
+		mmd="$(DIAGRAM_DIR)/$$base.mmd"; \
+		svg="$(DIAGRAM_GEN)/$$base.svg"; \
+		png="$(DIAGRAM_GEN)/$$base.png"; \
+		if [ ! -f "$$mmd" ]; then echo "skip: $$mmd not found"; continue; fi; \
+		echo "Rendering $$mmd (mmdc v$(MERMAID_CLI_VERSION))..."; \
+		cfg=$$(mktemp); \
+		printf '{"args":["--no-sandbox","--disable-setuid-sandbox"]}' > "$$cfg"; \
+		npx --yes @mermaid-js/mermaid-cli@$(MERMAID_CLI_VERSION) -i "$$mmd" -o "$$svg" -c "$$config" -p "$$cfg"; \
+		rc=$$?; rm -f "$$cfg"; \
+		if [ $$rc -ne 0 ]; then echo "SVG generation failed for $$base (rc=$$rc)"; exit $$rc; fi; \
+		cfg=$$(mktemp); \
+		printf '{"args":["--no-sandbox","--disable-setuid-sandbox"]}' > "$$cfg"; \
+		npx --yes @mermaid-js/mermaid-cli@$(MERMAID_CLI_VERSION) -i "$$mmd" -o "$$png" -c "$$config" -b white -w 1600 -p "$$cfg"; \
+		rc=$$?; rm -f "$$cfg"; \
+		if [ $$rc -ne 0 ]; then echo "PNG generation failed for $$base (rc=$$rc)"; exit $$rc; fi; \
+		echo "  -> $$svg"; \
+		echo "  -> $$png"; \
+	done; \
+	echo "Done. Generated files in $(DIAGRAM_GEN)/:"; \
+	ls -1 $(DIAGRAM_GEN)/
+
+# diagrams-check verifies that the native Mermaid blocks embedded in the
+# documentation files match the authoritative .mmd sources. For each diagram
+# base, it extracts the mermaid block (between the marker comment and the
+# closing fence) from the mapped Markdown file and diffs it against the .mmd
+# source. A mismatch means the embedded block was edited independently of the
+# .mmd source — the sync-check fails and the operator must re-embed (copy the
+# .mmd content into the Markdown block) or re-edit the .mmd.
+#
+# The mapping (diagram base -> Markdown file) is documented in the Makefile
+# variable DIAGRAM_DOC_MAP below. Add a new diagram base here and in
+# DIAGRAM_BASES together.
+# The mapping is "base:doc1,doc2,..." — a diagram base may be embedded in
+# multiple documentation files (e.g. system-architecture appears in both the
+# README and docs/architecture.md). Each doc must carry a marker comment
+# "<!-- DIAGRAM:<base> -->" immediately above its ```mermaid block.
+DIAGRAM_DOC_MAP := \
+  system-architecture:README.md,docs/architecture.md \
+  gossip-replication:docs/gossip-and-bootstrap.md \
+  lifecycle-recovery:docs/recovery.md \
+  lifecycle-recovery-sequence:docs/recovery.md \
+  security-credentials:docs/security.md \
+  gitops-delivery:docs/kubernetes-deployment.md
+
+.PHONY: diagrams-check
+diagrams-check: ## LEVEL 1: Verify embedded Mermaid blocks in docs match the .mmd sources AND no malformed note patterns (fails on mismatch)
+	@bash scripts/diagrams_check.sh $(DIAGRAM_DOC_MAP)
+
+# LEVEL 2 (render validation): render every canonical .mmd source using the
+# pinned Mermaid CLI (mmdc) to SVG and PNG in a TEMPORARY directory, and verify
+# the outputs exist and are non-empty. Fail if Mermaid reports a syntax or
+# rendering error, if the generated SVG/PNG is missing, or if the output is
+# empty. The temporary directory is removed on every exit path (a trap in the
+# script), so this target is read-only with respect to the repository: it
+# never regenerates or touches docs/diagrams/generated/. The committed
+# generated outputs are produced only by `make architecture` (level 0, the
+# generation target), which is deliberately NOT part of qa: qa must verify
+# without modifying tracked files. This target is an explicit operator/CI
+# validation step, distinct from the source-sync check (level 1, diagrams-check).
+.PHONY: diagrams-render
+diagrams-render: ## LEVEL 2: Render all .mmd to SVG+PNG in a temp dir and verify outputs are non-empty (read-only, never touches docs/diagrams/generated/)
+	$(call check_tool,npx,install Node.js >= 18 and npm)
+	@bash scripts/diagrams_render.sh $(DIAGRAM_BASES)
+
+# LEVEL 3 (visual review): generate a temporary contact sheet (a grid of all
+# diagram PNGs) for manual visual inspection. The contact sheet is written to
+# a temporary path OUTSIDE version-controlled documentation (the operator
+# inspects it and discards it). It is a convenience for the operator, not a
+# CI gate (the automated checks are levels 1 and 2). The operator is expected
+# to actually look at the rendered diagrams — not merely check file sizes or
+# exit codes. If a visual reviewer is unavailable, this step reports that
+# limitation rather than claiming success.
+.PHONY: diagrams-contact-sheet
+diagrams-contact-sheet: ## LEVEL 3: Generate a temporary contact sheet (grid of all diagram PNGs) for visual review (kept outside VCS)
+	@bash scripts/diagrams_contact_sheet.sh $(DIAGRAM_BASES)
+
+# qa is verification only: it must not modify any tracked file. diagram
+# generation (make architecture) writes the committed SVG/PNG outputs and is
+# therefore not part of qa; render validation is available as the explicit,
+# read-only target diagrams-render (renders into a temporary directory).
 .PHONY: qa
-qa: fmt-check vet lint security docs-lint test test-race test-version-injection ## Verify fmt, vet, lint, security, docs, tests, race, and version regression
+qa: fmt-check vet lint security docs-lint diagrams-check test test-race test-version-injection ## Verify fmt, vet, lint, security, docs, diagrams (source sync+lint), tests, race, and version regression
 
 .PHONY: test-version-injection
 test-version-injection: ## Run the version-detection and command-injection regression tests
@@ -208,5 +331,11 @@ version: ## Show the resolved build version and image reference
 	@echo "image:        $(IMAGE_REF)"
 
 .PHONY: clean
-clean: ## Remove build outputs
+clean: ## Remove build outputs (bin/, plus any stray root-level legacy gossipgrid executable)
 	rm -rf $(BIN_DIR)
+	# Historical build invocations may have emitted the binary at the repository
+	# root (a bare `go build ./cmd/gossipgrid` with no -o). Only remove a regular
+	# file named exactly "gossipgrid" at the root — never a directory, never
+	# recursively, and never a source path (cmd/gossipgrid is untouched). This
+	# is a no-op when no such file exists.
+	@if [ -f "./gossipgrid" ] && [ ! -d "./gossipgrid" ]; then rm -f ./gossipgrid; fi

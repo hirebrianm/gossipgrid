@@ -2,6 +2,9 @@
 bin/
 dist/
 *.out
+# A bare `go build ./cmd/gossipgrid` (no -o) emits the binary at the repository
+# root. `make clean` removes it; keep it out of version control.
+/gossipgrid
 
 # Test/coverage artifacts
 *.test
@@ -10,8 +13,17 @@ coverage.*
 # Local SQLite data (created by smoke tests and local runs)
 data/
 
+# Local credential files (the PBKDF2 verifier + signing key). Never commit these;
+# the in-cluster version is delivered via a mounted Secret (M7A), not VCS.
+*.credential.json
+credential.json
+/credentials/
+
 # goldmark-lint cache (written by `make docs-fix`; `docs-lint` uses --no-cache)
 .goldmark-lint-cache
+
+# Local review/report artifacts (not version-controlled)
+M6_SECURITY_CORRECTIONS_REPORT.md
 
 # Editor/OS noise
 .DS_Store

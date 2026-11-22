@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"gossipgrid/internal/antientropy"
+	"gossipgrid/internal/auth"
 	"gossipgrid/internal/config"
 	"gossipgrid/internal/discovery"
 	"gossipgrid/internal/gossip"
@@ -30,6 +31,7 @@ import (
 	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/server"
 	"gossipgrid/internal/store"
+	"gossipgrid/internal/web"
 )
 
 // Version is the build version injected by the linker (see Makefile/Dockerfile
@@ -50,6 +52,17 @@ func fipsRequired() bool {
 }
 
 func main() {
+	// Milestone 6: the `credential` subcommand is a one-shot provisioning
+	// helper (it does not start the server). It is dispatched before run()
+	// because it has no server dependencies. Any other first argument is
+	// ignored (the server has no subcommands).
+	if len(os.Args) >= 2 && os.Args[1] == "credential" {
+		if err := runCredential(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "credential:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("gossipgrid stopped", "error", err)
 		os.Exit(1)
@@ -286,16 +299,103 @@ func run() (retErr error) {
 		}
 	}
 
-	// Build the public server handler. When lifecycle protection is enabled
-	// (lifeCtrl != nil), use the lifecycle-aware constructor which gates
-	// readiness on the controller's state and rejects public writes while
-	// unready. Otherwise, use the legacy constructor (always ready).
-	var publicHandler http.Handler
-	if lifeCtrl != nil {
-		publicHandler = server.NewWithStoreAndCallbackAndLifecycle(server.Node{ID: cfg.NodeID}, st, onMessage, lifeCtrl)
-	} else {
-		publicHandler = server.NewWithStoreAndCallback(server.Node{ID: cfg.NodeID}, st, onMessage)
+	// Milestone 6: build the browser authentication reloader and the web
+	// handler. Authentication is enabled by default (fail-closed): when
+	// cfg.AuthEnabled is true and the insecure development mode is off, the
+	// reloader is always created. A missing or invalid credential file does
+	// NOT disable authentication — the reloader stays "unavailable" and
+	// authenticated requests return 503 until a valid credential is loaded.
+	// Only the explicitly-named insecure development mode (opt-in, documented
+	// as unsuitable for production/Kubernetes) disables authentication and
+	// preserves the legacy unauthenticated behavior.
+	var authProvider auth.Provider
+	if cfg.AuthEnabled && !cfg.AuthInsecureDevMode {
+		if cfg.AuthCredentialFile == "" {
+			logger.Warn("browser authentication is enabled but no credential file is set; authenticated requests will return 503 (fail-closed) until a valid credential is loaded",
+				slog.String("hint", "set "+config.EnvAuthCredentialFile+" to a mounted credential file, or use "+config.EnvAuthInsecureDevMode+"=true for local development only (insecure, not for production)"),
+			)
+		}
+		reloadInterval, _ := time.ParseDuration(cfg.AuthReloadInterval)
+		maxStale, _ := time.ParseDuration(cfg.AuthMaxStale)
+		// Apply the configured session TTLs to the auth package's defaults.
+		if ttl, err := time.ParseDuration(cfg.AuthSessionTTL); err == nil {
+			auth.SessionTTL = ttl
+		}
+		if idleTTL, err := time.ParseDuration(cfg.AuthSessionIdleTTL); err == nil {
+			auth.SessionIdleTTL = idleTTL
+		}
+		credReloader := auth.NewReloader(cfg.AuthCredentialFile, reloadInterval, maxStale, logger)
+		// Defer the reloader shutdown on every exit path.
+		defer credReloader.Shutdown()
+		if err := credReloader.Start(ctx); err != nil {
+			// A failed initial load does not fail startup (the reloader stays
+			// "unavailable" and the auth endpoint returns 503 until a valid
+			// credential is loaded). Log a warning and continue.
+			logger.Warn("credential reloader initial load failed; authentication will return 503 until a valid credential is loaded",
+				slog.String("path", cfg.AuthCredentialFile),
+				slog.Any("error", err),
+			)
+		}
+		authProvider = auth.NewProvider(credReloader)
 	}
+
+	// Build the web handler. It internally builds the public mux (reusing
+	// server.NewWithStoreAndCallbackAndLifecycle for the message API routes)
+	// and wraps it with authentication and CSRF when authProvider is non-nil.
+	// The peer mTLS listener is independent and unchanged.
+	webCfg := web.Config{
+		Node:         server.Node{ID: cfg.NodeID},
+		Store:        st,
+		OnMessage:    onMessage,
+		Lifecycle:    lifeCtrl,
+		Version:      Version,
+		FIPSModule:   fipsModule,
+		FIPSEnabled:  fipsEnabled,
+		AuthProvider: authProvider,
+		CookieSecure: cfg.AuthCookieSecure,
+	}
+	// Bridge discovery.Snapshot into web.DiscoverySnapshot (avoiding an import
+	// cycle and decoupling the web package from discovery's internal types).
+	webCfg.DiscoverySnapshot = func() web.DiscoverySnapshot {
+		ds := discMgr.Snapshot()
+		peers := make([]web.PeerInfo, 0, len(ds.Peers)+1)
+		for _, p := range ds.Peers {
+			state := "found"
+			peers = append(peers, web.PeerInfo{
+				Hostname: p.Hostname,
+				Identity: p.PodIdentity,
+				State:    state,
+			})
+		}
+		if ds.LocalNode != nil {
+			peers = append(peers, web.PeerInfo{
+				Hostname: ds.LocalNode.Hostname,
+				Identity: ds.LocalNode.PodIdentity,
+				State:    "local",
+			})
+		}
+		n, _ := strconv.Atoi(cfg.ExpectedReplicas)
+		return web.DiscoverySnapshot{
+			Peers:            peers,
+			PeerCount:        len(ds.Peers),
+			ExpectedReplicas: n,
+			Stale:            ds.Stale,
+		}
+	}
+	// Bridge peertls.Diagnostics into web.PeerTLDiagnostics (when peer TLS is
+	// enabled).
+	if peerMgr != nil {
+		webCfg.PeerTLDiagnostics = func() web.PeerTLDiagnostics {
+			d := peerMgr.Diagnostics()
+			return web.PeerTLDiagnostics{
+				CertFingerprint: d.CertFingerprint,
+				ReloadCount:     d.ReloadCount,
+				Enabled:         true,
+			}
+		}
+	}
+
+	publicHandler := web.NewHandler(webCfg)
 	srv := server.NewServer(cfg.HTTPAddr, publicHandler)
 
 	// Start listening in a goroutine so we can watch for OS signals on the

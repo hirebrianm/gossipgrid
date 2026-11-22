@@ -1,7 +1,15 @@
 # Security architecture
 
-This document describes the peer mTLS security architecture (implemented in Milestone 3B) and the broader target
-design for the rest of the system. It is not an assertion of deployed security or formal certification.
+This document describes the peer mTLS security architecture (implemented in Milestone 3B), the lifecycle and
+epoch fencing architecture (implemented in Milestone 5A), and the broader target design for the rest of the
+system (Milestones 5B, 5C, 6, 7A, 7B, 8, and 9). It is not an assertion of deployed security or formal
+certification.
+
+**Status classification:** Peer mTLS (3B), message exchange (4A), gossip (4B), anti-entropy (4C), and
+lifecycle/epoch fencing (5A) are **implemented and locally tested**. The browser authentication and
+credential management design (M6), the Kubernetes metadata provider (5B), and the operator recovery procedure
+(5C) are **designed but not implemented**. No security feature is currently **configured and verified in
+Kubernetes**.
 
 ## Threat model and trust boundaries
 
@@ -225,6 +233,335 @@ integration tests (all run under the FIPS build and the race detector):
   exists. A cached binding that is absent or does not match the accepted metadata fails closed (no
   database read inside the protected commit).
 
+## Web UI authentication and credential management (Milestone 6 — implemented 2026-11-21)
+
+Milestone 6 (implemented 2026-11-21, `v0.1.0-alpha.5` baseline) adds single-administrator password
+authentication for the public message API endpoints and the browser interface. **Authentication is
+enabled by default (fail-closed):** a missing or invalid credential file does **not** silently enable
+anonymous access — the process starts, `GET /healthz` and `GET /readyz` remain 200, and authenticated
+requests return 503 until a valid credential is loaded. The only path that disables authentication is the
+explicitly-named, opt-in `GOSSIPGRID_AUTH_INSECURE_DEV_MODE` (documented as insecure and unsuitable for
+production/Kubernetes). The credential authority is external HashiCorp Vault; GossipGrid never stores the
+**plaintext password** in its own database or in environment variables. The mounted credential file
+intentionally contains the versioned credential record (algorithm, format version, PBKDF2 parameters,
+per-credential salt, password verifier, credential generation, and the common session-signing key) — see
+the correction below and the
+[security-credentials](diagrams/generated/security-credentials.svg)
+([PNG](diagrams/generated/security-credentials.png)) diagram, which shows the browser-auth path and the
+eventual (not instantaneous) credential-rotation flow.
+
+The full credential-rotation and browser-authentication sequence is shown below (the authoritative
+`security-credentials.mmd` source embedded natively). External Vault appears as a distinct participant,
+separate from cert-manager (peer PKI), the Vault Secrets Operator, and the mounted Kubernetes Secret — the
+trust boundaries are preserved.
+
+<!-- DIAGRAM:security-credentials -->
+```mermaid
+sequenceDiagram
+  participant ADMIN as Operator
+  participant VKV as Vault KV v2 (gossipgrid/admin)
+  participant VSO as Vault Secrets Operator
+  participant SEC as K8s Secret (full volume, never subPath)
+  participant P0 as Replica gossipgrid-0
+  participant PX as Replica gossipgrid-x
+  participant BROWSER as Browser user
+
+  Note over VKV: versioned credential file: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key
+  BROWSER->>P0: POST /login (password)
+  P0->>P0: read credential file, PBKDF2-HMAC-SHA-256 verify (constant-time)
+  P0-->>BROWSER: signed session cookie (identifier, expiry, generation)
+  Note over P0: HttpOnly, Secure, SameSite=Strict. No password or verifier in the cookie
+  BROWSER->>PX: GET /api/messages (load-balanced to a different replica)
+  PX->>PX: verify cookie signature with the common signing key
+  PX-->>BROWSER: 200 (single login valid across all replicas, no server-side store)
+
+  ADMIN->>VKV: rotate password (new salt, new verifier, new generation, new key)
+  VKV->>VSO: secret changed
+  VSO->>SEC: atomically update the Kubernetes Secret
+  SEC-->>P0: kubelet swaps the mounted credential file (atomic)
+  P0->>P0: poll detects change, validate, publish new immutable snapshot
+  Note over P0: propagation across replicas is eventual (each loads on its own poll cycle), but there is no overlap window
+  SEC-->>PX: PX loads the new credential on a later poll
+  P0->>P0: old-generation sessions fail verification (no overlap window — generation binding)
+  BROWSER->>PX: request with an old-generation session cookie
+  PX-->>BROWSER: 401 (previously issued session rejected once this replica loaded the new generation)
+  Note over PX: no pod or process restart. No overlap window. Eventual propagation across replicas
+  Note over P0: Peer security is independent: per-pod mTLS 1.3 via cert-manager CSI, separate trust domain
+```
+
+### Credential flow
+
+```text
+Vault KV v2 (secret path: gossipgrid/admin)
+    |
+    |  Vault Secrets Operator (VSO) watches and synchronizes
+    v
+Kubernetes Secret (gossipgrid-auth)
+    |
+    |  mounted read-only into GossipGrid pods (a full Secret volume, never subPath)
+    v
+GossipGrid credential file (poll-based reload, same mechanism as peer mTLS)
+```
+
+- **Vault KV v2** is the credential authority. The secret path holds the admin password material: a
+  **versioned credential file** that intentionally contains, at minimum, the algorithm and format version,
+  the PBKDF2 parameters (iteration count), the per-credential salt, the **password verifier**, the credential
+  generation, and the **common session-signing key**. Only the **plaintext password** is never stored; the
+  verifier and signing key are deliberately kept in the credential file (see the
+  [security-credentials](diagrams/generated/security-credentials.svg) diagram).
+- **Vault Secrets Operator (VSO)** synchronizes the Vault secret to a Kubernetes Secret. VSO is a
+  cluster-wide component (owned by the cluster operations track, not by GossipGrid).
+- **The Kubernetes Secret** is mounted **read-only** into GossipGrid pods as a full Secret volume (e.g.
+  `/credentials/admin`). The credential file is one file in that volume; the volume is never mounted via
+  `subPath` (see the credential-reload section for why a full volume is required for rotation). The file
+  contains the credential material in a defined versioned format.
+- **Credentials are never delivered through environment variables.** The file is the sole source of
+  credential material. This prevents the password from appearing in process listings, crash dumps, or
+  Kubernetes API logs.
+
+**Credential file format (version 1).** The file is a single JSON document with no unknown fields
+allowed, all binary values hex-encoded:
+
+```json
+{
+  "format_version": 1,
+  "algorithm": "PBKDF2-HMAC-SHA-256",
+  "iterations": 200000,
+  "salt": "64 hex chars (32 bytes, per-credential random)",
+  "verifier": "64 hex chars (32 bytes, PBKDF2-HMAC-SHA-256 output)",
+  "generation": 1,
+  "signing_key": "64 hex chars (32 bytes, common session-signing key)"
+}
+```
+
+The `generation` counter increments on every rotation; the `signing_key` is the shared HMAC-SHA256
+key every replica uses to verify session cookies. The plaintext password is never present in this file.
+
+### Password verification scheme (implemented)
+
+- **Hashing algorithm:** PBKDF2-HMAC-SHA-256 (RFC 2898), via Go's `crypto/pbkdf2` over `crypto/hmac` and
+  `crypto/sha256`. The password is never stored in plaintext; only the per-credential salt and the PBKDF2
+  verifier are stored in the credential file.
+- **Iteration count:** A single fixed (not per-user) iteration count, recorded in the credential file. The
+  default is **200,000** iterations; the maximum accepted is **1,000,000**. The value is a parameter of the
+  credential record — changing the count is a rotation of the credential.
+- **Salt:** A randomly generated per-credential salt (32 bytes) is stored alongside the verifier. The salt is
+  not secret; it ensures two identical passwords produce different verifiers.
+- **Verification:** On authentication, GossipGrid reads the salt and verifier from the credential file,
+  computes the PBKDF2-HMAC-SHA-256 key for the submitted password with the stored iteration count, and performs
+  a **constant-time comparison** against the stored verifier. A mismatch returns 401; a missing or
+  unavailable credential returns 503 (see the failure-semantics section below).
+- **Credential file format (versioned):** The file is a small versioned structure recording, at minimum:
+  the algorithm (`PBKDF2-HMAC-SHA-256`), the format version, the iteration count, the per-credential salt,
+  the verifier, the credential **generation** (a counter that increments on every rotation), and the common
+  session-signing key (see the session section). The generation is what sessions are bound to, so a rotation
+  changes the generation and invalidates previously issued sessions.
+- **FIPS compatibility:** PBKDF2-HMAC-SHA-256 is implemented using `crypto/pbkdf2` (FIPS 140-3 approved) over
+  `crypto/hmac` and `crypto/sha256`, and the salt and signing key are generated with `crypto/rand` — all
+  FIPS-approved primitives available in Go's FIPS module. The unit tests for the verifier load/compare and
+  session sign/verify run under the existing `GOFIPS140` build profile (the default `FIPS_MODULE=v1.0.0`
+  used by `make test`/`make test-race`) and pass. **No whole-application FIPS certification is claimed**;
+  only the FIPS-enabled Go module and the use of FIPS-approved primitives are documented.
+
+### Credential reload, failure, and consistency semantics
+
+**Reload mechanism.** The application polls the credential file at a configurable interval (the same
+poll-based mechanism used for peer mTLS certificate reload, default 2s). A Kubernetes Secret mounted as a
+full Secret volume is updated atomically by the kubelet (the new file version is swapped in as a whole),
+so a read at any point observes either the complete old or the complete new version — never a partial
+write. A **successful** reload reads the complete file, validates it, and publishes an **immutable
+credential snapshot atomically** (the same pattern as the peer TLS credential snapshot). A **failed or
+malformed** read does not touch the published snapshot: the previous valid snapshot remains in place.
+`subPath` mounts are deliberately **not** used, because `subPath` does not honor projected-Secret
+rotation updates and would pin the pod to the initial file version.
+
+**Startup behavior (fail-closed default).** On process start, authentication is **on** (the default). If
+the credential file is **absent or invalid**, the authentication endpoint is **unavailable (503)** until a
+valid credential is loaded; the process does not crash and does not fall back to accepting unauthenticated
+requests. `GET /healthz` and `GET /readyz` remain 200. Because a valid credential is required before any
+authenticated request can be served, there is no window in which an unauthenticated request is accepted.
+A missing credential file therefore never exposes the application to anonymous access — it degrades to
+503 (unavailable) rather than to 200 (unauthenticated). The operator sees a startup warning naming the
+missing credential and the hint to set `GOSSIPGRID_AUTH_CREDENTIAL_FILE` (or, for local development only,
+`GOSSIPGRID_AUTH_INSECURE_DEV_MODE=true`).
+
+**Distinguishing availability from validity.** The credential has two independent concerns:
+*availability* (a readable, well-formed file exists) and *validity* (the file is parseable and
+internally consistent). A **malformed** file is treated as *unavailable*, not as a "valid credential
+that fails": it is never used to answer an authentication decision, and it is never accepted as a reason
+to reject a correct password as "wrong." The two are reported distinctly in diagnostics (loaded /
+reload-failed) and in the response code: 503 means the credential is unavailable or failed to load;
+401 means the credential is available and a password or session check failed.
+
+**Transient projected-volume updates.** When the kubelet is mid-update of the mounted Secret, a poll may
+observe the old version (or, briefly, the path momentarily during the atomic swap). The application
+treats this as "no change yet" and retries on the next poll; it never interprets a transient read as a
+new credential and never clears the published snapshot. Because Secret propagation is atomic per-file,
+there is no torn-read of a valid credential.
+
+**A subsequent malformed credential version (bounded failure policy).** If a later rotation delivers a
+file that fails validation, the application **keeps the last valid snapshot in effect** (the same
+preservation rule as peer mTLS) and **fails closed for the duration of the bad version**: it does not
+crash, does not revert to an unauthenticated mode, and does not accept the malformed version. However,
+accepting a stale snapshot is **bounded, not indefinite**: the reloader tracks how long it has been
+serving the last valid snapshot, and after a configurable bound (a maximum stale-credential time,
+default **5 minutes**, configurable via `GOSSIPGRID_AUTH_MAX_STALE`) the authentication endpoint
+degrades to 503 for new sessions, signalling an operator that the credential is stuck in a bad state.
+This prevents the "last valid snapshot" rule from masking a permanently broken credential indefinitely.
+
+**Session invalidation on credential generation change.** Because sessions are bound to the credential
+**generation**, a rotation (a new generation in the credential file) changes the generation the published
+snapshot carries. Previously issued session cookies were signed under the previous generation, so they
+fail verification once a replica has loaded the new snapshot and are rejected **immediately** (there is no
+overlap window that keeps old-generation sessions valid) — effectively logging out all active browser
+sessions on every replica that has loaded the new generation. A password rotation (a new hash + salt +
+new generation) is synchronized by VSO to the Kubernetes Secret, which atomically updates the mounted
+file. GossipGrid polls, detects the change, and atomically swaps the credential. The old password is no
+longer accepted and previously issued sessions are invalidated by the generation change.
+
+**Rotation consistency model (asynchronous, eventual — not instantaneous).** VSO and the Kubernetes
+Secret propagation are **asynchronous**: a rotation reaches the five mounted volumes one pod at a time
+over a rotation window (on the order of the poll interval plus Secret propagation delay). During that
+window some replicas run the **new** credential generation and some still run the **old** one:
+
+- **New logins** can succeed against the new credential on replicas that have loaded it, and against the
+  old credential on replicas that have not yet loaded it. A rotation is therefore **not** instantaneous
+  or global; no replica can promise that the old password is rejected everywhere the moment the Vault
+  secret changes.
+- **Existing sessions:** a session issued under the old generation remains valid on a replica that still
+  runs the old generation, and is **rejected immediately** on a replica that has loaded the new generation
+  (no overlap window). Because the web Service load-balances across replicas, a given browser request may
+  be accepted or rejected depending on which replica serves it, until all replicas have converged on the
+  new generation. This is the documented eventual-consistency limitation: revocation is per-replica and
+  becomes global only once all replicas have loaded the new generation.
+- **The common signing key** (below) is rotated **together with the credential** so that all replicas
+  verify the same generation; a replica that has not yet loaded the new key simply continues to verify
+  the old generation, which is the intended eventual-consistency behavior.
+- **The rotation window is a measured quantity, not an assumption.** The expected consistency model is
+  **eventual**: all replicas converge on the new credential within a bounded rotation window. That
+  window (propagation + poll + reload) must be **measured in staging** (Milestone 7A live-rotation test)
+  and reported, rather than assumed. The design does not promise instantaneous global revocation.
+
+**Temporary Secret-propagation differences across replicas.** If one replica's Secret volume lags
+another's, the lagging replica temporarily runs the previous credential generation and the leading
+replica runs the new one. This is the same asynchronous rotation window described above: it is
+benign, self-healing, and bounded by the rotation window. It does not cause a crash, an unauthenticated
+fallback, or a lost-credential state; it only produces a transient period in which old and new
+generations coexist across replicas, during which a browser may observe a mix of accepted and rejected
+requests depending on the serving replica.
+
+### Session handling (short-lived, signed session cookies; stateless across replicas)
+
+A **per-process server-side session store does not work reliably behind a load-balanced Kubernetes
+Service**: a browser request is round-robin dispatched across the five replicas, so a session token
+issued by one replica cannot be looked up by another. The design therefore uses **short-lived,
+authenticated session cookies that any replica can verify independently**, with no server-side session
+replication, no Redis, no central session database, and no sticky sessions.
+
+- **Session token format.** The cookie carries a compact, **signed** session value (not a self-contained
+  encrypted JWT, and not a lookup key into a per-replica store). It binds, at minimum: a session
+  identifier (an opaque random value), an issued-at and an expiry time, and the credential **generation**
+  under which it was issued. The value is **signed** with the common session-signing key, so a replica
+  can verify authenticity and integrity without contacting the replica that issued it. The signed format
+  is a compact **HMAC-SHA256 signed envelope** (`base64url(payload) . base64url(hmac)`), verified with a
+  constant-time comparison.
+- **No per-replica session store.** Verification is purely cryptographic: any replica holding the
+  current (or, during a rotation window, the previous) signing key can verify a cookie. This is what
+  makes authentication predictable across all five replicas without server-side session replication.
+- **What is never placed in the cookie.** The password and the password verifier (the PBKDF2 output) are
+  **never** placed in the cookie, and the signing key is never exposed to the client. The cookie
+  carries only session material (identifier, expiry, generation) and its signature.
+- **Bound to the credential generation.** A cookie records the generation it was issued under. A replica
+  verifies that the generation in the cookie matches the generation of its currently loaded credential
+  **only** (there is no overlap window that accepts a previous generation). A credential **rotation
+  changes the generation**, so previously issued cookies fail verification **immediately** on replicas
+  that have loaded the new generation — this is how rotation invalidates prior sessions, with no store to
+  clear. The signing-key rotation (a new key at the same generation) is a distinct concept: it changes
+  the verification mechanism, not the revocation policy.
+- **Session lifetime.** Short (default **2 hours** absolute, with a **30-minute** idle timeout — both
+  configurable via `GOSSIPGRID_AUTH_SESSION_TTL` and `GOSSIPGRID_AUTH_SESSION_IDLE_TTL`). Short-lived
+  expiry limits the value of a stolen cookie. There is no overlap window that extends an old-generation
+  session's validity.
+- **Cookie flags.** `HttpOnly`, `Secure` (HTTPS-only, never sent over plaintext HTTP), `SameSite=Strict`.
+  The session cookie is never accessible to JavaScript.
+- **CSRF protection (session-bound).** The CSRF token is **cryptographically bound to the
+  authenticated session**: it is `HMAC-SHA256(signing key, SID)`, where `SID` is the session identifier
+  embedded in the session cookie. The token is set as a (non-HttpOnly) cookie and is also required in a
+  custom header (`X-CSRF-Token`) on state-changing requests; the server validates that the header token
+  matches the cookie token **and** that both equal the expected HMAC of the session's SID. This is
+  stronger than a plain double-submit token: a token from one session (a different SID) does not
+  validate on another session, a tampered token fails the constant-time comparison, and a
+  reflected-header-only attack is rejected. It is stateless (no server-side session store) and
+  cross-replica (any replica with the shared signing key can derive the same token from the cookie's
+  SID). **Login CSRF and session fixation:** the login form is served unauthenticated (no CSRF
+  token required to *submit* a login — the login itself is the authentication step, and a
+  forged login cannot mint a valid session without the password); after a successful login the
+  session and CSRF token are re-issued with a fresh SID, so a pre-attacked cookie is replaced
+  (session fixation is prevented by re-issuance on login).
+- **Key rotation (the common session-signing key).** The signing key is part of the credential file and is
+  delivered securely through the existing Vault → VSO → mounted-Secret mechanism (the same Secret as the
+  password material). **Key rotation** is a distinct concept from **password rotation**: a key rotation
+  changes the signing key (the verification mechanism) while a password rotation changes the generation
+  (the revocation policy). The two are not conflated. **Behavior of previously issued cookies:** once a
+  replica has loaded a new credential (whether a password rotation with a new key, or a key rotation at
+  the same generation), cookies signed under the old key no longer verify and are rejected
+  (signature mismatch), and cookies bound to a previous generation are rejected (generation mismatch).
+  There is **no overlap window** that retains the previous credential snapshot to keep old sessions
+  valid — the reloader swaps the snapshot atomically and does not retain a `prev`. This is the
+  deliberate choice to avoid an unnecessarily long intentional overlap window that would extend
+  old-password or old-session validity.
+
+### Authentication scope
+
+- **Authenticated endpoints:** `POST /api/messages`, `GET /api/messages`, `GET /api/messages/{id}`, and the
+  browser interface (`GET /`).
+- **Unauthenticated endpoints:** `GET /healthz` and `GET /readyz`. These remain unauthenticated so that
+  Kubernetes probes and monitoring can always reach them.
+- **Peer mTLS is independent.** The peer listener's security (mTLS, identity validation, epoch fencing) is
+  **unchanged** by the browser authentication. The peer listener does not use the admin password; it uses
+  the workload mTLS certificates. The two authentication domains are separate.
+
+### Local-development support
+
+- The credential file is read from an ordinary filesystem path (the same `GOSSIPGRID_*_FILE` convention used
+  for peer TLS material). A new environment variable (e.g. `GOSSIPGRID_AUTH_CREDENTIAL_FILE`) specifies the
+  path.
+- **Local development** uses a file on the local filesystem containing the credential material (the
+  versioned credential: algorithm, version, iteration count, per-credential salt, PBKDF2 verifier,
+  generation, and the common session-signing key). **Kubernetes** uses a mounted Secret volume at the same
+  path. No special local-development mode is required; the same code path reads the file.
+- **No plaintext password in the credential file.** The file contains only the versioned credential
+  (salt, PBKDF2 verifier, parameters, generation, and signing key). To create or rotate a local
+  credential file, an operator runs the built-in `credential` CLI subcommand (implemented in M6). The
+  password is **always read interactively** (two hidden prompts with a confirmation for `init` and
+  `rotate`; one hidden prompt for `verify`) and is **never accepted as a command-line argument** (which
+  would expose it in shell history and process listings):
+  - `bin/gossipgrid credential init --out /path/to/admin [--iterations 200000] [--generation 1]
+    [--signing-key <hex32>]` — prompts twice for the password (hidden), writes a 0600 versioned credential
+    file atomically (temp file + rename, so a partial write is never left behind), and generates a random
+    signing key if not supplied.
+  - `bin/gossipgrid credential rotate --file /path/to/admin [--out /path/to/admin] [--iterations N]
+    [--new-signing-key]` — reads the existing credential, increments the generation, prompts twice for
+    the new password, and atomically writes the new record. By default it **preserves the existing
+    signing key** (a password change, not a key rotation); pass `--new-signing-key` to generate a fresh
+    key.
+  - `bin/gossipgrid credential verify --file /path/to/admin` — prompts once for the password (hidden) and
+    confirms the file parses and the password matches (exit 0 on a match, 1 on a mismatch).
+  In Kubernetes the same file format is delivered via a mounted Secret volume (7A) and provisioned from
+  Vault KV v2. The `rotate` subcommand is the local equivalent of editing the Vault KV v2 record (see the
+  "Kubernetes credential rotation" note below).
+
+### Logging and secret handling
+
+- Passwords, credential file contents (including the PBKDF2 verifier and the session-signing key), and
+  session tokens are **never logged**. Diagnostics report credential state (loaded, reload count, last
+  reload time, and whether the last reload succeeded or failed) without disclosing the credential
+  material.
+- The reloader does not log individual session tokens or the signing key.
+- Error messages for authentication failures distinguish "wrong password" (401) from "credential
+  unavailable" (503) by response code only, and never log the underlying cause in a way that reveals
+  which credential state produced it.
+
 ## Go TLS handling (target design for the remainder)
 
 - Peer client: verify server name, chain, approved identity; bound timeouts and connections (implemented; see above).
@@ -259,6 +596,15 @@ Adapt it after review; it is not copied into the initial documentation-only comm
 
 ## Future security exercises
 
-Cilium NetworkPolicy to restrict `8443` only to GossipGrid peers; Gateway exposure limits; TLS rotation under load;
-failed trust rotation; dynamic revocation behavior; RBAC negative tests; audit logs; container vulnerability/SBOM
-scan; non-root and read-only root filesystem; cryptographic module verification.
+These exercises are planned for Milestones 7A, 7B, and 9 (all **designed but not implemented**):
+
+- Cilium NetworkPolicy to restrict `8443` only to GossipGrid peers (7A).
+- Gateway exposure limits and TLS rotation under load (7A).
+- Failed trust rotation and dynamic revocation behavior (7A).
+- RBAC negative tests for the 5B metadata ConfigMap and the 5C recovery endpoint (7B).
+- Live password-rotation demonstration without pod restarts (7A).
+- Audit logs for reset incidents and recovery events (7B, 5C).
+- Container vulnerability/SBOM scan (7A).
+- Non-root and read-only root filesystem (7A).
+- Cryptographic module verification (FIPS runtime state, TLS behavior, and PBKDF2-HMAC-SHA-256 under the
+  `GOFIPS140` build profile) (9).

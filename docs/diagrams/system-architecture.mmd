@@ -1,0 +1,64 @@
+flowchart TB
+  subgraph EXT["External systems (cluster prerequisites, owned by the cluster operations track)"]
+    direction LR
+    VAULT["Vault - browser CA + workload CA PKI, KV v2 credential authority"]
+    GLCI["GitLab CI - QA, build, publish (M8 delivery)"]
+  end
+
+  B["Browser - internal CA HTTPS"]
+
+  subgraph K8S["Kubernetes cluster"]
+    direction TB
+    GW["Cilium Gateway - browser HTTPS termination, LAN LB"]
+    WEB["ClusterIP web Service - ready pods only"]
+
+    subgraph SS["StatefulSet gossipgrid - 5 replicas, Parallel, no PVCs"]
+      direction LR
+      APP["Replicas gossipgrid-0..4 - API :8080, peer :8443"]
+      SYNC["Peer discovery, gossip fanout, anti-entropy (implemented, opt-in)"]
+      DB[("Independent SQLite on emptyDir - pod-lifetime")]
+    end
+
+    B -->|HTTPS| GW
+    GW --> WEB
+    WEB --> APP
+    APP --- SYNC
+    APP --- DB
+
+    subgraph PKI["Peer PKI - separate workload trust domain (M3B implemented)"]
+      direction LR
+      WCA["Vault workload CA"]
+      CM["cert-manager - CSI driver, per-pod mTLS certs + browser TLS Secret"]
+    end
+    WCA --> CM
+    CM -. per-pod mTLS certs .-> APP
+    CM -. browser TLS Secret .-> GW
+
+    subgraph CRED["Browser auth credentials (M6 planned)"]
+      direction LR
+      VKV["Vault KV v2 - versioned credential: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key"]
+      VSO["Vault Secrets Operator"]
+      KSEC["Kubernetes Secret - full volume, never subPath, mounted read-only"]
+      VKV --> VSO --> KSEC
+    end
+    KSEC -. mounted credential file .-> APP
+
+    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B/5C planned)"]
+      direction LR
+      CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
+      RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]
+    end
+    CMETA --- RRBAC
+    CMETA -. metadata watch .-> APP
+  end
+
+  subgraph GITOPS["GitOps delivery (M8 planned)"]
+    direction LR
+    REG["Container registry - immutable image by digest"]
+    GOREPO["GitOps repository - Helm values + Argo CD application manifest"]
+    ARGO["Argo CD - reconciles the cluster"]
+    GLCI -->|publish by digest| REG
+    REG -->|record digest| GOREPO
+    GOREPO -->|watch and reconcile| ARGO
+  end
+  ARGO -. deploys GossipGrid .-> SS

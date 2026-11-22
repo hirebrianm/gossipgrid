@@ -1,0 +1,42 @@
+flowchart TB
+  C["Client / browser"]
+  C -->|"POST /api/messages"| API["Public API (m6)"]
+
+  subgraph REPL["Replica (one of gossipgrid-0..4) - implemented, opt-in"]
+    direction TB
+    API -->|"local commit (idempotent UUIDv7)"| DB1[("Local SQLite")]
+    DB1 -->|"insert callback enqueues"| Q["Gossip work queue (bounded, non-blocking)"]
+    Q --> W["Gossip workers (bounded count)"]
+    W --> SEL["Peer selection (fanout per round, up to rounds; excludes self, sender, contacted; filters exhausted + permanently rejected)"]
+    SEL -->|"admission re-check before send (5A)"| ADMIT{"Authorized?"}
+    ADMIT -->|no| BLOCK["Block outbound (no retry)"]
+    ADMIT -->|yes| DLV["Deliver POST /internal/messages over peer mTLS 1.3 (RealDelivery)"]
+    DLV --> ACK["Peer ack: inserted / duplicate no-op / 409 conflict"]
+    ACK -->|409, 400, 413, invalid ack = permanent| PERM["Mark peer permanently rejected (no retry)"]
+    ACK -->|network / timeout / 5xx / 429 = transient| RETRY["Exponential-backoff retry (bounded attempts per peer)"]
+    RETRY --> DLV
+    ACK -->|inserted, on the peer side| ONNEW["onNewMessage callback re-enqueues fanout (deduped by pending-ID set)"]
+  end
+
+  DLV -. "peer mTLS 1.3, identity-verified" .-> PEER["Peer replica (gossipgrid-x)"]
+  PEER -->|"POST /internal/messages (idempotent insert)"| PDB[("Peer SQLite")]
+
+  subgraph AE["Anti-entropy (M4C, implemented, opt-in) - periodic, PULL-based"]
+    direction TB
+    T["Scheduler (interval)"] --> CYC["Per-cycle sweep of eligible peers (from discovery snapshot)"]
+    CYC --> INV["GET /internal/sync/ids - bounded keyset-paginated ID inventory"]
+    INV --> DIFF["Diff against local store (WHERE id IN ...; bounded)"]
+    DIFF --> FETCH["POST /internal/sync/messages - fetch missing records in bounded batches"]
+    FETCH --> INS["Insert via ON CONFLICT DO NOTHING (idempotent, no overwrite)"]
+    INS --> CUR["Advance per-peer cursor only after full page (completed only on has_more=false)"]
+    CUR -->|"next cycle / full sweep resets cursor"| CYC
+    CYC -->|"admission re-check (5A); 409 epoch mismatch = permanent"| AEBLOCK["Block / do not merge"]
+  end
+
+  T -. "same replica's own scheduler" .-> T
+  PEER -. "replica runs the same anti-entropy loop" .-> T
+
+  CONVERGE["Eventual convergence - no global guarantee; finite fanout + periodic anti-entropy"]
+  DB1 -.-> CONVERGE
+  PDB -.-> CONVERGE
+  INS -.-> CONVERGE

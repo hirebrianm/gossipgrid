@@ -5,14 +5,14 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-> **Status: Milestones 4A, 4B, 4C, and 5A implemented (November 2026).** A locally runnable single-instance Go service with
-> configuration, HTTP health/ready/root endpoints, a GORM/SQLite local message store with REST API, peer discovery
-> (static and Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with certificate hot-reload**
-> (Milestone 3B), **authenticated peer message exchange (POST /internal/messages, opt-in)** (Milestone 4A),
-> **automatic epidemic gossip fanout with bounded queues, exponential-backoff retries, and duplicate suppression
-> (opt-in)** (Milestone 4B), **periodic anti-entropy synchronization with inventory comparison, keyset pagination,
-> and cursor progression (opt-in)** (Milestone 4C), and a **lifecycle state machine with durable SQLite epoch
-> binding, opt-in readiness gating, epoch fencing (request headers + response envelope), single-snapshot
+> **Status: Milestones 0 through 5A implemented (November 2026, tag `v0.1.0-alpha.5`).** A locally runnable
+> single-instance Go service with configuration, HTTP health/ready/root endpoints, a GORM/SQLite local message store
+> with REST API, peer discovery (static and Kubernetes DNS SRV), **authenticated peer-to-peer mTLS transport with
+> certificate hot-reload** (Milestone 3B), **authenticated peer message exchange (POST /internal/messages, opt-in)**
+> (Milestone 4A), **automatic epidemic gossip fanout with bounded queues, exponential-backoff retries, and duplicate
+> suppression (opt-in)** (Milestone 4B), **periodic anti-entropy synchronization with inventory comparison, keyset
+> pagination, and cursor progression (opt-in)** (Milestone 4C), and a **lifecycle state machine with durable SQLite
+> epoch binding, opt-in readiness gating, epoch fencing (request headers + response envelope), single-snapshot
 > fail-closed admission, a non-recursive commit guard with a fixed lock order, outbound epoch provider (per-send
 > re-check), and legacy-peer rejection (opt-in)** (Milestone 5A). Gossip and anti-entropy are implemented and
 > operational in standalone multi-process deployments. Structured logging, graceful shutdown, a Makefile, a static
@@ -20,9 +20,9 @@ mTLS, fault tolerance, and automated deployments.
 > and admission framework** and an **implemented RECOVERY_REQUIRED lockout** (a fail-closed state on epoch
 > mismatch that preserves data and rejects all writes/replication); it does **not** provide the **operator-
 > authorized recovery/reset procedure** that returns a locked-out replica to READY, nor automatic cluster genesis,
-> initial snapshot transfer, or the Kubernetes metadata provider — those are planned milestones (Milestones 5B, 6,
-> 7, and 9). 5A alone does not make GossipGrid safe for catastrophic cluster recovery. No application-level FIPS
-> certification or production-readiness claims are made.
+> initial snapshot transfer, or the Kubernetes metadata provider — those are planned milestones (Milestones 5B, 5C,
+> 6, 7A, 7B, 8, and 9). 5A alone does not make GossipGrid safe for catastrophic cluster recovery. No
+> application-level FIPS certification or production-readiness claims are made.
 
 ## What it does (planned)
 
@@ -73,33 +73,119 @@ deliberate part of the testbed design.
 | Single-snapshot fail-closed admission (reads, writes, replication; per-send re-check) | ✅ |
 | Outbound epoch provider (current authorization, not stale) | ✅ |
 | Legacy-peer rejection (response envelope validation; mTLS alone does not prove epoch membership) | ✅ |
-| Initial snapshot transfer and automatic genesis | 🔜 Milestone 5B |
-| Web UI and diagnostics | 🔜 Milestone 6 |
-| Kubernetes packaging (Helm) | 🔜 Milestone 7 |
+| Kubernetes metadata authority (ConfigMap-backed, atomic resourceVersion update) | 🔜 Milestone 5B |
+| Initial snapshot transfer (SYNCING → READY) and automatic genesis | 🔜 Milestone 5B |
+| Snapshot-source eligibility (unsynced pods never source snapshots) | 🔜 Milestone 5B |
+| Fail-closed behavior when authoritative metadata is unavailable | 🔜 Milestone 5B |
+| Operator recovery/reset authorization (no automatic destructive reset by default) | 🔜 Milestone 5C |
+| Catastrophic data-loss handling and epoch transitions with stale-data fencing | 🔜 Milestone 5C |
+| Incident and recovery audit information (persistent banner, metadata record) | 🔜 Milestone 5C |
+| Web UI (embedded Go templates, minimal JS) and diagnostics | ✅ Milestone 6 (local) |
+| Single-administrator password authentication (enabled by default; fail-closed on missing credential) | ✅ Milestone 6 (local) |
+| Credential reload without restart; password rotation invalidates sessions immediately (no overlap window) | ✅ Milestone 6 (local) |
+| Session-bound CSRF protection (HMAC of the session SID) | ✅ Milestone 6 (local) |
+| Secure credential CLI (`init`/`rotate`/`verify`; interactive hidden prompts, no password in args) | ✅ Milestone 6 (local) |
+| Kubernetes staging: five-replica StatefulSet, `emptyDir` SQLite, peer + web Services, Cilium Gateway | 🔜 Milestone 7A |
+| cert-manager Vault PKI, per-pod mTLS via CSI, VSO-managed auth Secret | 🔜 Milestone 7A |
+| Helm packaging, Argo CD ownership, live password-rotation demonstration (in-cluster) | 🔜 Milestone 7A |
+| Lifecycle-aware Kubernetes staging (5B/5C enabled, in-cluster recovery tests) | 🔜 Milestone 7B |
+| GitOps delivery automation (immutable images, digest-based Argo CD reconciliation) | 🔜 Milestone 8 |
 | Fault injection and resilience lab | 🔜 Milestone 9 |
 
 ## Architecture at a glance
 
-```text
-Browser (internal-CA HTTPS)
-          |
-   Cilium Gateway (TLS termination / LAN LoadBalancer)
-          |
-   gossipgrid-web Service (ready pods only)
-          |
-    Go HTTP API + minimal HTML UI (port 8080)
-          |
-  ---------------------------------------------
-  | Pod 0 | Pod 1 | Pod 2 | Pod 3 | Pod 4 |  ...
-  | SQLite emptyDir databases, independent    |
-  | HTTPS gossip + peer sync over mTLS :8443  |
-  ---------------------------------------------
-          |
-  Headless peer Service / Kubernetes DNS
+<!-- DIAGRAM:system-architecture -->
+```mermaid
+flowchart TB
+  subgraph EXT["External systems (cluster prerequisites, owned by the cluster operations track)"]
+    direction LR
+    VAULT["Vault - browser CA + workload CA PKI, KV v2 credential authority"]
+    GLCI["GitLab CI - QA, build, publish (M8 delivery)"]
+  end
 
-Vault PKI -> cert-manager -> Gateway HTTPS certificate
-Separate workload PKI -> cert-manager CSI -> per-pod mTLS certificates
+  B["Browser - internal CA HTTPS"]
+
+  subgraph K8S["Kubernetes cluster"]
+    direction TB
+    GW["Cilium Gateway - browser HTTPS termination, LAN LB"]
+    WEB["ClusterIP web Service - ready pods only"]
+
+    subgraph SS["StatefulSet gossipgrid - 5 replicas, Parallel, no PVCs"]
+      direction LR
+      APP["Replicas gossipgrid-0..4 - API :8080, peer :8443"]
+      SYNC["Peer discovery, gossip fanout, anti-entropy (implemented, opt-in)"]
+      DB[("Independent SQLite on emptyDir - pod-lifetime")]
+    end
+
+    B -->|HTTPS| GW
+    GW --> WEB
+    WEB --> APP
+    APP --- SYNC
+    APP --- DB
+
+    subgraph PKI["Peer PKI - separate workload trust domain (M3B implemented)"]
+      direction LR
+      WCA["Vault workload CA"]
+      CM["cert-manager - CSI driver, per-pod mTLS certs + browser TLS Secret"]
+    end
+    WCA --> CM
+    CM -. per-pod mTLS certs .-> APP
+    CM -. browser TLS Secret .-> GW
+
+    subgraph CRED["Browser auth credentials (M6 planned)"]
+      direction LR
+      VKV["Vault KV v2 - versioned credential: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key"]
+      VSO["Vault Secrets Operator"]
+      KSEC["Kubernetes Secret - full volume, never subPath, mounted read-only"]
+      VKV --> VSO --> KSEC
+    end
+    KSEC -. mounted credential file .-> APP
+
+    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B/5C planned)"]
+      direction LR
+      CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
+      RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]
+    end
+    CMETA --- RRBAC
+    CMETA -. metadata watch .-> APP
+  end
+
+  subgraph GITOPS["GitOps delivery (M8 planned)"]
+    direction LR
+    REG["Container registry - immutable image by digest"]
+    GOREPO["GitOps repository - Helm values + Argo CD application manifest"]
+    ARGO["Argo CD - reconciles the cluster"]
+    GLCI -->|publish by digest| REG
+    REG -->|record digest| GOREPO
+    GOREPO -->|watch and reconcile| ARGO
+  end
+  ARGO -. deploys GossipGrid .-> SS
 ```
+
+The diagram above is a logical overview of the whole application. GossipGrid is shown as one StatefulSet of
+five replicas with a single independent SQLite-per-replica storage model (not five repeated pod/database
+drawings). External Vault and GitLab CI are treated as external cluster prerequisites, not components inside
+the cluster. The diagram renders natively on GitHub and GitLab; the
+[SVG](docs/diagrams/generated/system-architecture.svg) and
+[PNG](docs/diagrams/generated/system-architecture.png) links are fallbacks.
+
+**Detailed diagrams** (each answers a distinct technical question; all generated from Mermaid sources under
+[docs/diagrams/](docs/diagrams/), rendered to SVG and PNG under [docs/diagrams/generated/](docs/diagrams/generated/)):
+
+- [System architecture](docs/diagrams/generated/system-architecture.svg) — the logical overview above (embedded).
+- [Gossip and anti-entropy replication](docs/diagrams/generated/gossip-replication.svg) — the implemented
+  distributed messaging mechanism (fanout, idempotency, retries, reconciliation, eventual convergence).
+- [Lifecycle state machine and recovery](docs/diagrams/generated/lifecycle-recovery.svg) — the implemented 5A
+  7-state machine, epoch fencing, and readiness/authorization.
+- [Replacement-pod / recovery sequence](docs/diagrams/generated/lifecycle-recovery-sequence.svg) — how a
+  replaced pod re-initializes and how stale-epoch peers are rejected (5A/5B/5C).
+- [Security and credentials](docs/diagrams/generated/security-credentials.svg) — the browser-auth and peer-mTLS
+  paths, and the eventual (not instantaneous) credential rotation flow.
+- [GitOps delivery](docs/diagrams/generated/gitops-delivery.svg) — the M8 delivery pipeline and the
+  CI/Argo CD ownership boundary.
+
+Regenerate all diagrams with `make architecture` (or `make architecture DIAGRAM=<base>` for one) — see
+[Regenerating the architecture diagrams](#regenerating-the-architecture-diagrams) for how to reproduce them.
 
 The workload is planned as a **StatefulSet without PVCs**: stable ordinal identities, but data stored in pod-lifetime
 `emptyDir` volumes. The peer Service will publish unready pod addresses to avoid bootstrap deadlock; only ready pods
@@ -207,6 +293,22 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_ANTI_ENTROPY_WORKERS` | `2` | Concurrent synchronization workers (range 1–16) |
 | `GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT` | `5s` | Per-request timeout for sync HTTP calls (range 1ms–60s) |
 | `GOSSIPGRID_LIFECYCLE_ENABLED` | `false` | Enable lifecycle state machine, epoch fencing, and fail-closed admission (Milestone 5A). Requires peer mTLS |
+| `GOSSIPGRID_AUTH_ENABLED` | `true` | Enable browser password authentication. **Enabled by default** (Milestone 6). Set to `false` only in a controlled environment; with it disabled all API endpoints are unauthenticated |
+| `GOSSIPGRID_AUTH_INSECURE_DEV_MODE` | `false` | Insecure, **local-development-only** opt-out of authentication. When `true`, all API endpoints are unauthenticated. Never set this in a production or network-reachable deployment |
+| `GOSSIPGRID_AUTH_CREDENTIAL_FILE` | (empty) | Path to the mounted credential file (JSON; format version 1). Required when `GOSSIPGRID_AUTH_ENABLED=true` and `GOSSIPGRID_AUTH_INSECURE_DEV_MODE=false`; a missing or malformed file fails closed (503) |
+| `GOSSIPGRID_AUTH_RELOAD_INTERVAL` | `2s` | Polling interval for credential file changes |
+| `GOSSIPGRID_AUTH_MAX_STALE` | `5m` | Maximum age of the last successfully loaded credential; when the file has been failing longer than this, authentication fails closed (503) |
+| `GOSSIPGRID_AUTH_SESSION_TTL` | `24h` | Absolute session lifetime |
+| `GOSSIPGRID_AUTH_SESSION_IDLE_TTL` | `30m` | Maximum session idle time |
+| `GOSSIPGRID_AUTH_COOKIE_SECURE` | (auto) | Override the session cookie `Secure` attribute. Default: `true` when the public listener has a TLS certificate, `false` otherwise |
+
+When `GOSSIPGRID_AUTH_ENABLED=true` (the default) and the credential file is absent or malformed, the web
+endpoints **fail closed** with `503 Service Unavailable` (the browser UI and all API endpoints require
+authentication). There is **no** silent fallback to anonymous access. To run unauthenticated for local
+development, set `GOSSIPGRID_AUTH_INSECURE_DEV_MODE=true` (a clearly-named, insecure opt-out — never for
+network-reachable deployments) or `GOSSIPGRID_AUTH_ENABLED=false`. The `GET /healthz` and `GET /readyz`
+endpoints are always unauthenticated. Peer mTLS (`GOSSIPGRID_PEER_TLS_ENABLED`) is an **independent** security
+mechanism and is not affected by browser authentication.
 
 When `GOSSIPGRID_PEER_TLS_ENABLED` is `true`, all of the peer TLS file paths and the identity suffix are **required**; a
 missing or malformed value fails startup clearly (no silent fallback to unauthenticated communication). When it is
@@ -290,14 +392,46 @@ credentials: possessing an epoch ID does not grant access to any resource. A pee
 but a different epoch is rejected (409) — its data is not merged. mTLS alone does not prove epoch membership;
 the response envelope provides a second, independent validation layer.
 
+### Browser authentication (Milestone 6)
+
+When `GOSSIPGRID_AUTH_ENABLED=true` (the default), all API and UI endpoints require a valid session cookie
+obtained from `POST /login` (single-administrator password authentication); the root page `GET /` serves the
+embedded UI to authenticated users and redirects an unauthenticated browser to `GET /login`. The web endpoints
+**fail closed** (`503 Service Unavailable`) when the credential file is missing, malformed, or stale beyond
+`GOSSIPGRID_AUTH_MAX_STALE` — there is no silent anonymous access. `GET /healthz` and `GET /readyz` are
+**always unauthenticated** (Kubernetes probes). Authentication is **independent** from peer mTLS.
+
+- **Sessions** are HMAC-SHA256-signed cookies bound to a credential **generation**; there is **no overlap
+  window** — a session under the old generation is rejected immediately once any replica has loaded the new
+  generation.
+- **Password rotation** (new password + new generation + new signing key, same or new) invalidates existing
+  sessions immediately. **Signing-key rotation** (new key, same generation) preserves same-generation sessions.
+- **CSRF protection** is session-bound: after login, the token is `HMAC-SHA256(signing key, session SID)`, sent
+  as the `gossipgrid_csrf` cookie + `X-CSRF-Token` header, and cannot be reused across sessions. It is required
+  on all authenticated state-changing requests (`POST /logout`, `POST /api/messages`) when authentication is
+  on. The unauthenticated `POST /login` is not gated by the session-bound CSRF token (a session does not yet
+  exist); **session fixation** is mitigated by always issuing a fresh session on login rather than inheriting
+  a session ID from a cookie an attacker pre-set.
+- **Credential reload** is poll-based (no restart); a changed verifier, signing key, or PBKDF2 parameter is
+  detected. A malformed replacement never replaces the last good snapshot.
+- The in-cluster delivery path (Vault KV v2 → Vault Secrets Operator → mounted K8s Secret) is **designed but
+  not yet deployed** (Milestone 7A); the local CLI (`init`/`rotate`/`verify`) provisions the same credential
+  file format directly.
+
 ### Endpoints
 
-- `GET /` — HTML page identifying GossipGrid and the serving node
-- `GET /healthz` — liveness
-- `GET /readyz` — readiness
-- `POST /api/messages` — create a local message (body only)
-- `GET /api/messages` — list local messages (newest first, paginated)
-- `GET /api/messages/{id}` — retrieve a single message
+- `GET /` — HTML page identifying GossipGrid and the serving node (authenticated when auth is enabled; an
+  unauthenticated browser is redirected to `GET /login`)
+- `GET /healthz` — liveness (always unauthenticated)
+- `GET /readyz` — readiness (always unauthenticated)
+- `GET /login` — (Milestone 6) the login page (unauthenticated)
+- `POST /login` — (Milestone 6) obtain a session cookie with the administrator password (unauthenticated;
+  a new session is always issued)
+- `POST /logout` — (Milestone 6) end the session (requires the session-bound CSRF token)
+- `POST /api/messages` — create a local message (body only; authenticated, CSRF-protected when auth is enabled)
+- `GET /api/messages` — list local messages (newest first, paginated; authenticated when auth is enabled)
+- `GET /api/messages/{id}` — retrieve a single message (authenticated when auth is enabled)
+- `GET /api/diagnostics` — (Milestone 6) safe runtime diagnostics (authenticated when auth is enabled)
 
 ### Peer discovery
 
@@ -470,12 +604,71 @@ make image
 docker run --rm -p 8080:8080 --name gossipgrid gossipgrid:dev
 ```
 
+## Regenerating the architecture diagrams
+
+Each diagram is a Mermaid source file under `docs/diagrams/` (one diagram per file), rendered to a pair of
+outputs under `docs/diagrams/generated/`:
+
+- `<name>.svg` — the scalable documentation artifact (preferred).
+- `<name>.png` — a raster convenience artifact.
+
+To regenerate all diagrams:
+
+```sh
+make architecture
+```
+
+To regenerate a single diagram:
+
+```sh
+make architecture DIAGRAM=system-architecture
+```
+
+The target uses a pinned version of `@mermaid-js/mermaid-cli` (mmdc) via `npx`. The exact version is recorded in
+the Makefile (`MERMAID_CLI_VERSION`). If the pinned version is unavailable, update `MERMAID_CLI_VERSION` and
+re-run. The generated files are committed to the repository; they are not git-ignored. mmdc output for a given
+`.mmd` source and pinned version is deterministic, so the committed SVG/PNG diffs reflect only genuine source
+changes. Do not edit the SVG or PNG directly — edit the `.mmd` source and regenerate.
+
+Rendering and verification are separated: `make architecture` **generates** the committed SVG/PNG outputs,
+while the validation targets are read-only — `make diagrams-check` (level 1) verifies the embedded Markdown
+blocks match the `.mmd` sources and lints the sources, and `make diagrams-render` (level 2) renders the
+sources to a temporary directory to confirm they render without error. `make qa` runs the verification
+targets but never regenerates the committed diagram outputs.
+
+## Build efficiency
+
+Docker image builds are expensive. For documentation, Mermaid diagram, and Makefile-only changes, **do not
+invoke `docker build` or `make image`** — run targeted validation appropriate to the changed files (e.g.
+`make architecture`, `make docs-lint`, `make qa`). Rebuild container images only when image contents,
+application code, dependencies, build configuration, or deployment validation requires it.
+
+## Ownership boundaries
+
+GossipGrid is one component in a larger delivery stack. Each system owns a distinct set of resources; no
+resource is owned by more than one system.
+
+| System | Owns |
+| --- | --- |
+| **Ansible** | Kubernetes cluster and foundational infrastructure (nodes, network plugins, base system packages). |
+| **Vault** | PKI (workload CA and browser CA roles, certificate issuance) and application credential authority (KV v2 secret path for the GossipGrid admin password). |
+| **Vault Secrets Operator (VSO)** | Synchronizes Vault KV v2 secrets to Kubernetes Secrets (the GossipGrid authentication Secret). |
+| **Helm** | GossipGrid resource templates (StatefulSet, Services, NetworkPolicy, cert-manager Certificate/Issuers, ServiceAccount/Role/RoleBinding). |
+| **Argo CD** | Application deployment reconciliation (watches the GitOps repository and reconciles the cluster to the recorded desired state). |
+| **GitLab CI** | Build, test, publish, and GitOps revision updates (QA, container build, image publish by digest, GitOps revision commit). |
+
+The GossipGrid Helm chart does **not** create foundational cluster resources (Cilium, cert-manager, Vault, VSO,
+or the cluster DNS). Those are pre-existing prerequisites owned by the cluster operations track.
+
 ## CI/CD
 
 - **GitLab CI** (`.gitlab-ci.yml`): primary pipeline — QA (fmt, vet, lint, security, tests, race detection) and binary
   build. FIPS-enabled by default. Optional manual Docker image build for tags.
 - **GitHub Actions** (`.github/workflows/ci.yml`): public mirror pipeline — same QA and build steps. No Docker image
   builds.
+- **GitOps delivery (Milestone 8, designed but not implemented):** GitLab CI publishes immutable container images
+  by digest, records the digest in the GitOps repository, and Argo CD reconciles the cluster to the recorded
+  revision. CI does not deploy directly to the cluster; all deployment goes through Argo CD.
 
 ## Scope
 

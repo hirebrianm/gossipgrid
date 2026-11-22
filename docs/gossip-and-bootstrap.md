@@ -1,8 +1,71 @@
 # Gossip and bootstrap protocol
 
 **Intent:** A compact, inspectable protocol that teaches real replication behavior without a separate broker or
-leader. Milestones 4A–4C implement the gossip and anti-entropy wire protocols; Milestone 5A (implemented 2026-11-21)
-adds the lifecycle state machine, durable epoch binding, epoch fencing, and fail-closed admission.
+leader. Milestones 4A–4C implement the gossip and anti-entropy wire protocols (all **implemented and locally
+tested**); Milestone 5A (implemented 2026-11-21, `v0.1.0-alpha.5`) adds the lifecycle state machine, durable epoch
+binding, epoch fencing, and fail-closed admission (**implemented and locally tested**). Milestone 5B (Kubernetes
+metadata provider, initial snapshot transfer, automatic genesis, snapshot-source eligibility) is **designed but
+not implemented**.
+
+**Replication diagram:** The implemented distributed messaging mechanism (local persistence, gossip fanout,
+idempotent peer transfer, retries, and anti-entropy reconciliation toward eventual convergence) is illustrated
+in [gossip-replication](diagrams/generated/gossip-replication.svg)
+([PNG](diagrams/generated/gossip-replication.png)). The lifecycle state machine and the replacement-pod/recovery
+sequence are in [lifecycle-recovery](diagrams/generated/lifecycle-recovery.svg) and
+[lifecycle-recovery-sequence](diagrams/generated/lifecycle-recovery-sequence.svg).
+
+## Replication mechanism (gossip and anti-entropy)
+
+The implemented distributed messaging mechanism — local persistence, gossip fanout, idempotent peer transfer,
+retries, and anti-entropy reconciliation toward eventual convergence — is shown below (the authoritative
+`gossip-replication.mmd` source embedded natively). The [SVG](diagrams/generated/gossip-replication.svg) and
+[PNG](diagrams/generated/gossip-replication.png) links are fallbacks.
+
+<!-- DIAGRAM:gossip-replication -->
+```mermaid
+flowchart TB
+  C["Client / browser"]
+  C -->|"POST /api/messages"| API["Public API (m6)"]
+
+  subgraph REPL["Replica (one of gossipgrid-0..4) - implemented, opt-in"]
+    direction TB
+    API -->|"local commit (idempotent UUIDv7)"| DB1[("Local SQLite")]
+    DB1 -->|"insert callback enqueues"| Q["Gossip work queue (bounded, non-blocking)"]
+    Q --> W["Gossip workers (bounded count)"]
+    W --> SEL["Peer selection (fanout per round, up to rounds; excludes self, sender, contacted; filters exhausted + permanently rejected)"]
+    SEL -->|"admission re-check before send (5A)"| ADMIT{"Authorized?"}
+    ADMIT -->|no| BLOCK["Block outbound (no retry)"]
+    ADMIT -->|yes| DLV["Deliver POST /internal/messages over peer mTLS 1.3 (RealDelivery)"]
+    DLV --> ACK["Peer ack: inserted / duplicate no-op / 409 conflict"]
+    ACK -->|409, 400, 413, invalid ack = permanent| PERM["Mark peer permanently rejected (no retry)"]
+    ACK -->|network / timeout / 5xx / 429 = transient| RETRY["Exponential-backoff retry (bounded attempts per peer)"]
+    RETRY --> DLV
+    ACK -->|inserted, on the peer side| ONNEW["onNewMessage callback re-enqueues fanout (deduped by pending-ID set)"]
+  end
+
+  DLV -. "peer mTLS 1.3, identity-verified" .-> PEER["Peer replica (gossipgrid-x)"]
+  PEER -->|"POST /internal/messages (idempotent insert)"| PDB[("Peer SQLite")]
+
+  subgraph AE["Anti-entropy (M4C, implemented, opt-in) - periodic, PULL-based"]
+    direction TB
+    T["Scheduler (interval)"] --> CYC["Per-cycle sweep of eligible peers (from discovery snapshot)"]
+    CYC --> INV["GET /internal/sync/ids - bounded keyset-paginated ID inventory"]
+    INV --> DIFF["Diff against local store (WHERE id IN ...; bounded)"]
+    DIFF --> FETCH["POST /internal/sync/messages - fetch missing records in bounded batches"]
+    FETCH --> INS["Insert via ON CONFLICT DO NOTHING (idempotent, no overwrite)"]
+    INS --> CUR["Advance per-peer cursor only after full page (completed only on has_more=false)"]
+    CUR -->|"next cycle / full sweep resets cursor"| CYC
+    CYC -->|"admission re-check (5A); 409 epoch mismatch = permanent"| AEBLOCK["Block / do not merge"]
+  end
+
+  T -. "same replica's own scheduler" .-> T
+  PEER -. "replica runs the same anti-entropy loop" .-> T
+
+  CONVERGE["Eventual convergence - no global guarantee; finite fanout + periodic anti-entropy"]
+  DB1 -.-> CONVERGE
+  PDB -.-> CONVERGE
+  INS -.-> CONVERGE
+```
 
 ## Milestone 5A — what is enforced vs. deferred to 5B
 
@@ -224,6 +287,39 @@ A deliberate, idempotent initialization creates a durable metadata epoch for a b
 designated initial seed and becomes ready with an empty message set, then others synchronize from it. A ConfigMap or
 narrow API-backed record holds **only metadata**, never messages. This should not be inferred from 'no peers
 answered'.
+
+**Status:** The genesis protocol is **designed but not implemented** (Milestone 5B). The 5A state machine has the
+`GENESIS` state and the transition to it is defined, but the control-plane-coordinated genesis procedure (the
+mechanism that atomically sets the `Initialized` flag in the ConfigMap and designates the seed pod) is deferred to
+5B.
+
+## Milestone 5B — Authoritative metadata and initial synchronization (designed, not implemented)
+
+Milestone 5B adds the Kubernetes metadata authority, the initial snapshot transfer, and the snapshot-source
+eligibility rules that complete the bootstrap protocol.
+
+- **Kubernetes ConfigMap-backed authoritative metadata.** A narrowly scoped ConfigMap holds the globally unique
+  cluster ID, the unpredictable epoch ID (plus a display generation number), the `Initialized` flag, the
+  `EverAcceptedMessages` flag, and the last reset incident with acknowledgment state. The ConfigMap is
+  **metadata only** — it never stores message bodies. All transitions use the Kubernetes `resourceVersion`
+  compare-and-swap; restricted RBAC (get + update on the named ConfigMap only) prevents competing reset attempts.
+- **Safe genesis.** A fresh cluster with no prior epoch is initialized by an explicit, control-plane-coordinated
+  action (not inferred from "no peers answered"). One eligible pod is designated seed, the ConfigMap's
+  `Initialized` flag is set atomically via CAS, and the seed becomes ready with an empty message set. Others
+  synchronize from it. Empty SQLite state alone is never sufficient to claim genesis.
+- **Initial snapshot transfer.** A `SYNCING` replica pulls a bounded, keyset-paginated baseline from an eligible
+  source (using the existing anti-entropy `GET /internal/sync/ids` and `POST /internal/sync/messages` endpoints,
+  but in a single, larger transfer rather than the periodic reconciliation) and transitions to `READY` when the
+  baseline is installed and initial catch-up succeeds. The same bounded, idempotent `ON CONFLICT DO NOTHING`
+  insert path is used.
+- **Snapshot-source eligibility.** A peer is eligible to supply a snapshot only when it is in `READY` or
+  `DEGRADED` state and its epoch matches the caller's. `SYNCING` replicas are **never** eligible as bootstrap
+  data sources. The eligibility check uses the same `AuthorizationSnapshot` the admission guard uses (ready
+  state + fresh metadata + matching binding).
+- **Fail-closed when authority is unavailable.** If the ConfigMap is absent, unwatchable, or returns a stale
+  revision, the replica stays in `DISCOVERING` or transitions to `RECOVERY_REQUIRED`; it does not invent an
+  epoch. The `MetadataSource` interface (defined in 5A) is implemented with the ConfigMap-backed provider in
+  5B.
 
 ## Joining an existing epoch
 

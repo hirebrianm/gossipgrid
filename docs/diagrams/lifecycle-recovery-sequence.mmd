@@ -1,0 +1,25 @@
+sequenceDiagram
+  participant NEW as Replaced pod gossipgrid-2
+  participant CM as ConfigMap metadata 5B planned
+  participant SRC as Eligible source
+  participant OLD as Stale epoch peer
+
+  Note over NEW: pod replaced, local SQLite is empty (emptyDir lost)
+  NEW->>CM: read authoritative metadata (cluster ID, epoch, Initialized)
+  alt 5A only, no 5B provider
+    NEW->>NEW: metadata unavailable, stays DISCOVERING or RECOVERY_REQUIRED (fail closed)
+  else 5B implemented
+    CM-->>NEW: fresh metadata (Initialized=true, epoch E)
+    NEW->>NEW: bind local_metadata to epoch E
+  end
+  NEW->>SRC: select eligible source (READY or DEGRADED, matching epoch)
+  alt source eligible (5B)
+    NEW->>SRC: GET /internal/sync/ids then POST /internal/sync/messages
+    SRC-->>NEW: baseline records
+    NEW->>NEW: install baseline and initial catch-up, SYNCING then READY
+  else no eligible source (5A only)
+    NEW->>NEW: RECOVERY_REQUIRED (no silent empty-epoch genesis)
+  end
+  OLD->>NEW: attempt to gossip old-epoch data
+  NEW-->>OLD: 409 epoch mismatch (permanent, no retry, data not merged)
+  Note over OLD: old-epoch peer quarantined, 5C operator recovery required to rejoin

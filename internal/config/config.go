@@ -77,6 +77,26 @@ const (
 	// replication requires epoch fencing. When disabled (the default),
 	// all existing Milestone 4 behavior is preserved.
 	EnvLifecycleEnabled = "GOSSIPGRID_LIFECYCLE_ENABLED"
+
+	// Browser authentication and credential management (Milestone 6). When
+	// AuthCredentialFile is set, the public API and the browser UI are
+	// protected by single-administrator password authentication using a
+	// mounted versioned credential file. When unset (the default), the
+	// existing behavior is preserved (no browser authentication; the message
+	// API is unauthenticated). The credential is never delivered through
+	// environment variables; the file is the sole source of credential
+	// material.
+	// #nosec G101: this is an environment-variable name, not a credential.
+	EnvAuthEnabled         = "GOSSIPGRID_AUTH_ENABLED"
+	EnvAuthInsecureDevMode = "GOSSIPGRID_AUTH_INSECURE_DEV_MODE"
+	// #nosec G101: this is an environment-variable name (the path to the
+	// credential file), not a credential value.
+	EnvAuthCredentialFile = "GOSSIPGRID_AUTH_CREDENTIAL_FILE"
+	EnvAuthReloadInterval = "GOSSIPGRID_AUTH_RELOAD_INTERVAL"
+	EnvAuthMaxStale       = "GOSSIPGRID_AUTH_MAX_STALE"
+	EnvAuthSessionTTL     = "GOSSIPGRID_AUTH_SESSION_TTL"
+	EnvAuthSessionIdleTTL = "GOSSIPGRID_AUTH_SESSION_IDLE_TTL"
+	EnvAuthCookieSecure   = "GOSSIPGRID_AUTH_COOKIE_SECURE"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -146,6 +166,28 @@ type Config struct {
 	// peer identity configuration). When false (default), all existing
 	// behavior is preserved and no epoch protection is claimed.
 	LifecycleEnabled bool
+
+	// Browser authentication (Milestone 6). AuthEnabled is true by default:
+	// the public message API and the web UI are protected by
+	// single-administrator password authentication. A missing or invalid
+	// credential file does NOT silently enable anonymous access — the
+	// process starts, /healthz and /readyz remain 200, and authenticated
+	// requests return 503 (fail-closed) until a valid credential is loaded.
+	// AuthInsecureDevMode is an opt-in, clearly-named escape hatch for local
+	// development that disables authentication entirely. It defaults to
+	// false, is documented as insecure, and is unsuitable for
+	// production/Kubernetes deployment. AuthCredentialFile is the path to the
+	// mounted versioned credential file. AuthCookieSecure controls the Secure
+	// cookie flag; it defaults to true in production (HTTPS) and is set to
+	// false for local development over plain HTTP.
+	AuthEnabled         bool
+	AuthInsecureDevMode bool
+	AuthCredentialFile  string
+	AuthReloadInterval  string
+	AuthMaxStale        string
+	AuthSessionTTL      string
+	AuthSessionIdleTTL  string
+	AuthCookieSecure    bool
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -350,6 +392,60 @@ func load(lookup envFunc) (*Config, error) {
 		cfg.LifecycleEnabled = b
 	}
 	if err := validateLifecycleConfig(cfg); err != nil {
+		errs = append(errs, err)
+	}
+
+	// Browser authentication (Milestone 6). Authentication is enabled by
+	// default (fail-closed): the message API and web UI require a valid
+	// credential. AuthEnabled defaults to true; an explicit false disables
+	// authentication for the (documented) unauthenticated mode. An
+	// unrecognised value is an error (a typo must not silently change a
+	// security feature).
+	if v, ok := lookup(EnvAuthEnabled); ok {
+		b, perr := parseBoolEnv(v, EnvAuthEnabled)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.AuthEnabled = b
+	} else {
+		cfg.AuthEnabled = true
+	}
+	// AuthInsecureDevMode is an opt-in escape hatch for local development.
+	// It defaults to false; when true, authentication is disabled entirely
+	// (regardless of AuthEnabled). It is documented as insecure and
+	// unsuitable for production/Kubernetes. An unrecognised value is an
+	// error.
+	if v, ok := lookup(EnvAuthInsecureDevMode); ok {
+		b, perr := parseBoolEnv(v, EnvAuthInsecureDevMode)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.AuthInsecureDevMode = b
+	} else {
+		cfg.AuthInsecureDevMode = false
+	}
+	// AuthCredentialFile is a path; when empty, the reloader stays
+	// "unavailable" and authenticated requests return 503 (fail-closed) —
+	// never anonymous access. The other fields have defaults and are
+	// validated when authentication is on (not in insecure dev mode).
+	cfg.AuthCredentialFile = getEnv(lookup, EnvAuthCredentialFile, "")
+	cfg.AuthReloadInterval = getEnv(lookup, EnvAuthReloadInterval, "2s")
+	cfg.AuthMaxStale = getEnv(lookup, EnvAuthMaxStale, "5m")
+	cfg.AuthSessionTTL = getEnv(lookup, EnvAuthSessionTTL, "2h")
+	cfg.AuthSessionIdleTTL = getEnv(lookup, EnvAuthSessionIdleTTL, "30m")
+	// The Secure cookie flag defaults to true (production HTTPS). It is set
+	// explicitly only when the operator overrides it; an unrecognised value is
+	// an error (a typo must not silently weaken the cookie).
+	if v, ok := lookup(EnvAuthCookieSecure); ok {
+		b, perr := parseBoolEnv(v, EnvAuthCookieSecure)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.AuthCookieSecure = b
+	} else {
+		cfg.AuthCookieSecure = true
+	}
+	if err := validateAuthConfig(cfg); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -786,6 +882,68 @@ func validateLifecycleConfig(cfg *Config) error {
 	// authenticated peer identity).
 	if !cfg.PeerTLSEnabled {
 		return fmt.Errorf("%s: lifecycle protection requires peer mTLS to be enabled (%s=true)", EnvLifecycleEnabled, EnvPeerTLSEnabled)
+	}
+	return nil
+}
+
+// validateAuthConfig checks the browser authentication fields (Milestone 6).
+//
+// Fail-closed default: when AuthEnabled is true (the default), authentication
+// is always on. A missing or invalid credential file does NOT silently enable
+// anonymous access — the reloader stays "unavailable" and authenticated
+// requests return 503 until a valid credential is loaded. The insecure
+// development mode (AuthInsecureDevMode) is the only path that disables
+// authentication, and it is a clearly-named opt-in documented as unsuitable for
+// production/Kubernetes.
+//
+// When authentication is off (insecure dev mode, or AuthEnabled explicitly
+// false), no duration validation is performed. When on, the reload interval,
+// max-stale bound, and session TTLs must all be positive durations within
+// documented bounds. The credential file path is not validated for existence
+// here (that is the reloader's job at load time, which fails closed when the
+// file is absent).
+func validateAuthConfig(cfg *Config) error {
+	if !cfg.AuthEnabled || cfg.AuthInsecureDevMode {
+		return nil
+	}
+	reloadInterval, err := time.ParseDuration(cfg.AuthReloadInterval)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid duration: %w", EnvAuthReloadInterval, cfg.AuthReloadInterval, err)
+	}
+	if reloadInterval <= 0 {
+		return fmt.Errorf("%s: %q must be a positive duration", EnvAuthReloadInterval, cfg.AuthReloadInterval)
+	}
+	if reloadInterval < time.Second {
+		return fmt.Errorf("%s: %q must be at least 1s (polling more frequently than 1s is not useful and risks excessive file reads)", EnvAuthReloadInterval, cfg.AuthReloadInterval)
+	}
+	maxStale, err := time.ParseDuration(cfg.AuthMaxStale)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid duration: %w", EnvAuthMaxStale, cfg.AuthMaxStale, err)
+	}
+	if maxStale <= 0 {
+		return fmt.Errorf("%s: %q must be a positive duration", EnvAuthMaxStale, cfg.AuthMaxStale)
+	}
+	sessionTTL, err := time.ParseDuration(cfg.AuthSessionTTL)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid duration: %w", EnvAuthSessionTTL, cfg.AuthSessionTTL, err)
+	}
+	if sessionTTL <= 0 {
+		return fmt.Errorf("%s: %q must be a positive duration", EnvAuthSessionTTL, cfg.AuthSessionTTL)
+	}
+	if sessionTTL > 24*time.Hour {
+		return fmt.Errorf("%s: %q must be at most 24h (a session longer than a day defeats the short-lived cookie model)", EnvAuthSessionTTL, cfg.AuthSessionTTL)
+	}
+	idleTTL, err := time.ParseDuration(cfg.AuthSessionIdleTTL)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a valid duration: %w", EnvAuthSessionIdleTTL, cfg.AuthSessionIdleTTL, err)
+	}
+	if idleTTL <= 0 {
+		return fmt.Errorf("%s: %q must be a positive duration", EnvAuthSessionIdleTTL, cfg.AuthSessionIdleTTL)
+	}
+	// The idle TTL must not exceed the absolute TTL (the idle expiry is a
+	// subset of the absolute lifetime).
+	if idleTTL > sessionTTL {
+		return fmt.Errorf("%s: idle TTL (%v) must not exceed the absolute session TTL (%v)", EnvAuthSessionIdleTTL, idleTTL, sessionTTL)
 	}
 	return nil
 }

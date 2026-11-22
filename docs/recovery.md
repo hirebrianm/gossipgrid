@@ -1,5 +1,12 @@
 # Data loss, recovery, and cluster epochs
 
+**Status:** This document describes the recovery model and the cluster epoch protocol. Milestone 5A
+(2026-11-21, `v0.1.0-alpha.5`) is **implemented and locally tested** (the lifecycle state machine, durable
+epoch binding, epoch fencing, and fail-closed admission). Milestone 5B (Kubernetes metadata provider, initial
+snapshot transfer, automatic genesis) and Milestone 5C (operator recovery/reset authorization, catastrophic
+data-loss handling) are **designed but not implemented**. The recovery protocol described below is the **target
+design** that 5B and 5C will implement.
+
 ## Why this matters
 
 Each pod stores SQLite in `emptyDir`, so replacing a pod discards its messages. The application intentionally tests
@@ -7,8 +14,43 @@ self-healing from surviving peers. **No design without durable copies can restor
 Recovery of *availability* is not recovery of *lost data*.
 
 Milestone 5A (implemented 2026-11-21) adds the lifecycle state machine, durable epoch binding, epoch fencing, and
-fail-closed admission that underpin the recovery model described below. The Kubernetes metadata provider, automatic
-genesis, and automatic epoch reset are deferred to Milestone 5B and later milestones.
+fail-closed admission that underpin the recovery model described below. The Kubernetes metadata provider (5B),
+initial snapshot transfer (5B), automatic genesis (5B), and operator recovery/reset (5C) are designed but not
+yet implemented.
+
+## Lifecycle state machine (Milestone 5A, implemented)
+
+The lifecycle controller's state machine — the transitions, the fail-closed boundaries, and the readiness
+implication of each state — is shown below (the authoritative `lifecycle-recovery.mmd` source embedded
+natively). The [SVG](diagrams/generated/lifecycle-recovery.svg) and
+[PNG](diagrams/generated/lifecycle-recovery.png) links are fallbacks.
+
+<!-- DIAGRAM:lifecycle-recovery -->
+```mermaid
+stateDiagram-v2
+  [*] --> STARTING
+  STARTING --> DISCOVERING: SQLite + credentials initialized
+  STARTING --> RECOVERY_REQUIRED: no safe path
+  DISCOVERING --> SYNCING: eligible peer found (5B)
+  DISCOVERING --> GENESIS: authorized initial cluster creation (5C)
+  DISCOVERING --> READY: initialized cluster metadata available
+  DISCOVERING --> RECOVERY_REQUIRED: known cluster, no safe sync source
+  GENESIS --> READY: authorized epoch established
+  GENESIS --> RECOVERY_REQUIRED: authorization lost
+  SYNCING --> READY: snapshot ingested + initial catch-up (5B)
+  SYNCING --> DISCOVERING: source unavailable
+  SYNCING --> RECOVERY_REQUIRED: authority lost
+  READY --> DEGRADED: peer partition / sync failure
+  READY --> RECOVERY_REQUIRED: epoch mismatch (fenced, data preserved)
+  DEGRADED --> READY: reconciliation recovers
+  DEGRADED --> RECOVERY_REQUIRED: authority lost
+  RECOVERY_REQUIRED --> DISCOVERING: operator recovery (5C) / epoch changes
+  note right of READY
+      READY and DEGRADED return 200 from /readyz.
+      RECOVERY_REQUIRED returns 503.
+      Existing data is preserved.
+  end note
+```
 
 ## Failure cases
 
@@ -56,6 +98,31 @@ old copies exist outside the observed membership, or that no messages were in fl
 operator authorization**. We can implement the automation after testing the stricter manual path. This is a deliberate
 improvement over treating `all currently reachable pods are empty` as a sufficient proof of total loss.
 
+## Milestone 5C — Controlled recovery (designed, not implemented)
+
+Milestone 5C adds the operator recovery/reset procedure that returns a `RECOVERY_REQUIRED` replica to `READY`.
+It is **explicit and operator-authorized**: there is **no automatic destructive reset by default**.
+
+- **Explicit operator recovery authorization.** A `RECOVERY_REQUIRED` replica returns to `READY` only after an
+  explicit operator action. The exact mechanism (a dedicated API endpoint vs. a controlled Kubernetes job) is to
+  be finalized in the 5C implementation. The RBAC scope is tightly restricted (get + update on the named
+  ConfigMap only; no write access to arbitrary cluster resources).
+- **Catastrophic data-loss handling.** A reset is attempted only when every expected identity responds
+  conclusively that all eligible data sources are gone **and** the control-plane metadata permits a reset. The
+  preconditions are rechecked immediately before the atomic `resourceVersion` update. If any identity is
+  unreachable or ambiguously initialized, the procedure **fails closed** and does not claim all data is lost.
+- **Epoch transitions and stale-data fencing.** A reset establishes a new epoch. Old-epoch replicas are
+  quarantined and never silently rejoin or inject messages into the new epoch. An old-epoch return requires
+  explicit operator inspection. The epoch fencing protocol (M5A) prevents an old-epoch replica from reintroducing
+  its data: a 409 epoch mismatch is permanent (no retry) and the data is not merged.
+- **Incident and recovery audit information.** A completed reset does not hide history: a persistent, dismissible
+  incident banner reports the previous/current epoch, detection time, mode (manual/automatic), and an explicit
+  message-loss warning. The ConfigMap records the reset cause and acknowledgment state. The incident remains
+  visible in metadata and in structured logs after the service resumes.
+- **No automatic destructive reset by default.** The default safe policy is to **halt for operator
+  authorization**. An optional, explicitly configured automatic reset (a lab-only, opt-in policy with a
+  prominently disclosed risk) is a later 5C enhancement, not the default.
+
 ## UX and operations
 
 - A completed reset does not hide history: a persistent, dismissible incident banner reports previous/current epoch,
@@ -91,6 +158,42 @@ A database that predates the lifecycle feature (no `local_metadata` row) is hand
 - No binding is automatically created; the operator must explicitly bind the database to a cluster epoch
   (reserved for future milestones).
 - All existing Milestone 4 behavior is preserved when lifecycle protection is disabled (the default).
+
+## Lifecycle recovery sequence (Milestone 5B/5C, designed)
+
+The end-to-end recovery sequence — a replaced pod reading authoritative metadata, selecting an eligible source,
+ingesting a baseline, and fencing out an old-epoch peer — is shown below (the authoritative
+`lifecycle-recovery-sequence.mmd` source embedded natively). The [SVG](diagrams/generated/lifecycle-recovery-sequence.svg)
+and [PNG](diagrams/generated/lifecycle-recovery-sequence.png) links are fallbacks.
+
+<!-- DIAGRAM:lifecycle-recovery-sequence -->
+```mermaid
+sequenceDiagram
+  participant NEW as Replaced pod gossipgrid-2
+  participant CM as ConfigMap metadata 5B planned
+  participant SRC as Eligible source
+  participant OLD as Stale epoch peer
+
+  Note over NEW: pod replaced, local SQLite is empty (emptyDir lost)
+  NEW->>CM: read authoritative metadata (cluster ID, epoch, Initialized)
+  alt 5A only, no 5B provider
+    NEW->>NEW: metadata unavailable, stays DISCOVERING or RECOVERY_REQUIRED (fail closed)
+  else 5B implemented
+    CM-->>NEW: fresh metadata (Initialized=true, epoch E)
+    NEW->>NEW: bind local_metadata to epoch E
+  end
+  NEW->>SRC: select eligible source (READY or DEGRADED, matching epoch)
+  alt source eligible (5B)
+    NEW->>SRC: GET /internal/sync/ids then POST /internal/sync/messages
+    SRC-->>NEW: baseline records
+    NEW->>NEW: install baseline and initial catch-up, SYNCING then READY
+  else no eligible source (5A only)
+    NEW->>NEW: RECOVERY_REQUIRED (no silent empty-epoch genesis)
+  end
+  OLD->>NEW: attempt to gossip old-epoch data
+  NEW-->>OLD: 409 epoch mismatch (permanent, no retry, data not merged)
+  Note over OLD: old-epoch peer quarantined, 5C operator recovery required to rejoin
+```
 
 ## Why mTLS alone is not sufficient for epoch membership
 
@@ -130,15 +233,17 @@ restoration from an out-of-date snapshot is an administrative incident, not a si
 disaster recovery and safe split-brain prevention would require stronger assumptions and/or durable storage than this
 testbed intentionally provides.
 
-**Milestone 5A limitations (not yet implemented):**
+**Milestone 5A limitations (by design; 5B and 5C add the missing pieces):**
 
 - No production Kubernetes metadata provider: the controller uses a no-op source that always reports metadata
   unavailable. In production, replicas with lifecycle enabled will stay unready until the 5B provider is deployed.
+  *(5B adds the ConfigMap-backed provider.)*
 - No automatic genesis: a fresh replica with no binding cannot automatically initialize an empty epoch.
+  *(5B adds control-plane-coordinated genesis.)*
 - No automatic epoch reset: a `RECOVERY_REQUIRED` replica cannot automatically return to `READY`; operator
-  intervention is required.
+  intervention is required. *(5C adds the explicit operator recovery procedure.)*
 - No snapshot transfer: the initial data baseline (the path from `SYNCING` to `READY`) is not yet implemented;
-  `SetReady` is provided for test purposes and future 5B implementation.
+  `SetReady` is provided for test purposes and future 5B implementation. *(5B adds initial snapshot transfer.)*
 - 5A alone does **not** make GossipGrid safe for catastrophic cluster recovery. It provides the fencing and
   admission framework; the full recovery protocol requires the 5B metadata provider, snapshot transfer, and
-  operator recovery procedures.
+  the 5C operator recovery procedures.

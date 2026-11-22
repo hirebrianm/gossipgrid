@@ -2,6 +2,18 @@
 
 **Status:** Approved direction; protocol details may evolve during implementation review.
 
+**Diagrams:** The authoritative architecture definitions are the Mermaid sources under [diagrams/](diagrams/),
+rendered to SVG and PNG under [diagrams/generated/](diagrams/generated/). The main logical overview is
+[system-architecture](diagrams/generated/system-architecture.svg). Regenerate all with `make architecture`
+(pinned Mermaid CLI, see the Makefile). The inline diagram in this document (under "Logical components") is the
+full system architecture — the same authoritative `system-architecture.mmd` source embedded natively. `make
+diagrams-check` verifies the embedded block matches the `.mmd` source. Detailed companion diagrams:
+[gossip/anti-entropy replication](diagrams/generated/gossip-replication.svg),
+[lifecycle state machine and recovery](diagrams/generated/lifecycle-recovery.svg),
+[replacement-pod/recovery sequence](diagrams/generated/lifecycle-recovery-sequence.svg),
+[security and credentials](diagrams/generated/security-credentials.svg), and
+[GitOps delivery](diagrams/generated/gitops-delivery.svg).
+
 ## Purpose
 
 GossipGrid is a Kubernetes distributed systems testbed: a Go-based application for evaluating Kubernetes orchestration,
@@ -24,34 +36,256 @@ service.
 - Installing and configuring cluster-wide components in early milestones.
 - Claiming formal application-level FIPS 140-3 validation or production-readiness.
 
+## Roadmap and status
+
+The implementation is phased. Milestones 0–5A are **implemented and locally tested** (Go code, unit tests, and
+integration tests pass under the FIPS build and the race detector). They have not yet been deployed to
+Kubernetes. Milestones 5B, 5C, 6, 7A, 7B, 8, and 9 are **designed but not implemented** — the design is
+documented in this document and the per-milestone docs, but the code, manifests, or infrastructure do not yet
+exist. No milestone is currently **configured and verified in Kubernetes**; that status is expected to be
+reached at Milestone 7A and later.
+
+| Milestone | Scope | Status |
+| --- | --- | --- |
+| 5A | Lifecycle state machine, epoch fencing, fail-closed admission, durable binding | ✅ Implemented and locally tested |
+| 5B | Kubernetes metadata authority, initial snapshot transfer, automatic genesis, snapshot-source eligibility | 🔜 Designed but not implemented |
+| 5C | Operator recovery/reset authorization, catastrophic data-loss handling, epoch transitions, incident audit | 🔜 Designed but not implemented |
+| 6 | Web UI, single-administrator password authentication, credential reload (local; in-cluster Vault → VSO → mounted Secret is M7A) | ✅ Implemented and locally tested (local); in-cluster delivery 🔜 M7A |
+| 7A | Kubernetes staging: StatefulSet, `emptyDir` SQLite, peer + web Services, Cilium Gateway, cert-manager, VSO, Helm, Argo CD | 🔜 Designed but not implemented |
+| 7B | Lifecycle-aware staging: enable lifecycle enforcement, in-cluster recovery and partition tests | 🔜 Designed but not implemented |
+| 8 | GitOps delivery automation: immutable images, digest-based Argo CD reconciliation, GitOps revision | 🔜 Designed but not implemented |
+| 9 | Resilience/security lab: fault injection, reset authorization, metrics, FIPS profile | 🔜 Designed but not implemented |
+
+### Milestone 5B — Authoritative metadata and initial synchronization (designed, not implemented)
+
+- **Kubernetes ConfigMap-backed authoritative metadata.** A narrowly scoped ConfigMap holds the globally unique
+  cluster ID, the unpredictable epoch ID (plus a display generation number), the `Initialized` flag, the
+  `EverAcceptedMessages` flag, and the last reset incident with acknowledgment state. The ConfigMap is **metadata
+  only** — it never stores message bodies.
+- **Atomic transitions.** All metadata transitions use the Kubernetes `resourceVersion` compare-and-swap; a
+  failed CAS means the update is lost and the caller retries or fails closed. Restricted RBAC (get + update on the
+  named ConfigMap only) prevents competing reset attempts.
+- **Safe genesis.** A fresh cluster with no prior epoch is initialized by an explicit, control-plane-coordinated
+  action (not inferred from "no peers answered"). One eligible pod is designated seed, becomes ready with an empty
+  message set, and others synchronize from it. Empty SQLite state alone is never sufficient to claim genesis.
+- **Initial snapshot transfer.** A `SYNCING` replica pulls a bounded, keyset-paginated baseline from an eligible
+  source and transitions to `READY` when the baseline is installed and initial catch-up succeeds.
+- **Snapshot-source eligibility.** A peer is eligible to supply a snapshot only when it is in `READY` or `DEGRADED`
+  state and its epoch matches the caller's. `SYNCING` replicas are **never** eligible as bootstrap data sources.
+- **Fail-closed when authority is unavailable.** If the ConfigMap is absent, unwatchable, or returns a stale
+  revision, the replica stays in `DISCOVERING` or transitions to `RECOVERY_REQUIRED`; it does not invent an epoch.
+
+### Milestone 5C — Controlled recovery (designed, not implemented)
+
+- **Explicit operator authorization.** A `RECOVERY_REQUIRED` replica returns to `READY` only after an explicit
+  operator action (a dedicated endpoint or a controlled job with tightly scoped RBAC). There is **no automatic
+  destructive reset by default**.
+- **Catastrophic data-loss handling.** A reset is attempted only when every expected identity responds conclusively
+  that all eligible data sources are gone **and** the control-plane metadata permits a reset. The preconditions are
+  rechecked immediately before the atomic update.
+- **Epoch transitions and stale-data fencing.** Old-epoch replicas are quarantined and never silently rejoin or
+  inject messages into the new epoch. An old-epoch return requires explicit operator inspection.
+- **Incident and recovery audit.** A completed reset does not hide history: a persistent, dismissible incident
+  banner reports the previous/current epoch, detection time, mode (manual/automatic), and an explicit message-loss
+  warning. The ConfigMap records the reset cause and acknowledgment state.
+
+### Milestone 6 — Web UI and authentication (implemented locally; in-cluster delivery in M7A)
+
+The browser interface, single-administrator password authentication, credential reload, and session-bound CSRF
+protection are **implemented and locally tested**. The in-cluster delivery path (Vault KV v2 → Vault Secrets
+Operator → mounted K8s Secret) is **designed but not yet deployed** (Milestone 7A); the same credential file
+format is provisioned locally by the `gossipgrid credential` CLI.
+
+- **Browser interface.** Embedded Go templates and minimal JS (no frontend build pipeline). The UI shows the
+  serving pod, cluster membership, message availability, and security diagnostics. A browser refresh can land on
+  another ready replica; the UI explicitly displays which replica responded.
+- **Single-administrator password authentication.** One administrator password, stored in external HashiCorp Vault
+  KV v2. Vault Secrets Operator (VSO) synchronizes the Vault secret to a Kubernetes Secret. The Secret is mounted
+  **read-only** into GossipGrid pods. Credentials are **never** delivered through environment variables.
+- **Authentication enabled by default (fail-closed).** Browser password authentication is **enabled by
+  default** (`GOSSIPGRID_AUTH_ENABLED=true`). With it enabled and the credential file absent or malformed, the
+  web endpoints **fail closed** with `503 Service Unavailable` — there is no silent fallback to anonymous
+  access. `GET /healthz` and `GET /readyz` remain unauthenticated (Kubernetes probes). To run unauthenticated
+  for local development, set `GOSSIPGRID_AUTH_INSECURE_DEV_MODE=true` (a clearly-named, insecure,
+  local-development-only opt-out) or `GOSSIPGRID_AUTH_ENABLED=false`.
+- **Credential reload without restart.** The application polls the credential file (the same poll-based mechanism
+  used for peer mTLS certificate reload) at `GOSSIPGRID_AUTH_RELOAD_INTERVAL` (default 2s). Reload is
+  **change-detecting** over all security-relevant fields (verifier, signing key, PBKDF2 parameters, generation):
+  a no-op when unchanged, an atomic swap to an immutable snapshot when changed. A malformed replacement never
+  replaces the last good snapshot and does not reset its freshness. When the file has been failing longer than
+  `GOSSIPGRID_AUTH_MAX_STALE` (default 5m), authentication fails closed (503). A changed verifier or signing key
+  is never silently ignored.
+- **Password rotation semantics (no overlap window).** A password rotation (new password + new generation + new
+  signing key) invalidates the previous credential and **all** existing sessions. There is **no overlap
+  window**: a session under the old generation is rejected immediately once a replica has loaded the new
+  generation. The new password is verified against the loaded material; the old password is no longer accepted.
+  **Signing-key rotation** (new key, same generation) preserves same-generation sessions.
+- **Authentication scope.** Public message API endpoints (`POST /api/messages`, `GET /api/messages`,
+  `GET /api/messages/{id}`) require authentication. `GET /healthz` and `GET /readyz` remain unauthenticated.
+  Peer mTLS is **independent** of browser authentication: the peer listener's security is unchanged.
+- **Local-development support.** The credential file is read from an ordinary filesystem path
+  (`GOSSIPGRID_AUTH_CREDENTIAL_FILE`, the same `GOSSIPGRID_*_FILE` convention used for peer TLS material).
+  Local development provisions it with the `gossipgrid credential` CLI (`init`/`rotate`/`verify` — interactive
+  hidden prompts, no password in process arguments, 0600 atomic writes); Kubernetes mounts it from a Secret
+  volume. An explicit `GOSSIPGRID_AUTH_INSECURE_DEV_MODE` is available for unauthenticated local development.
+- **Verification scheme (implemented).** PBKDF2-HMAC-SHA-256 (RFC 2898) with a calibrated iteration count, a
+  randomly generated per-credential salt, and a constant-time verifier comparison, all using FIPS-approved
+  Go primitives (`crypto/pbkdf2`, `crypto/hmac`, `crypto/sha256`, `crypto/rand`) verified against the
+  existing `GOFIPS140` build profile. The credential file is a versioned structure (format version 1) recording
+  algorithm, iteration count, salt, verifier, credential generation, and the common session-signing key
+  (all 32-byte hex-encoded fields). The session cookie is a **signed session value that any replica can
+  verify independently** (not a per-process server-side store, and not a self-contained JWT) with
+  `GOSSIPGRID_AUTH_SESSION_TTL` (default 24h) and `GOSSIPGRID_AUTH_SESSION_IDLE_TTL` (default 30m), and
+  `HttpOnly`, `Secure`, `SameSite=Strict` flags; it never carries the password or verifier. Sessions are
+  bound to the credential **generation**, so a rotation invalidates previously issued sessions (no overlap
+  window). CSRF protection uses a double-submit cookie token (`gossipgrid_csrf` cookie + `X-CSRF-Token`
+  header) that is **session-bound** — `HMAC-SHA256(signing key, session SID)` — so a token cannot be reused
+  across sessions.
+- **Logging and secret handling.** Passwords, credential file contents, and session tokens are never logged.
+  Diagnostics report credential state (loaded, reload count, last reload time) without disclosing the credential
+  material.
+
+### Milestone 7A — Initial Kubernetes staging (designed, not implemented)
+
+- **Five configurable StatefulSet replicas** with `podManagementPolicy: Parallel` and no PVC templates.
+- **Independent SQLite databases** on `emptyDir` (pod-lifetime, not pod-replacement-surviving).
+- **Headless peer Service** with a named `peer` port (8443) and `publishNotReadyAddresses: true` for
+  bootstrap deadlock avoidance.
+- **Ready-only public web Service** (ClusterIP) routing to ready pods only.
+- **Kubernetes DNS peer discovery** via the headless Service's SRV/A records.
+- **Separate workload PKI and per-pod peer mTLS** via cert-manager CSI with an external Vault PKI issuer.
+- **Cilium Gateway** for browser HTTPS termination with a Vault-issued certificate.
+- **VSO-managed authentication Secret** mounted read-only into the pods.
+- **Helm packaging** and **Argo CD ownership** of the GossipGrid resources.
+- **Non-root containers** and appropriate resource/probe configuration.
+- **Gossip and anti-entropy convergence tests** in-cluster.
+- **Live password-rotation demonstration** without pod restarts (eventual, not instantaneous: VSO and Secret
+  propagation are asynchronous, and the rotation window is measured in staging).
+- **What 7A validates.** Existing gossip, anti-entropy, peer discovery, peer mTLS, web authentication, and
+  live password rotation. Pod replacement in 7A is re-reconciled by anti-entropy (a best-effort test); it is
+  **not** validated as authoritative initial snapshot synchronization, safe genesis, or lifecycle readiness
+  gating — those guarantees belong to 5B and 7B.
+- **Lifecycle enforcement remains disabled** in 7A because the required 5B implementation is incomplete. This
+  means the staging phase has **reduced safety guarantees**: a pod replacement loses its local SQLite data and
+  is re-reconciled by anti-entropy (best effort, not an authoritative-snapshot guarantee), but there is no
+  authoritative epoch fencing, no snapshot-source eligibility check, and no recovery lockout. The reduced
+  guarantees are an intentional tradeoff to validate the Kubernetes plumbing (DNS, mTLS, Gateway, VSO,
+  cert-manager) before enabling the lifecycle layer.
+
+### Milestone 7B — Lifecycle-aware Kubernetes staging (designed, not implemented)
+
+- **Enable lifecycle enforcement** (`GOSSIPGRID_LIFECYCLE_ENABLED=true`).
+- **Exercise authoritative metadata and epoch fencing** in-cluster (ConfigMap-backed metadata, 409 epoch mismatch,
+  response envelope validation).
+- **Verify safe genesis and initial synchronization** (a fresh pod joins via snapshot transfer from an eligible
+  source; `SYNCING` pods are never eligible as bootstrap data sources).
+- **Validate recovery authorization and stale-state rejection** (a `RECOVERY_REQUIRED` pod returns to READY only
+  after explicit operator action; old-epoch pods are rejected as sync sources).
+- **Run fail-closed, partition, and catastrophic-recovery tests** in-cluster.
+
+### Milestone 8 — GitOps delivery automation (designed, not implemented)
+
+- **GitLab CI** performs QA, security checks, and container builds.
+- **Publish immutable container images** by commit SHA / digest; never use `latest` as a deployment identity.
+- **Record and deploy images by immutable digest** in the GitOps repository.
+- **Update the GitOps desired application revision** (a commit in the GitOps repository referencing the image
+  digest).
+- **Argo CD reconciles Kubernetes deployment state** (watches the GitOps repository, syncs the cluster to the
+  recorded desired state).
+- **No direct CI deployments** that compete with Argo CD. All deployment goes through Argo CD.
+- **Document release promotion, rollback, and failure handling.** A failed Argo CD sync is observable and
+  reversible.
+- **Clear responsibility boundaries** between Ansible, GitLab CI, Helm, Vault, and Argo CD (see the ownership
+  boundaries section in [kubernetes-deployment.md](kubernetes-deployment.md)).
+
+### Milestone 9 — Resilience/security lab (designed, not implemented)
+
+- **Fault injection** (pod loss, partition, network impairment, CA rotation).
+- **Reset authorization** (M5C operator procedure, tested in-cluster).
+- **Metrics** (gossip attempts/failures, convergence lag, sync state, peer count, SQLite failures, cert expiry,
+  reset incidents).
+- **FIPS profile verification** (runtime FIPS state, TLS behavior, binary static linkage, container digest).
+- **Logged and reproducible experiments** (a full-pod-loss scenario fails closed, is manually reset, and the
+  incident persists in metadata).
+
 ## Logical components
 
+<!-- DIAGRAM:system-architecture -->
 ```mermaid
 flowchart TB
-  B[Browser] -->|HTTPS, browser CA| GW[Cilium Gateway]
-  GW --> WEB[ClusterIP web Service]
-  WEB --> A[Go Pod A]
-  WEB --> C[Go Pod B]
-  WEB --> D[Go Pod C]
-  A <-->|HTTPS mTLS gossip / sync| C
-  C <-->|HTTPS mTLS gossip / sync| D
-  A <-->|HTTPS mTLS gossip / sync| D
-  DNS[Headless Service / Kubernetes DNS] -. peer discovery .-> A
-  DNS -. peer discovery .-> C
-  DNS -. peer discovery .-> D
-  A --- DB1[(SQLite emptyDir)]
-  C --- DB2[(SQLite emptyDir)]
-  D --- DB3[(SQLite emptyDir)]
-  VAULT[Vault PKI] --> CM[cert-manager]
-  CM --> GW
-  CM --> CSI[CSI driver: pod certificates]
-  CSI --> A
-  CSI --> C
-  CSI --> D
+  subgraph EXT["External systems (cluster prerequisites, owned by the cluster operations track)"]
+    direction LR
+    VAULT["Vault - browser CA + workload CA PKI, KV v2 credential authority"]
+    GLCI["GitLab CI - QA, build, publish (M8 delivery)"]
+  end
+
+  B["Browser - internal CA HTTPS"]
+
+  subgraph K8S["Kubernetes cluster"]
+    direction TB
+    GW["Cilium Gateway - browser HTTPS termination, LAN LB"]
+    WEB["ClusterIP web Service - ready pods only"]
+
+    subgraph SS["StatefulSet gossipgrid - 5 replicas, Parallel, no PVCs"]
+      direction LR
+      APP["Replicas gossipgrid-0..4 - API :8080, peer :8443"]
+      SYNC["Peer discovery, gossip fanout, anti-entropy (implemented, opt-in)"]
+      DB[("Independent SQLite on emptyDir - pod-lifetime")]
+    end
+
+    B -->|HTTPS| GW
+    GW --> WEB
+    WEB --> APP
+    APP --- SYNC
+    APP --- DB
+
+    subgraph PKI["Peer PKI - separate workload trust domain (M3B implemented)"]
+      direction LR
+      WCA["Vault workload CA"]
+      CM["cert-manager - CSI driver, per-pod mTLS certs + browser TLS Secret"]
+    end
+    WCA --> CM
+    CM -. per-pod mTLS certs .-> APP
+    CM -. browser TLS Secret .-> GW
+
+    subgraph CRED["Browser auth credentials (M6 planned)"]
+      direction LR
+      VKV["Vault KV v2 - versioned credential: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key"]
+      VSO["Vault Secrets Operator"]
+      KSEC["Kubernetes Secret - full volume, never subPath, mounted read-only"]
+      VKV --> VSO --> KSEC
+    end
+    KSEC -. mounted credential file .-> APP
+
+    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B/5C planned)"]
+      direction LR
+      CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
+      RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]
+    end
+    CMETA --- RRBAC
+    CMETA -. metadata watch .-> APP
+  end
+
+  subgraph GITOPS["GitOps delivery (M8 planned)"]
+    direction LR
+    REG["Container registry - immutable image by digest"]
+    GOREPO["GitOps repository - Helm values + Argo CD application manifest"]
+    ARGO["Argo CD - reconciles the cluster"]
+    GLCI -->|publish by digest| REG
+    REG -->|record digest| GOREPO
+    GOREPO -->|watch and reconcile| ARGO
+  end
+  ARGO -. deploys GossipGrid .-> SS
 ```
 
-Three pods illustrated; default target is five, arbitrary count is configurable. All peer gossip paths are independent
-of the public HTTP Service.
+The diagram above is the full system architecture (the same authoritative
+`system-architecture.mmd` source embedded in the README). It is shown as one
+StatefulSet of five replicas with a single independent SQLite-per-replica
+storage model. External Vault and GitLab CI are treated as external cluster
+prerequisites, not components inside the cluster. All peer gossip paths are
+independent of the public HTTP Service. The diagram renders natively on GitHub
+and GitLab; the [SVG](diagrams/generated/system-architecture.svg) and
+[PNG](diagrams/generated/system-architecture.png) links are fallbacks.
 
 ## Processes, storage, identity
 
@@ -152,12 +386,32 @@ reserved for Milestone 5B.
 
 ## Risks and open implementation questions
 
-- Define a safe multi-page snapshot protocol and follow-up reconciliation in the presence of concurrent posts.
-  Bounded scans of immutable messages are sufficient for the small target size; design tests for races.
-- Peer membership changes when scaling down or up; distinguish desired replicas from reachable DNS records.
-- The cluster metadata control path must safely prevent two competing reset epochs (Kubernetes resourceVersion
-  compare-and-swap, restricted RBAC, no secret content). Milestone 5A implements the epoch fencing and admission
-  framework; the Kubernetes metadata provider and automatic genesis/reset are deferred to 5B and later.
-- Choose DNS/URI SAN conventions based on deployed cert-manager CSI behavior; unit-test hostile identities.
-- FIPS testing requires a pinned toolchain and module compatible with our supported build architectures; do not claim
-  whole-cluster compliance.
+Resolved (2026-11-21, M5A committed as `v0.1.0-alpha.5`):
+
+- Safe multi-page snapshot protocol and follow-up reconciliation (M4C, implemented with bounded keyset pagination,
+  cursor progression, and the 256 KiB response limit).
+- Pod certificate identity SAN conventions and Go-side authorization logic (M3B, implemented with strict
+  SAN-only validation).
+- FIPS toolchain and module pinning (M1, implemented with Go 1.27 and FIPS module v1.0.0).
+
+Still open, to be resolved as their milestones are implemented:
+
+- **M5B — Genesis and reset contract.** The exact control-plane-coordinated first-install genesis protocol and
+  reset authorization/locking contract, including scale-down and lost-metadata behavior. The Kubernetes
+  `resourceVersion` compare-and-swap and restricted RBAC design is documented; the implementation is deferred to
+  5B/5C.
+- **M5C — Recovery procedure details.** The exact operator recovery/reset mechanism (endpoint vs. controlled job),
+  the RBAC scope, and the incident audit format.
+- **M6 (resolved in the local implementation).** The PBKDF2-HMAC-SHA-256 iteration count, signed session cookie
+  format, lifetime, and credential generation binding, the common session-signing key (no overlap window —
+  generation binding governs revocation), and the session-bound CSRF token mechanism are all implemented and
+  verified under the `GOFIPS140` build profile. The remaining M6 work is in-cluster delivery (Vault → VSO →
+  mounted Secret), which is Milestone 7A.
+- **M7A — Cluster capabilities.** The local cluster's actual Cilium version, Gateway API support, LB IPAM mode, and
+  cert-manager CSI / Vault Issuer configuration.
+- **M8 — GitOps repository layout and Argo CD sync policy.** The GitOps repository structure, the image digest
+  recording format, and the Argo CD sync policy (pruning, self-heal).
+- **M9 — Fault-injection harness.** The exact tooling and the set of experiments.
+
+Peer membership changes when scaling down or up; distinguishing desired replicas from reachable DNS records is
+part of the 5B snapshot-source eligibility design.
