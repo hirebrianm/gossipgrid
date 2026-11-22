@@ -60,7 +60,13 @@ echo ""
 echo "--- 1. StatefulSet/headless Service DNS compatibility ---"
 
 # The StatefulSet's serviceName must match the headless Service name.
-SVC_NAME=$(echo "$RENDERED_OUTPUT" | grep '^  serviceName:' | head -1 | awk '{print $2}')
+# Single awk pass: find the first StatefulSet block, print its serviceName.
+# Avoids head -1 on the full string (SIGPIPE hazard under pipefail).
+SVC_NAME=$(awk '
+  /^kind: StatefulSet$/ {insts=1}
+  insts && /^---/ {insts=0}
+  insts && /^  serviceName: / {print $2; exit}
+' <<< "$RENDERED_OUTPUT")
 if [ -z "$SVC_NAME" ]; then
   fail "Could not find serviceName in rendered StatefulSet"
 else
@@ -68,11 +74,14 @@ else
 fi
 
 # The headless Service name (from the rendered Service resource).
-HEADLESS_NAME=$(echo "$RENDERED_OUTPUT" | sed -n '/^kind: Service$/,/^---/p' | grep 'clusterIP: None' -B 20 | grep '^  name:' | head -1 | awk '{print $2}')
-if [ -z "$HEADLESS_NAME" ]; then
-  # Try a different approach: find the Service with clusterIP: None
-  HEADLESS_NAME=$(echo "$RENDERED_OUTPUT" | awk '/^kind: Service$/,/^---/' | grep -B 30 'clusterIP: None' | grep '^  name:' | head -1 | awk '{print $2}')
-fi
+# Single awk pass: extract Service blocks, find the one with clusterIP: None,
+# print its name. No grep -q, no head -1, no SIGPIPE risk.
+HEADLESS_NAME=$(awk '
+  /^kind: Service$/ {insvc=1}
+  insvc && /^---/ {insvc=0}
+  insvc && /^  name: / {name=$2}
+  insvc && /clusterIP: None/ {if (name != "") {print name; exit}}
+' <<< "$RENDERED_OUTPUT")
 if [ -z "$HEADLESS_NAME" ]; then
   fail "Could not find headless Service name in rendered output"
 else
@@ -89,12 +98,12 @@ fi
 # The pod DNS FQDN pattern: <pod-name>.<serviceName>.<namespace>.svc.<clusterDomain>
 # The peer identity suffix (from the env var) must be
 # <peerServiceName>.<namespace>.svc.<clusterDomain>
-PEER_SUFFIX=$(echo "$RENDERED_OUTPUT" | grep 'PEER_IDENTITY_SUFFIX' -A1 | grep 'value:' | awk -F'"' '{print $2}')
+PEER_SUFFIX=$(grep 'PEER_IDENTITY_SUFFIX' -A1 <<< "$RENDERED_OUTPUT" | grep 'value:' | awk -F'"' '{print $2}')
 if [ -z "$PEER_SUFFIX" ]; then
   fail "Could not find GOSSIPGRID_PEER_IDENTITY_SUFFIX in rendered StatefulSet"
 else
   # Verify the suffix ends with .<namespace>.svc.cluster.local
-  if echo "$PEER_SUFFIX" | grep -q "\.${NAMESPACE}\.svc\.cluster\.local$"; then
+  if grep -q "\.${NAMESPACE}\.svc\.cluster\.local$" <<< "$PEER_SUFFIX"; then
     pass "Peer identity suffix is a valid FQDN suffix: $PEER_SUFFIX"
   else
     fail "Peer identity suffix does not match namespace/cluster domain: $PEER_SUFFIX"
@@ -108,7 +117,7 @@ else
 fi
 
 # The discovery DNS name must match the headless Service FQDN.
-DISCOVERY_NAME=$(echo "$RENDERED_OUTPUT" | grep 'DISCOVERY_DNS_NAME' -A1 | grep 'value:' | awk -F'"' '{print $2}')
+DISCOVERY_NAME=$(grep 'DISCOVERY_DNS_NAME' -A1 <<< "$RENDERED_OUTPUT" | grep 'value:' | awk -F'"' '{print $2}')
 if [ -n "$DISCOVERY_NAME" ] && [ "$DISCOVERY_NAME" = "${HEADLESS_NAME}.${NAMESPACE}.svc.cluster.local" ]; then
   pass "Discovery DNS name matches headless Service FQDN: $DISCOVERY_NAME"
 else
@@ -123,58 +132,59 @@ echo "--- 2. Per-pod certificate identity (cert-manager CSI driver) ---"
 
 # The CSI driver name must be csi.cert-manager.io (NOT the stale, wrong
 # cert-manager.csi.dev — the real driver name is csi.cert-manager.io).
-CSI_DRIVER=$(echo "$RENDERED_OUTPUT" | grep 'driver: csi\.cert-manager\.io' | head -1)
-if [ -n "$CSI_DRIVER" ]; then
+# No head -1: just test for presence with grep -q; no SIGPIPE risk.
+if grep -q 'driver: csi\.cert-manager\.io' <<< "$RENDERED_OUTPUT"; then
   pass "CSI driver is csi.cert-manager.io"
 else
   fail "CSI driver csi.cert-manager.io not found in rendered StatefulSet"
 fi
 
 # The stale, wrong driver name must NOT be present.
-if echo "$RENDERED_OUTPUT" | grep -q 'cert-manager\.csi\.dev'; then
+if grep -q 'cert-manager\.csi\.dev' <<< "$RENDERED_OUTPUT"; then
   fail "Stale driver name cert-manager.csi.dev present in rendered StatefulSet"
 else
   pass "No stale driver name cert-manager.csi.dev in rendered StatefulSet"
 fi
 
 # The volumeAttributes must use the csi.cert-manager.io/ prefix.
-if echo "$RENDERED_OUTPUT" | grep -q 'csi\.cert-manager\.io/issuer-name:'; then
+if grep -q 'csi\.cert-manager\.io/issuer-name:' <<< "$RENDERED_OUTPUT"; then
   pass "volumeAttributes use csi.cert-manager.io/issuer-name"
 else
   fail "csi.cert-manager.io/issuer-name not found in volumeAttributes"
 fi
 
-if echo "$RENDERED_OUTPUT" | grep -q 'csi\.cert-manager\.io/dns-names:'; then
+if grep -q 'csi\.cert-manager\.io/dns-names:' <<< "$RENDERED_OUTPUT"; then
   pass "volumeAttributes include csi.cert-manager.io/dns-names"
 else
   fail "csi.cert-manager.io/dns-names not found in volumeAttributes"
 fi
 
 # The dns-names must use ${POD_NAME} (per-pod substitution).
-DNS_NAMES_VALUE=$(echo "$RENDERED_OUTPUT" | grep 'csi\.cert-manager\.io/dns-names:' | awk -F': ' '{print $2}')
-if echo "$DNS_NAMES_VALUE" | grep -q '^\${POD_NAME}\.'; then
+DNS_NAMES_VALUE=$(grep 'csi\.cert-manager\.io/dns-names:' <<< "$RENDERED_OUTPUT" | awk -F': ' '{print $2}')
+if grep -q '^\${POD_NAME}\.' <<< "$DNS_NAMES_VALUE"; then
   pass "dns-names uses \${POD_NAME} per-pod substitution: $DNS_NAMES_VALUE"
 else
   fail "dns-names does not use \${POD_NAME} prefix: $DNS_NAMES_VALUE"
 fi
 
 # The dns-names must include the peerServiceName, namespace, and cluster domain.
-if echo "$DNS_NAMES_VALUE" | grep -q "\.${HEADLESS_NAME}\.${NAMESPACE}\.svc\.cluster\.local$"; then
+if grep -q "\.${HEADLESS_NAME}\.${NAMESPACE}\.svc\.cluster\.local$" <<< "$DNS_NAMES_VALUE"; then
   pass "dns-names SAN matches the headless Service FQDN suffix"
 else
   fail "dns-names SAN does not match headless Service FQDN: $DNS_NAMES_VALUE"
 fi
 
 # The key algorithm must be ECDSA.
-if echo "$RENDERED_OUTPUT" | grep -q 'csi\.cert-manager\.io/key-algorithm: ECDSA'; then
+if grep -q 'csi\.cert-manager\.io/key-algorithm: ECDSA' <<< "$RENDERED_OUTPUT"; then
   pass "Key algorithm is ECDSA (FIPS 140-3 compatible)"
 else
   fail "Key algorithm is not ECDSA"
 fi
 
 # The key usages must include both server auth and client auth.
-if echo "$RENDERED_OUTPUT" | grep 'csi\.cert-manager\.io/key-usages:' | grep -q 'server auth' && \
-   echo "$RENDERED_OUTPUT" | grep 'csi\.cert-manager\.io/key-usages:' | grep -q 'client auth'; then
+KEY_USAGES=$(grep -A2 'csi\.cert-manager\.io/key-usages:' <<< "$RENDERED_OUTPUT")
+if grep -q 'server auth' <<< "$KEY_USAGES" && \
+   grep -q 'client auth' <<< "$KEY_USAGES"; then
   pass "Key usages include serverAuth and clientAuth"
 else
   fail "Key usages do not include both serverAuth and clientAuth"
@@ -184,7 +194,7 @@ fi
 # directly). The browser Certificate is rendered by
 # certmanager-browser-certificate.yaml, so there should be exactly 1 Certificate
 # resource (the browser one), not 2.
-CERT_RESOURCES=$(echo "$RENDERED_OUTPUT" | grep -c '^kind: Certificate$' || true)
+CERT_RESOURCES=$(grep -c '^kind: Certificate$' <<< "$RENDERED_OUTPUT" || true)
 if [ "$CERT_RESOURCES" -eq 1 ]; then
   pass "Exactly 1 Certificate resource rendered (browser only; no peer Certificate)"
 else
@@ -348,15 +358,16 @@ echo ""
 echo "--- 5. Secret rotation without subPath ---"
 
 # The trust bundle volumeMount must NOT have subPath.
-if echo "$RENDERED_OUTPUT" | sed -n '/peer-ca-bundle/,/readOnly/p' | grep -q 'subPath:'; then
+TRUST_MOUNT_SECTION=$(sed -n '/peer-ca-bundle/,/readOnly/p' <<< "$RENDERED_OUTPUT")
+if grep -q 'subPath:' <<< "$TRUST_MOUNT_SECTION"; then
   fail "Trust bundle volumeMount has subPath (blocks Secret rotation)"
 else
   pass "Trust bundle volumeMount has no subPath (rotation is honored)"
 fi
 
 # The trust bundle mount path must be a directory (not a file path).
-TRUST_MOUNT=$(echo "$RENDERED_OUTPUT" | sed -n '/peer-ca-bundle/,/readOnly/p' | grep 'mountPath:' | awk '{print $2}')
-if [ -n "$TRUST_MOUNT" ] && ! echo "$TRUST_MOUNT" | grep -q '\.pem$'; then
+TRUST_MOUNT=$(grep 'mountPath:' <<< "$TRUST_MOUNT_SECTION" | awk '{print $2}')
+if [ -n "$TRUST_MOUNT" ] && ! grep -q '\.pem$' <<< "$TRUST_MOUNT"; then
   pass "Trust bundle mountPath is a directory: $TRUST_MOUNT"
 else
   fail "Trust bundle mountPath is not a directory: $TRUST_MOUNT"
@@ -364,8 +375,8 @@ fi
 
 # The GOSSIPGRID_PEER_TRUST_BUNDLE_FILE env var must be the full file path
 # (mount directory + secret key), not just the directory.
-TRUST_BUNDLE_FILE=$(echo "$RENDERED_OUTPUT" | grep 'PEER_TRUST_BUNDLE_FILE' -A1 | grep 'value:' | awk -F'"' '{print $2}')
-if [ -n "$TRUST_BUNDLE_FILE" ] && echo "$TRUST_BUNDLE_FILE" | grep -q '\.pem$'; then
+TRUST_BUNDLE_FILE=$(grep 'PEER_TRUST_BUNDLE_FILE' -A1 <<< "$RENDERED_OUTPUT" | grep 'value:' | awk -F'"' '{print $2}')
+if [ -n "$TRUST_BUNDLE_FILE" ] && grep -q '\.pem$' <<< "$TRUST_BUNDLE_FILE"; then
   pass "GOSSIPGRID_PEER_TRUST_BUNDLE_FILE is the full file path: $TRUST_BUNDLE_FILE"
 else
   fail "GOSSIPGRID_PEER_TRUST_BUNDLE_FILE is not a file path: $TRUST_BUNDLE_FILE"
@@ -374,15 +385,16 @@ fi
 # The credentials volumeMount must NOT have subPath.
 # Check only the YAML structure lines (not comments) by looking for the
 # "subPath:" key followed by a value (not a comment).
-if echo "$RENDERED_OUTPUT" | sed -n '/- name: credentials/,/readOnly/p' | grep -v '^\s*#' | grep -q '^\s*subPath:'; then
+CRED_MOUNT_SECTION=$(sed -n '/- name: credentials/,/readOnly/p' <<< "$RENDERED_OUTPUT" | grep -v '^\s*#')
+if grep -q '^\s*subPath:' <<< "$CRED_MOUNT_SECTION"; then
   fail "Credentials volumeMount has subPath (blocks Secret rotation)"
 else
   pass "Credentials volumeMount has no subPath (rotation is honored)"
 fi
 
 # The credentials mount path must be a directory.
-CRED_MOUNT=$(echo "$RENDERED_OUTPUT" | sed -n '/name: credentials/,/readOnly/p' | grep 'mountPath:' | awk '{print $2}')
-if [ -n "$CRED_MOUNT" ] && ! echo "$CRED_MOUNT" | grep -q '\.json$'; then
+CRED_MOUNT=$(grep 'mountPath:' <<< "$CRED_MOUNT_SECTION" | awk '{print $2}')
+if [ -n "$CRED_MOUNT" ] && ! grep -q '\.json$' <<< "$CRED_MOUNT"; then
   pass "Credentials mountPath is a directory: $CRED_MOUNT"
 else
   fail "Credentials mountPath is not a directory: $CRED_MOUNT"
@@ -396,21 +408,23 @@ echo "--- 6. No unintended public peer exposure ---"
 
 # The peer port must NOT be in the Gateway/HTTPRoute.
 PEER_PORT_NUM=8443
-if echo "$RENDERED_OUTPUT" | sed -n '/^kind: HTTPRoute$/,/^---/p' | grep -q "$PEER_PORT_NUM"; then
+HTTPROUTE_SECTION=$(sed -n '/^kind: HTTPRoute$/,/^---/p' <<< "$RENDERED_OUTPUT")
+if grep -q "$PEER_PORT_NUM" <<< "$HTTPROUTE_SECTION"; then
   fail "Peer port ($PEER_PORT_NUM) is exposed in HTTPRoute (should be peer-only)"
 else
   pass "Peer port is not exposed in HTTPRoute"
 fi
 
 # The peer port must NOT be in the web Service.
-if echo "$RENDERED_OUTPUT" | sed -n '/^kind: Service$/,/^---/p' | grep 'name: web' -A 20 | grep -q '8443'; then
+WEB_SERVICE_SECTION=$(sed -n '/^kind: Service$/,/^---/p' <<< "$RENDERED_OUTPUT" | grep -A 20 'name: web')
+if grep -q '8443' <<< "$WEB_SERVICE_SECTION"; then
   fail "Peer port (8443) is exposed in the web Service"
 else
   pass "Peer port is not exposed in the web Service"
 fi
 
 # The peer port must ONLY be in the headless Service (for DNS SRV discovery).
-if echo "$RENDERED_OUTPUT" | grep -q "containerPort: $PEER_PORT_NUM"; then
+if grep -q "containerPort: $PEER_PORT_NUM" <<< "$RENDERED_OUTPUT"; then
   pass "Peer port ($PEER_PORT_NUM) is declared in the StatefulSet"
 else
   fail "Peer port ($PEER_PORT_NUM) not found in StatefulSet"
@@ -425,7 +439,8 @@ echo "--- 7. NetworkPolicy ingress restrictions ---"
 # No 0.0.0.0/0 in the rendered NetworkPolicy YAML structure (not in comments).
 # The comment "do NOT use 0.0.0.0/0" is fine; only a YAML cidr: 0.0.0.0/0
 # would be a problem.
-if echo "$RENDERED_OUTPUT" | sed -n '/^kind: NetworkPolicy$/,/^---/p' | grep -v '^\s*#' | grep -q 'cidr: 0\.0\.0\.0/0'; then
+NETPOL_SECTION=$(sed -n '/^kind: NetworkPolicy$/,/^---/p' <<< "$RENDERED_OUTPUT" | grep -v '^\s*#')
+if grep -q 'cidr: 0\.0\.0\.0/0' <<< "$NETPOL_SECTION"; then
   fail "NetworkPolicy contains cidr: 0.0.0.0/0 in YAML (unrestricted ingress)"
 else
   pass "NetworkPolicy has no 0.0.0.0/0 cidr in YAML structure"
@@ -433,7 +448,7 @@ fi
 
 # The web port ingress must only be from the Gateway namespace and optional
 # CIDRs. Count the ingress rules that target the web port.
-WEB_PORT_RULES=$(echo "$RENDERED_OUTPUT" | sed -n '/^kind: NetworkPolicy$/,/^---/p' | grep -c "port: 8080" || true)
+WEB_PORT_RULES=$(grep -c "port: 8080" <<< "$NETPOL_SECTION" || true)
 if [ "$WEB_PORT_RULES" -le 2 ]; then
   pass "Web port ingress rules: $WEB_PORT_RULES (Gateway + optional CIDR only)"
 else
@@ -441,7 +456,7 @@ else
 fi
 
 # The peer port ingress must only be from GossipGrid pods.
-PEER_PORT_RULES=$(echo "$RENDERED_OUTPUT" | sed -n '/^kind: NetworkPolicy$/,/^---/p' | grep -c "port: 8443" || true)
+PEER_PORT_RULES=$(grep -c "port: 8443" <<< "$NETPOL_SECTION" || true)
 if [ "$PEER_PORT_RULES" -le 2 ]; then
   pass "Peer port ingress rules: $PEER_PORT_RULES (GossipGrid pods + egress only)"
 else
@@ -449,9 +464,10 @@ else
 fi
 
 # No ipBlock with 0.0.0.0/0 in the NetworkPolicy (at all).
-if echo "$RENDERED_OUTPUT" | sed -n '/^kind: NetworkPolicy$/,/^---/p' | grep -q 'ipBlock:' ; then
+if grep -q 'ipBlock:' <<< "$NETPOL_SECTION"; then
   # Check if any ipBlock is 0.0.0.0/0
-  if echo "$RENDERED_OUTPUT" | sed -n '/^kind: NetworkPolicy$/,/^---/p' | grep -A1 'ipBlock:' | grep -q '0\.0\.0\.0/0'; then
+  IPBLOCK_LINES=$(grep -A1 'ipBlock:' <<< "$NETPOL_SECTION")
+  if grep -q '0\.0\.0\.0/0' <<< "$IPBLOCK_LINES"; then
     fail "NetworkPolicy has ipBlock 0.0.0.0/0"
   else
     pass "NetworkPolicy ipBlocks are specific CIDRs (not 0.0.0.0/0)"

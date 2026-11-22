@@ -332,12 +332,16 @@ helm-template: ## Render the GossipGrid Helm chart and verify the output parses 
 	if [ -z "$$out" ]; then echo "helm template produced empty output"; exit 1; fi; \
 	lines=$$(printf '%s\n' "$$out" | wc -l | tr -d ' '); \
 	echo "helm template: OK ($$lines lines rendered)"
-	# Verify the rendered output parses as YAML (use python3 if available;
-	# otherwise skip — the helm template success is the primary check).
-	@command -v python3 >/dev/null 2>&1 && \
-		helm template test-release $(HELM_CHART) --namespace $(HELM_NAMESPACE) 2>/dev/null | \
-		python3 -c "import sys, yaml; list(yaml.safe_load_all(sys.stdin)); print('YAML parse: OK')" || \
-		echo "YAML parse: skipped (python3/yaml not available)"
+	@command -v python3 >/dev/null 2>&1 || { \
+		echo "ERROR: python3 is required for YAML validation (install with: apk add python3 py3-yaml)"; \
+		exit 1; \
+	}
+	@python3 -c "import yaml" 2>/dev/null || { \
+		echo "ERROR: PyYAML is required for YAML validation (install with: apk add py3-yaml)"; \
+		exit 1; \
+	}
+	@helm template test-release $(HELM_CHART) --namespace $(HELM_NAMESPACE) 2>/dev/null | \
+		python3 -c "import sys, yaml; list(yaml.safe_load_all(sys.stdin)); print('YAML parse: OK')"
 
 # deploy-checks runs the GossipGrid Helm chart regression checks
 # (deploy/helm/gossipgrid/tests/deploy_checks.sh). It validates the rendered
@@ -351,9 +355,7 @@ DEPLOY_CHECKS := deploy/helm/gossipgrid/tests/deploy_checks.sh
 .PHONY: deploy-checks
 deploy-checks: ## Run the GossipGrid Helm chart regression checks (read-only, no cluster)
 	$(call check_tool,helm,see https://helm.sh/docs/intro/install/)
-	@command -v python3 >/dev/null 2>&1 || { \
-		echo "Warning: python3 not available; some YAML checks may be skipped."; \
-	}
+	$(call check_tool,python3,install with: apk add python3 py3-yaml (Alpine) or apt-get install python3 python3-yaml (Debian))
 	bash $(DEPLOY_CHECKS)
 
 # qa is verification only: it must not modify any tracked file. diagram
@@ -363,11 +365,15 @@ deploy-checks: ## Run the GossipGrid Helm chart regression checks (read-only, no
 # helm-lint and deploy-checks are included in qa (the Helm chart is part of
 # the deliverables; the regression checks validate the rendered output).
 .PHONY: qa
-qa: fmt-check vet lint security docs-lint diagrams-check helm-lint deploy-checks test test-race test-version-injection ## Verify fmt, vet, lint, security, docs, diagrams (source sync+lint), helm, deploy checks, tests, race, and version regression
+qa: fmt-check vet lint security docs-lint diagrams-check helm-lint deploy-checks test test-race test-version-injection test-deploy-pipefail ## Verify fmt, vet, lint, security, docs, diagrams (source sync+lint), helm, deploy checks, tests, race, and version regression
 
 .PHONY: test-version-injection
 test-version-injection: ## Run the version-detection and command-injection regression tests
 	bash scripts/test_version_injection.sh
+
+.PHONY: test-deploy-pipefail
+test-deploy-pipefail: ## Run the pipefail safety regression test for deploy_checks.sh
+	bash scripts/test_deploy_checks_pipefail.sh
 
 .PHONY: image
 image: ## Build the static Docker image
