@@ -45,6 +45,8 @@ webServiceName: gossipgrid-web
 # the actual registry path and immutable tag/digest for the staging deployment.
 # Milestone 8 automation will record the digest in the GitOps repository and
 # Argo CD will reconcile to it.
+imagePullSecrets: []
+
 image:
   repository: registry.gitlab.example.internal/gossipgrid
   tag: dev
