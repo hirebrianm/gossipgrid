@@ -1,0 +1,46 @@
+# Headless peer Service: provides per-pod DNS records for discovery and the
+# named "peer" port for SRV records.
+#
+# publishNotReadyAddresses: true — CRITICAL for bootstrap. Without it, the
+# headless Service would not serve DNS records for pods that are not yet
+# Ready, creating a bootstrap deadlock: a new pod cannot discover its peers
+# until a peer is Ready, but no peer can become Ready until it discovers
+# the new pod (for membership reconciliation). With this flag set, every
+# pod (Ready or not) has a stable DNS name the moment the pod exists.
+#
+# The peer mTLS identity check (certificate SAN + ordinal + StatefulSet name)
+# is the primary security boundary; DNS is only the discovery mechanism. A
+# pod that is not yet Ready will fail the mTLS handshake or the readiness
+# check on the peer endpoints, so unready pods do not silently accept
+# replication traffic.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.peerServiceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: peer
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  # The named "peer" port must match .Values.peerSRVServiceName (the SRV
+  # service name used by GOSSIPGRID_DISCOVERY_SRV_SERVICE) so that the DNS
+  # SRV discovery in internal/discovery resolves the correct port.
+  ports:
+    - name: {{ .Values.peerSRVServiceName }}
+      port: {{ .Values.peerPort }}
+      targetPort: peer
+      protocol: TCP
+  # No selector is needed: the StatefulSet's headless Service is auto-wired
+  # to the StatefulSet's pods by Kubernetes (the StatefulSet controller
+  # creates the headless Service if absent, but we provide it explicitly so
+  # the port name and publishNotReadyAddresses are correct).
+  selector:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: peer

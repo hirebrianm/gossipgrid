@@ -1,0 +1,45 @@
+# cert-manager Certificate for the browser-facing TLS (Gateway HTTPS
+# termination).
+#
+# The browser reaches the GossipGrid web UI via the Cilium Gateway, which
+# terminates HTTPS using this certificate. The DNS name is the public FQDN
+# (operator-configured); the browser must trust the issuing CA (the
+# internal Vault browser CA) — the CA chain is pre-installed in the
+# browser's trust store.
+#
+# This is a separate trust domain from the peer mTLS workload CA. The
+# browser certificate is a single cert for one DNS name (the public FQDN),
+# not per-pod.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Values.gateway.browserCertificateName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: browser-tls
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+spec:
+  {{- if .Values.gateway.browserClusterIssuerName }}
+  issuerRef:
+    name: {{ .Values.gateway.browserClusterIssuerName }}
+    kind: ClusterIssuer
+  {{- else }}
+  issuerRef:
+    name: {{ .Values.gateway.browserIssuerName }}
+    kind: Issuer
+  {{- end }}
+  # The Secret the Gateway references for TLS termination.
+  secretName: {{ .Values.gateway.tlsSecretName }}
+  dnsNames:
+    - {{ .Values.gateway.hostname }}
+  usages:
+    - server auth
+  duration: 720h
+  renewBefore: 72h
+  privateKey:
+    algorithm: ECDSA
+    size: 256

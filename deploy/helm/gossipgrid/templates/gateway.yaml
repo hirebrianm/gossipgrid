@@ -1,0 +1,62 @@
+# Cilium Gateway: browser-facing HTTPS termination with a LoadBalancer IP.
+#
+# The Gateway references the existing cluster-wide Cilium GatewayClass
+# (owner: cluster operations track — NOT created by this chart). The
+# browser TLS certificate (cert-manager managed) is referenced in the
+# HTTPRoute (not here) so the certificate rotation is decoupled from the
+# Gateway resource.
+#
+# The Gateway serves the public FQDN over HTTPS; the upstream application
+# listener is plain HTTP on port 8080 (the web Service). The "Secure"
+# cookie flag (GOSSIPGRID_AUTH_COOKIE_SECURE=true) is correct because the
+# browser only ever sees the app over HTTPS.
+#
+# NOTE: This Gateway is only rendered when .Values.gateway.enabled is
+# true. If the cluster already has a GatewayClass with a different name,
+# update .Values.gateway.gatewayClassName to match.
+{{- if .Values.gateway.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: {{ .Values.gateway.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+  {{- with .Values.gateway.lbAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  gatewayClassName: {{ .Values.gateway.gatewayClassName }}
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: {{ .Values.gateway.hostname }}
+      # The TLS certificate is referenced here (the cert-manager-managed
+      # Secret). When cert-manager rotates the certificate, the Secret is
+      # updated in place and the Gateway picks up the new cert without a
+      # resource change (the Secret name is stable; only the contents change).
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: {{ .Values.gateway.tlsSecretName }}
+            kind: Secret
+            # The Secret is in the same namespace as the Gateway (cert-manager
+            # creates it in the Certificate's namespace).
+  # LoadBalancer: for a LAN-reachable staging lab, Cilium can provision a
+  # LoadBalancer IP via MetalLB or L2 announcements. The lbType and
+  # lbAnnotations are set per-cluster in values.yaml.
+  {{- if eq .Values.gateway.lbType "LoadBalancer" }}
+  infrastructure:
+    parametersRef:
+      group: ""
+      kind: Service
+      name: {{ .Values.gateway.name }}
+  {{- end }}
+{{- end }}

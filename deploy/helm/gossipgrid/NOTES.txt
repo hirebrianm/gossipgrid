@@ -1,0 +1,61 @@
+GossipGrid deployed (Milestone 7A — lifecycle enforcement DISABLED).
+
+Namespace: {{ .Release.Namespace }}
+Replicas:  {{ .Values.replicas }}
+Public FQDN: {{ .Values.publicFQDN }}
+
+To check pod status:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name=gossipgrid
+
+To check the headless peer Service DNS records:
+  kubectl -n {{ .Release.Namespace }} get endpoints {{ .Values.peerServiceName }}
+
+To check the web Service:
+  kubectl -n {{ .Release.Namespace }} get service {{ .Values.webServiceName }}
+
+To check the Gateway (if enabled):
+  kubectl -n {{ .Release.Namespace }} get gateway {{ .Values.gateway.name }}
+  kubectl -n {{ .Release.Namespace }} get httproute {{ .Values.gateway.name }}-web
+
+To test the public HTTPS endpoint:
+  curl -k -s https://{{ .Values.publicFQDN }}/healthz
+
+To test peer mTLS (from a GossipGrid pod, using the per-pod certificate):
+  kubectl -n {{ .Release.Namespace }} exec gossipgrid-0 -- \
+    curl -s --cert /certs/tls.crt --key /certs/tls.key \
+    --cacert /certs/ca-bundle.pem \
+    https://gossipgrid-1.{{ include "gossipgrid.peerIdentitySuffix" . }}:{{ .Values.peerPort }}/internal/status
+
+IMPORTANT (Milestone 7A):
+- Lifecycle enforcement is DISABLED (GOSSIPGRID_LIFECYCLE_ENABLED=false).
+  This means the staging phase has REDUCED SAFETY GUARANTEES:
+  - A pod replacement loses its local SQLite data and is re-reconciled
+    by anti-entropy (best-effort, NOT an authoritative-snapshot guarantee).
+  - There is no authoritative epoch fencing, no snapshot-source eligibility
+    check, and no recovery lockout.
+  - Pod replacement is NOT validated as authoritative initial snapshot
+    synchronization, safe genesis, or lifecycle readiness gating — those
+    guarantees belong to Milestones 5B and 7B.
+- The browser authentication credential file is delivered via Vault KV v2
+  -> Vault Secrets Operator -> Kubernetes Secret -> mounted volume.
+  If the Secret {{ .Values.auth.secretName }} is not yet provisioned by VSO,
+  authenticated requests will return 503 (fail-closed) until it is.
+- The peer mTLS trust bundle Secret {{ .Values.peerTLS.trustBundleSecretName }}
+  must exist in the namespace before the pods start; a missing Secret causes
+  the pods to fail at startup (fail-closed).
+
+To rotate the admin password (via Vault, not in-cluster):
+  1. Use the `gossipgrid credential rotate` CLI to produce a new credential
+     file (new salt, new verifier, new generation, optionally a new signing
+     key). See docs/security.md for the exact commands.
+  2. Write the new credential file to the Vault KV v2 secret
+     (gossipgrid/admin) — VSO will synchronize it to the Kubernetes Secret,
+     the kubelet will atomically swap in the updated file, and the poll-based
+     reloader (default 2s) will pick up the new generation WITHOUT restarting
+     any pod.
+  3. Once each replica has loaded the new generation (eventual, not
+     instantaneous — the propagation window is measured, not assumed),
+     old-generation sessions are rejected immediately (no overlap window).
+
+To deploy with Argo CD, see deploy/argocd/application.yaml.
+To provision Vault (KV v2 secret + VSO + Issuers), see deploy/vault/PROVISIONING.md.

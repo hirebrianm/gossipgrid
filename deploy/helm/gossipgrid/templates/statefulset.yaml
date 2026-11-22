@@ -1,0 +1,385 @@
+# StatefulSet: five replicas with stable ordinal names, parallel startup,
+# and per-pod emptyDir SQLite storage (no PVCs).
+#
+# Design constraints (Milestone 7A):
+# - podManagementPolicy: Parallel — all pods start concurrently (no ordinal
+#   ordering) to avoid bootstrap deadlock.
+# - emptyDir for /data — pod-lifetime writable SQLite; data survives
+#   container restart but NOT pod replacement (no PVCs, no persistent
+#   volumes). This is the documented 7A tradeoff: pod replacement loses
+#   local SQLite and is re-reconciled by anti-entropy (best-effort).
+# - Per-pod peer mTLS via cert-manager CSI — each pod gets a unique
+#   certificate with a DNS SAN matching its pod identity.
+# - Full-volume mount of the VSO-created auth Secret (no subPath) so the
+#   kubelet can atomically swap in updated credential files on rotation.
+# - Read-only root filesystem; writable volumes for /data, /credentials,
+#   and /certs (the CSI driver and Secret mount handle the read-only
+#   /credentials and /certs paths via their own volume semantics).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Values.discovery.statefulSetName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+  {{- with .Values.statefulSetAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # The serviceName MUST match the headless peer Service name
+  # (.Values.peerServiceName, e.g. "gossipgrid-headless"). Kubernetes uses
+  # this name for the pod DNS records:
+  #   <pod-name>.<serviceName>.<namespace>.svc.<clusterDomain>
+  # e.g. gossipgrid-0.gossipgrid-headless.gossipgrid.svc.cluster.local
+  # This FQDN is also the DNS SAN in each pod's per-pod certificate
+  # (issued by the cert-manager CSI driver) and the identity suffix
+  # validated by the peer mTLS layer. A mismatch breaks both DNS discovery
+  # and the mTLS identity check.
+  serviceName: {{ .Values.peerServiceName }}
+  replicas: {{ .Values.replicas }}
+  podManagementPolicy: {{ .Values.podManagementPolicy }}
+  {{- with .Values.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gossipgrid
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: peer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gossipgrid
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: peer
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+        runAsGroup: {{ .Values.securityContext.runAsGroup }}
+        fsGroup: {{ .Values.securityContext.fsGroup }}
+        seccompProfile:
+          type: {{ .Values.securityContext.seccompProfile.type }}
+      containers:
+        - name: gossipgrid
+          image: {{ include "gossipgrid.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: web
+              containerPort: {{ .Values.webPort }}
+              protocol: TCP
+            - name: peer
+              containerPort: {{ .Values.peerPort }}
+              protocol: TCP
+          env:
+            # -- Core.
+            - name: GOSSIPGRID_HTTP_ADDR
+              value: ":{{ .Values.webPort }}"
+            - name: GOSSIPGRID_NODE_ID
+              # The node ID must match the pod name (used by the peer mTLS
+              # identity check: the local certificate's pod identity must
+              # match the configured GOSSIPGRID_NODE_ID). The pod name for a
+              # StatefulSet is <statefulset-name>-<ordinal>, so we use the
+              # downward API to get the pod name.
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GOSSIPGRID_LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            - name: GOSSIPGRID_SHUTDOWN_TIMEOUT
+              value: {{ .Values.shutdownTimeout | quote }}
+            - name: GOSSIPGRID_DB_PATH
+              value: /data/gossipgrid.db
+            # -- Discovery (DNS SRV mode).
+            - name: GOSSIPGRID_DISCOVERY_MODE
+              value: {{ .Values.discovery.mode | quote }}
+            - name: GOSSIPGRID_DISCOVERY_DNS_NAME
+              value: {{ include "gossipgrid.discoveryDNSName" . | quote }}
+            - name: GOSSIPGRID_DISCOVERY_SRV_SERVICE
+              value: {{ .Values.discovery.srvService | quote }}
+            - name: GOSSIPGRID_DISCOVERY_INTERVAL
+              value: {{ .Values.discovery.interval | quote }}
+            - name: GOSSIPGRID_DISCOVERY_TIMEOUT
+              value: {{ .Values.discovery.timeout | quote }}
+            - name: GOSSIPGRID_EXPECTED_REPLICAS
+              value: {{ .Values.discovery.expectedReplicas | quote }}
+            - name: GOSSIPGRID_STATEFULSET_NAME
+              value: {{ .Values.discovery.statefulSetName | quote }}
+            # -- Peer mTLS (Milestone 3B).
+            - name: GOSSIPGRID_PEER_TLS_ENABLED
+              value: {{ .Values.peerTLS.enabled | quote }}
+            - name: GOSSIPGRID_PEER_ADDR
+              value: ":{{ .Values.peerPort }}"
+            - name: GOSSIPGRID_PEER_CERT_FILE
+              value: {{ .Values.peerTLS.certMountPath | quote }}
+            - name: GOSSIPGRID_PEER_KEY_FILE
+              value: {{ .Values.peerTLS.keyMountPath | quote }}
+            - name: GOSSIPGRID_PEER_TRUST_BUNDLE_FILE
+              value: {{ printf "%s/%s" .Values.peerTLS.trustBundleMountPath .Values.peerTLS.trustBundleSecretKey | quote }}
+            - name: GOSSIPGRID_PEER_IDENTITY_SUFFIX
+              value: {{ include "gossipgrid.peerIdentitySuffix" . | quote }}
+            - name: GOSSIPGRID_PEER_TLS_RELOAD_INTERVAL
+              value: {{ .Values.peerTLS.reloadInterval | quote }}
+            # -- Peer message exchange (Milestone 4A).
+            - name: GOSSIPGRID_PEER_MESSAGE_EXCHANGE_ENABLED
+              value: {{ .Values.peerMessageExchange.enabled | quote }}
+            # -- Epidemic gossip (Milestone 4B).
+            - name: GOSSIPGRID_GOSSIP_ENABLED
+              value: {{ .Values.gossip.enabled | quote }}
+            - name: GOSSIPGRID_GOSSIP_FANOUT
+              value: {{ .Values.gossip.fanout | quote }}
+            - name: GOSSIPGRID_GOSSIP_ROUNDS
+              value: {{ .Values.gossip.rounds | quote }}
+            - name: GOSSIPGRID_GOSSIP_WORKERS
+              value: {{ .Values.gossip.workers | quote }}
+            - name: GOSSIPGRID_GOSSIP_QUEUE_CAPACITY
+              value: {{ .Values.gossip.queueCapacity | quote }}
+            - name: GOSSIPGRID_GOSSIP_MAX_ATTEMPTS
+              value: {{ .Values.gossip.maxAttempts | quote }}
+            - name: GOSSIPGRID_GOSSIP_RETRY_BASE
+              value: {{ .Values.gossip.retryBase | quote }}
+            - name: GOSSIPGRID_GOSSIP_RETRY_MAX
+              value: {{ .Values.gossip.retryMax | quote }}
+            # -- Anti-entropy (Milestone 4C).
+            - name: GOSSIPGRID_ANTI_ENTROPY_ENABLED
+              value: {{ .Values.antiEntropy.enabled | quote }}
+            - name: GOSSIPGRID_ANTI_ENTROPY_INTERVAL
+              value: {{ .Values.antiEntropy.interval | quote }}
+            - name: GOSSIPGRID_ANTI_ENTROPY_PAGE_SIZE
+              value: {{ .Values.antiEntropy.pageSize | quote }}
+            - name: GOSSIPGRID_ANTI_ENTROPY_FETCH_BATCH_SIZE
+              value: {{ .Values.antiEntropy.fetchBatchSize | quote }}
+            - name: GOSSIPGRID_ANTI_ENTROPY_MAX_PAGES_PER_PEER
+              value: {{ .Values.antiEntropy.maxPagesPerPeer | quote }}
+            - name: GOSSIPGRID_ANTI_ENTROPY_WORKERS
+              value: {{ .Values.antiEntropy.workers | quote }}
+            - name: GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT
+              value: {{ .Values.antiEntropy.requestTimeout | quote }}
+            # -- Lifecycle (Milestone 5A). Disabled in 7A (see values.yaml).
+            - name: GOSSIPGRID_LIFECYCLE_ENABLED
+              value: {{ .Values.lifecycle.enabled | quote }}
+            # -- Browser authentication (Milestone 6).
+            #
+            # The credential material is NEVER delivered through environment
+            # variables — only the PATH to the mounted credential file is an
+            # env var. The file itself is the sole source of credential
+            # material (PBKDF2 verifier, salt, algorithm, version, generation,
+            # signing key — all in the mounted file; the plaintext password
+            # is never stored anywhere).
+            - name: GOSSIPGRID_AUTH_ENABLED
+              value: {{ .Values.auth.enabled | quote }}
+            - name: GOSSIPGRID_AUTH_INSECURE_DEV_MODE
+              value: {{ .Values.auth.insecureDevMode | quote }}
+            - name: GOSSIPGRID_AUTH_CREDENTIAL_FILE
+              value: {{ .Values.auth.credentialFile | quote }}
+            - name: GOSSIPGRID_AUTH_RELOAD_INTERVAL
+              value: {{ .Values.auth.reloadInterval | quote }}
+            - name: GOSSIPGRID_AUTH_MAX_STALE
+              value: {{ .Values.auth.maxStale | quote }}
+            - name: GOSSIPGRID_AUTH_SESSION_TTL
+              value: {{ .Values.auth.sessionTTL | quote }}
+            - name: GOSSIPGRID_AUTH_SESSION_IDLE_TTL
+              value: {{ .Values.auth.sessionIdleTTL | quote }}
+            - name: GOSSIPGRID_AUTH_COOKIE_SECURE
+              value: {{ .Values.auth.cookieSecure | quote }}
+          # Probes. The liveness probe checks /healthz (always 200 regardless
+          # of peer state) so a peer outage does NOT trigger a restart storm.
+          # The readiness probe checks /readyz (200 when Ready, 503 when
+          # unready — in 7A with lifecycle disabled, /readyz returns 200 once
+          # the listeners are up).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: web
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: web
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: web
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+            capabilities:
+              drop:
+                {{- toYaml .Values.securityContext.capabilities.drop | nindent 16 }}
+            readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+          volumeMounts:
+            # Writable SQLite directory (pod-lifetime; no PVCs).
+            - name: data
+              mountPath: /data
+            # Read-only credential Secret volume (full-volume mount of the
+            # VSO-created Secret; no subPath so the kubelet can atomically
+            # swap in updated files on rotation). The volume is mounted at
+            # a directory (e.g. /credentials); the credential file appears
+            # inside it at <mountPath>/<secretKey> (e.g. /credentials/admin),
+            # matching GOSSIPGRID_AUTH_CREDENTIAL_FILE.
+            - name: credentials
+              mountPath: {{ .Values.auth.mountPath }}
+              readOnly: true
+            # Read-only peer mTLS trust bundle (K8s Secret; cluster-owned).
+            # The Secret is mounted as a FULL VOLUME (no subPath) at a
+            # directory (/certs-ca). The bundle file appears inside it at
+            # <mountPath>/<secretKey> (e.g. /certs-ca/ca-bundle.pem), matching
+            # GOSSIPGRID_PEER_TRUST_BUNDLE_FILE.
+            #
+            # A subPath mount PINS the pod to the initial file version and
+            # does NOT honor Kubernetes Secret rotation updates — the kubelet
+            # only atomically swaps files for full-volume mounts. For the
+            # trust bundle, this means a CA rotation would require a pod
+            # restart. The full-volume mount ensures the kubelet can swap in
+            # an updated bundle without a restart (the GossipGrid poll-based
+            # reloader, default 2s, picks it up).
+            - name: peer-ca-bundle
+              mountPath: {{ .Values.peerTLS.trustBundleMountPath }}
+              readOnly: true
+            # Per-pod peer mTLS certificate and key (cert-manager CSI driver).
+            # The CSI driver mounts the per-pod certificate (tls.crt) and key
+            # (tls.key) into the pod at the volume root; the volume is mounted
+            # at a directory (e.g. /certs), so the files are at
+            # <mountPath>/tls.crt and <mountPath>/tls.key (matching
+            # GOSSIPGRID_PEER_CERT_FILE and GOSSIPGRID_PEER_KEY_FILE).
+            - name: peer-certs
+              mountPath: {{ .Values.peerTLS.peerCertsMountPath }}
+              readOnly: true
+      # Volumes.
+      volumes:
+        # Pod-lifetime writable SQLite. Survives container restart, NOT pod
+        # replacement (the documented 7A tradeoff).
+        - name: data
+          emptyDir: {}
+        # Full-volume mount of the VSO-created auth Secret (no subPath).
+        # VSO projects the Vault KV v2 secret (gossipgrid/admin) into a K8s
+        # Secret; the credential file is one file in that volume. The kubelet
+        # atomically swaps in updated files on rotation (no subPath means the
+        # projected-Secret rotation is honored).
+        - name: credentials
+          secret:
+            secretName: {{ .Values.auth.secretName }}
+            items:
+              - key: {{ .Values.auth.secretKey }}
+                path: {{ .Values.auth.secretKey }}
+        # The workload CA trust bundle (a cluster-owned K8s Secret; NOT created
+        # by this chart). The Secret must exist in the target namespace before
+        # the pods start; a missing Secret causes the pods to fail at startup
+        # (fail-closed). The trust bundle may hold multiple CA certificates
+        # during a CA transition.
+        #
+        # The items projection maps the Secret key (trustBundleSecretKey,
+        # e.g. "ca-bundle.pem") to a file at the same name inside the mount
+        # directory (trustBundleMountPath, e.g. /certs-ca). The resulting file
+        # path is /certs-ca/ca-bundle.pem — matching
+        # GOSSIPGRID_PEER_TRUST_BUNDLE_FILE.
+        #
+        # No subPath: the full-volume mount allows the kubelet to atomically
+        # swap in an updated bundle on CA rotation without a pod restart.
+        - name: peer-ca-bundle
+          secret:
+            secretName: {{ .Values.peerTLS.trustBundleSecretName }}
+            items:
+              - key: {{ .Values.peerTLS.trustBundleSecretKey }}
+                path: {{ .Values.peerTLS.trustBundleSecretKey }}
+        # Per-pod peer mTLS via the cert-manager CSI driver.
+        #
+        # The cert-manager CSI driver (driver: csi.cert-manager.io) provisions
+        # a unique certificate per pod WITHOUT requiring a Certificate resource
+        # or an intermediate Kubernetes Secret. The driver issues a new
+        # certificate directly for each pod based on the volumeAttributes
+        # below, using ${POD_NAME} and ${POD_NAMESPACE} environment variable
+        # substitution (a documented feature of the driver).
+        #
+        # The driver mounts three files at the volume root:
+        #   tls.crt  — the leaf certificate (the per-pod mTLS certificate)
+        #   tls.key  — the private key (ECDSA P-256, FIPS 140-3 compatible)
+        #   ca.crt   — the issuing CA certificate (useful for debugging)
+        # The volume is mounted at /certs (peerTLS.peerCertsMountPath), so the
+        # files are at /certs/tls.crt and /certs/tls.key — matching
+        # GOSSIPGRID_PEER_CERT_FILE and GOSSIPGRID_PEER_KEY_FILE.
+        #
+        # The same certificate serves both the server and client roles
+        # (serverAuth + clientAuth EKUs, set via key-usages). The driver
+        # renews the certificate automatically (duration: 24h, renewBefore:
+        # 12h); the GossipGrid hot-reload (poll-based, default 2s) picks up
+        # the new cert without a pod restart.
+        #
+        # The ${POD_NAME} and ${POD_NAMESPACE} variables are substituted by
+        # the CSI driver at volume-mount time, producing the per-pod DNS SAN:
+        #   <statefulset-name>-<ordinal>.<peerServiceName>.<namespace>.svc.<clusterDomain>
+        # e.g. gossipgrid-0.gossipgrid-headless.gossipgrid.svc.cluster.local
+        # This matches the pod's StatefulSet DNS name (see serviceName above)
+        # and the identity suffix validated by internal/peertls.
+        #
+        # PREREQUISITE: the cert-manager CSI driver (csi.cert-manager.io) must
+        # be installed and running in the cluster. It is a cluster-wide
+        # prerequisite owned by the cluster operations track — this chart does
+        # NOT install it. Verify with:
+        #   kubectl get csidriver csi.cert-manager.io
+        # If it is missing, the per-pod peer mTLS mount will fail (blocker).
+        - name: peer-certs
+          csi:
+            driver: csi.cert-manager.io
+            readOnly: true
+            volumeAttributes:
+              # The Vault-backed Issuer (or ClusterIssuer) that signs the
+              # per-pod peer mTLS certificates. This is a cluster-wide
+              # prerequisite owned by the cluster operations track.
+              csi.cert-manager.io/issuer-name: {{ .Values.peerTLS.certManagerIssuerName }}
+              csi.cert-manager.io/issuer-kind: {{ if .Values.peerTLS.certManagerClusterIssuerName }}ClusterIssuer{{ else }}Issuer{{ end }}
+              # The per-pod DNS SAN: the pod's StatefulSet DNS name.
+              # ${POD_NAME} and ${POD_NAMESPACE} are substituted by the CSI
+              # driver at volume-mount time (a documented feature).
+              csi.cert-manager.io/dns-names: ${POD_NAME}.{{ .Values.peerServiceName }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}
+              # ECDSA P-256 key (FIPS 140-3 compatible; the GossipGrid FIPS
+              # build verifies the key matches the cert's public key at load).
+              csi.cert-manager.io/key-algorithm: ECDSA
+              csi.cert-manager.io/key-size: "256"
+              # Both serverAuth and clientAuth EKUs: the same certificate is
+              # used for the peer mTLS server (the listener) and client (the
+              # dialer) roles.
+              csi.cert-manager.io/key-usages: "server auth, client auth"
+              # Short-lived certificates: the driver renews automatically and
+              # the GossipGrid poll-based reloader (default 2s) picks up the
+              # new cert without a pod restart.
+              csi.cert-manager.io/duration: 24h
+              csi.cert-manager.io/renew-before: 12h

@@ -1,0 +1,22 @@
+# No Certificate resource is rendered here.
+#
+# The per-pod peer mTLS certificates are issued directly by the cert-manager
+# CSI driver (driver: csi.cert-manager.io) based on the volumeAttributes in
+# the StatefulSet spec (see statefulset.yaml, volume "peer-certs"). The CSI
+# driver requests a unique certificate for each pod WITHOUT needing a
+# cert-manager Certificate resource and WITHOUT creating an intermediate
+# Kubernetes Secret (per the official cert-manager CSI driver documentation:
+# https://cert-manager.io/docs/usage/csi-driver/).
+#
+# The per-pod DNS SAN is set via csi.cert-manager.io/dns-names in the
+# volumeAttributes, using ${POD_NAME} and ${POD_NAMESPACE} substitution:
+#   <statefulset-name>-<ordinal>.<peerServiceName>.<namespace>.svc.<clusterDomain>
+#
+# The issuing authority is the Vault-backed Issuer (peerTLS.certManagerIssuerName,
+# a cluster-wide prerequisite owned by the cluster operations track — see
+# deploy/vault/PROVISIONING.md section 3). The CSI driver issues and renews
+# the per-pod certificates directly from that Issuer.
+#
+# The browser TLS certificate (a single, non-per-pod certificate for the
+# Cilium Gateway) IS a cert-manager Certificate resource and IS rendered by
+# certmanager-browser-certificate.yaml.

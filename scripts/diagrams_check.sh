@@ -132,8 +132,93 @@ for mmd in "$DIAGRAM_DIR"/*.mmd; do
   fi
 done
 
+# --- Check 3: discover all mermaid blocks in all .md files and verify each
+# has a DIAGRAM marker, a registered canonical .mmd source, generated SVG+PNG
+# artifacts, and SVG/PNG links near the diagram. ---
+#
+# This check is exhaustive: it walks every .md file in the repository
+# (excluding docs/diagrams/ which is not documentation content) and inspects
+# every ```mermaid block. A block is valid when:
+#   1. The line immediately above the ```mermaid fence contains
+#      "<!-- DIAGRAM:<base> -->"
+#   2. docs/diagrams/<base>.mmd exists (canonical source)
+#   3. docs/diagrams/generated/<base>.svg exists (generated artifact)
+#   4. docs/diagrams/generated/<base>.png exists (generated artifact)
+#   5. The .md file contains a link to <base>.svg and <base>.png
+#      (the links may be anywhere in the file, not necessarily immediately
+#      adjacent to the diagram block)
+#
+# Note: we do NOT verify that the base appears in DIAGRAM_DOC_MAP here,
+# because the script receives the map as arguments and the map is already
+# enforced by Check 1 (source sync). Check 3 verifies the structural
+# integrity of every block regardless of registration.
+
+# Build a list of all .md files (exclude docs/diagrams/ which is not doc
+# content, and exclude .git/).
+md_files=$(find . -name '*.md' -not -path './.git/*' -not -path './docs/diagrams/*' 2>/dev/null | sort)
+
+for doc in $md_files; do
+  # Find line numbers of ```mermaid fences in this file
+  mermaid_lines=$(grep -n '^```mermaid$' "$doc" 2>/dev/null) || mermaid_lines=""
+  [ -z "$mermaid_lines" ] && continue
+
+  for ml in $mermaid_lines; do
+    ml_num=${ml%%:*}
+    # The DIAGRAM marker must be on the line immediately above the fence
+    prev_line=$((ml_num - 1))
+    if [ "$prev_line" -lt 1 ]; then
+      echo "FAIL: $doc line $ml_num — mermaid block has no DIAGRAM marker (no line above)"
+      status=1
+      continue
+    fi
+    marker_line=$(sed -n "${prev_line}p" "$doc")
+    case "$marker_line" in
+      *"<!-- DIAGRAM:"*)
+        base=$(printf '%s' "$marker_line" | sed 's/.*<!-- DIAGRAM:\([^ ]*\) -->.*/\1/')
+        # 3a: canonical .mmd source exists
+        mmd="$DIAGRAM_DIR/$base.mmd"
+        if [ ! -f "$mmd" ]; then
+          echo "FAIL: $doc line $ml_num — DIAGRAM:$base block has no canonical source ($mmd not found)"
+          status=1
+          continue
+        fi
+        # 3b: generated SVG artifact exists
+        svg="$DIAGRAM_DIR/generated/$base.svg"
+        if [ ! -f "$svg" ]; then
+          echo "FAIL: $doc line $ml_num — DIAGRAM:$base block has no generated SVG ($svg not found)"
+          status=1
+          continue
+        fi
+        # 3c: generated PNG artifact exists
+        png="$DIAGRAM_DIR/generated/$base.png"
+        if [ ! -f "$png" ]; then
+          echo "FAIL: $doc line $ml_num — DIAGRAM:$base block has no generated PNG ($png not found)"
+          status=1
+          continue
+        fi
+        # 3d: doc contains a link to the SVG and a link to the PNG
+        if ! grep -q "$base\.svg" "$doc"; then
+          echo "FAIL: $doc line $ml_num — DIAGRAM:$base block has no link to $base.svg in $doc"
+          status=1
+          continue
+        fi
+        if ! grep -q "$base\.png" "$doc"; then
+          echo "FAIL: $doc line $ml_num — DIAGRAM:$base block has no link to $base.png in $doc"
+          status=1
+          continue
+        fi
+        echo "OK: $doc line $ml_num ($base — all artifacts and links present)"
+        ;;
+      *)
+        echo "FAIL: $doc line $ml_num — mermaid block has no DIAGRAM marker (line $prev_line: $marker_line)"
+        status=1
+        ;;
+    esac
+  done
+done
+
 if [ "$status" -eq 0 ]; then
-  echo "All embedded Mermaid blocks match their .mmd sources; no malformed note patterns."
+  echo "All embedded Mermaid blocks match their .mmd sources; no malformed note patterns; all blocks have markers, sources, artifacts, and links."
 else
   echo "diagrams-check (level 1: source): failures detected (see FAIL lines above)." >&2
 fi

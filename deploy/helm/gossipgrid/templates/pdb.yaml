@@ -1,0 +1,26 @@
+# PodDisruptionBudget: for a 5-replica testbed with emptyDir storage,
+# allowing all 5 to be unavailable during a voluntary node drain is
+# acceptable (no data survives pod replacement in 7A — the documented
+# tradeoff). Set minAvailable to a higher value to prevent voluntary
+# disruption until the workload is explicitly drained.
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gossipgrid
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: peer
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gossipgrid
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: peer
+{{- end }}

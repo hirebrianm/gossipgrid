@@ -1,0 +1,131 @@
+# NetworkPolicy: defense-in-depth for the GossipGrid pods.
+#
+# Primary security boundary:
+# - Peer mTLS: TLS 1.3 mutual TLS with a dedicated workload CA trust
+#   hierarchy and strict identity authorization (certificate SAN + ordinal
+#   + StatefulSet name). The NetworkPolicy is NOT the primary security
+#   boundary — it is a second layer that restricts which pods can even
+#   reach the peer port.
+# - Browser auth: single-administrator password authentication (Milestone 6).
+#
+# This NetworkPolicy:
+# 1. Allows ingress to the web port (8080) ONLY from the Cilium Gateway
+#    namespace (the Gateway data-plane pods) and from a specific CIDR
+#    (additionalIngressCIDRs, e.g. the MetalLB pool or LAN range) if
+#    configured. There is NO 0.0.0.0/0 allowance — the web port is not
+#    exposed to the entire cluster.
+# 2. Allows ingress to the peer port (8443) ONLY from other GossipGrid pods
+#    (same namespace, same StatefulSet label). This prevents non-GossipGrid
+#    pods from attempting mTLS handshakes against the peer listener.
+# 3. Allows egress to DNS (kube-system:53), to the web Service ClusterIP
+#    (for in-cluster service-to-service traffic from other pods to the web
+#    Service), and to the peer port of other GossipGrid pods (for gossip and
+#    anti-entropy).
+#
+# NOTE: This is a standard Kubernetes NetworkPolicy (networking.k8s.io/v1).
+# Cilium implements the standard API; if the cluster uses Cilium's extended
+# NetworkPolicy (cilium.io/v2) for L7 rules, this standard policy is
+# compatible.
+#
+# IMPORTANT: For kubectl port-forward, kubectl proxy, or in-cluster service
+# traffic from non-GossipGrid pods, set additionalIngressCIDRs to the
+# specific CIDR(s) that need access (e.g. the MetalLB pool, the node CIDR,
+# or a specific service CIDR range). Do NOT use 0.0.0.0/0 — that defeats the
+# purpose of the NetworkPolicy.
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gossipgrid-peer-and-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: network
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gossipgrid
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: peer
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # 1. Web port: from the Cilium Gateway namespace (Gateway data-plane pods).
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.webPort }}
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.gatewayNamespace }}
+    # 1b. Web port: from a specific CIDR (e.g. the MetalLB pool or LAN range),
+    #     if configured. This is the ONLY non-Gateway, non-GossipGrid ingress
+    #     to the web port. Do NOT use 0.0.0.0/0 — restrict to the exact CIDR
+    #     that needs access (e.g. the MetalLB pool, the node CIDR, or a
+    #     specific service CIDR range).
+    {{- range .Values.networkPolicy.additionalIngressCIDRs }}
+    - ports:
+        - protocol: TCP
+          port: {{ $.Values.webPort }}
+      from:
+        - ipBlock:
+            cidr: {{ . }}
+    {{- end }}
+    # 2. Peer port: ONLY from other GossipGrid pods (same namespace, same
+    #     StatefulSet label). This is the peer mTLS traffic — the identity
+    #     check is the primary security boundary; this NetworkPolicy is a
+    #     second layer.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.peerPort }}
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gossipgrid
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: peer
+  egress:
+    # DNS: allow egress to the cluster DNS (kube-system:53) for peer discovery.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Peer port: allow egress to the peer port of other GossipGrid pods.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gossipgrid
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: peer
+      ports:
+        - protocol: TCP
+          port: {{ .Values.peerPort }}
+    # Web Service ClusterIP: allow egress to the web Service (for in-cluster
+    # service-to-service traffic from non-GossipGrid pods that access the
+    # web Service via its ClusterIP). The web Service's ClusterIP is in the
+    # service CIDR range; this rule is a best-effort allowance. For
+    # production, restrict to the specific service CIDR or use a separate
+    # NetworkPolicy for the web Service.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: gossipgrid
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: web
+      ports:
+        - protocol: TCP
+          port: {{ .Values.webPort }}
+{{- end }}

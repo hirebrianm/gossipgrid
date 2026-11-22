@@ -1,0 +1,90 @@
+# Staging Helm values for GossipGrid (Milestone 7A).
+#
+# This file is a VALID, self-contained set of values that Argo CD applies via
+# `helm.valueFiles` (see deploy/argocd/application.yaml). It lives IN the chart
+# directory (next to values.yaml) so the Argo CD Application can reference it
+# by a path relative to the chart root — no manual copy into a separate
+# location is required, and the reference is resolvable before any manual step.
+#
+# Why this is a single-source (in-chart) layout rather than a multi-source
+# (GitOps repo) one:
+#
+#   - Argo CD 2.6+ supports a second `source` (referenced in valueFiles with the
+#     `$values/...` prefix) that holds the per-environment overrides, including
+#     the immutable image digest a GitLab CI job commits after each publish. That
+#     multi-source layout is the intended Milestone 8 delivery design.
+#   - This repository does NOT pin an Argo CD version. If the cluster's Argo CD
+#     predates 2.6, a second source is not supported and the Application would
+#     fail to render. To stay valid for any Argo CD version the cluster runs,
+#     7A uses a self-contained single source: all overrides live in THIS file.
+#   - The 7A image is a placeholder (registry.gitlab.example.internal / dev) and
+#     7A is a one-off, manually-applied staging test (not an automated M8 digest
+#     pipeline). The immutable-by-digest image recording and the GitOps
+#     multi-source promotion/rollback boundary are Milestone 8 deliverables.
+#
+# To move to the M8 multi-source design: remove `helm.valueFiles` here (or keep
+# only the chart defaults), add a second source in application.yaml pointing at
+# the GitOps repository's values file, and reference that file as
+# `$values/values-gitops.yaml`. The values in this file become the per-environment
+# overrides in the GitOps repo.
+#
+# Do NOT put secrets in this file (the admin password, the workload CA trust
+# bundle contents, or any credential material). The credential file is delivered
+# via Vault KV v2 (apps mount) -> VSO -> Kubernetes Secret -> mounted volume; the
+# trust bundle is a cluster-owned K8s Secret.
+
+# -- Cluster / network.
+namespace: gossipgrid
+clusterDomain: cluster.local
+# Adjust to the actual public FQDN the browser reaches via the Cilium
+# Gateway. The internal CA must have issued a certificate for this name.
+# (This must match gateway.hostname below.)
+publicFQDN: gossipgrid.example.internal
+
+# -- Image.
+#
+# Use an immutable image reference (commit SHA or digest). Never `latest`.
+# In 7A this is a placeholder for the manual staging test. In M8 the digest is
+# recorded in the GitOps values file by a GitLab CI job and Argo CD reconciles
+# to it.
+image:
+  # Adjust to the actual registry path.
+  repository: registry.gitlab.example.internal/gossipgrid
+  # Set to the immutable tag (commit SHA) or leave empty and set `digest`.
+  # In 7A the manual staging deployment sets this to the published tag.
+  tag: dev
+  # Optional: pin by digest (e.g. sha256:abc...). When set, overrides tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# -- Replicas and StatefulSet.
+replicas: 5
+podManagementPolicy: Parallel
+discovery:
+  expectedReplicas: 5
+
+# -- Gateway.
+gateway:
+  # The hostname the Gateway serves (must match publicFQDN above).
+  hostname: gossipgrid.example.internal
+  # The GatewayClass name (must match the existing Cilium GatewayClass in the
+  # cluster; NOT created by this chart). Adjust per-cluster.
+  gatewayClassName: cilium
+  lbType: LoadBalancer
+  # Set per-cluster (MetalLB pool, L2 announcement settings, etc.).
+  lbAnnotations: {}
+
+# -- NetworkPolicy.
+networkPolicy:
+  # Adjust to the namespace where the Cilium Gateway data-plane pods run.
+  gatewayNamespace: kube-system
+  # Set a specific CIDR if a non-Gateway, non-GossipGrid source needs access
+  # to the web port (e.g. the MetalLB pool or node CIDR). Do NOT use
+  # 0.0.0.0/0 — that defeats the purpose of the NetworkPolicy.
+  additionalIngressCIDRs: []
+
+# -- Lifecycle (Milestone 7A: disabled).
+lifecycle:
+  enabled: false
+
+# -- Everything else uses the chart defaults (see values.yaml).

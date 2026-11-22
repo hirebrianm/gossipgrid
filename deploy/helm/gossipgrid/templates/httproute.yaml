@@ -1,0 +1,39 @@
+# HTTPRoute: routes browser traffic (HTTPS, terminated at the Gateway) to
+# the GossipGrid web Service (plain HTTP on port 8080).
+#
+# The Gateway handles TLS termination; the upstream Service is plain HTTP.
+# The peer mTLS port (8443) is NOT exposed through the Gateway — peer
+# traffic flows directly between pods via the headless Service, not
+# through the Gateway.
+#
+# Only the web path (/) is routed; the peer endpoints (/internal/*) are
+# not registered on the public router and are reachable only via the peer
+# mTLS listener (a separate trust domain).
+{{- if .Values.gateway.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ .Values.gateway.name }}-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.name }}
+      namespace: {{ .Release.Namespace }}
+  hostnames:
+    - {{ .Values.gateway.hostname }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ .Values.webServiceName }}
+          port: {{ .Values.webPort }}
+{{- end }}

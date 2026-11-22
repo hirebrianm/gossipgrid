@@ -1,0 +1,36 @@
+# Public ClusterIP web Service: routes browser traffic (via the Cilium
+# Gateway) to ready pods only. Unready pods are NOT exposed here, so a
+# browser refresh never lands on a pod that is still starting up or
+# recovering.
+#
+# The web port is plain HTTP (8080); the Cilium Gateway terminates HTTPS
+# in front of this Service. The "Secure" cookie flag (GOSSIPGRID_AUTH_COOKIE_SECURE)
+# is set to true because the browser only ever sees the app over HTTPS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.webServiceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: web
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: web
+      port: {{ .Values.webPort }}
+      targetPort: web
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: peer
+    # The same pods serve both web and peer; the component label is "peer"
+    # because the StatefulSet template labels all pods as "peer" (the
+    # component that runs both listeners). This Service selects the same
+    # pods but only exposes the web port.
+  # No publishNotReadyAddresses: only ready pods are exposed.

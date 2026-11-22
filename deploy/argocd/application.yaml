@@ -1,0 +1,82 @@
+# Argo CD Application for GossipGrid (Milestone 7A).
+#
+# This manifest is intended to be placed in the GitOps repository (the
+# separate repository that Argo CD watches), NOT in this application source
+# repository. It references the Helm chart (in this repo) by repository URL
+# and path.
+#
+# Values strategy (self-contained single source):
+#
+# - All non-secret staging overrides live in `deploy/helm/gossipgrid/
+#   values-staging.yaml` — IN the chart directory, alongside values.yaml.
+#   The chart's values.yaml provides the defaults; values-staging.yaml
+#   overrides the staging-specific values (FQDN, namespace, cluster domain,
+#   GatewayClass, image placeholder).
+# - This file is referenced via `helm.valueFiles` by a path relative to the
+#   chart root (`values-staging.yaml`). Because it lives in the chart
+#   directory, the reference resolves with NO manual copy and is valid for
+#   any Argo CD version (no second source is used).
+# - The immutable image reference (commit SHA or digest) is set in
+#   values-staging.yaml for the 7A manual staging test. In Milestone 8, when
+#   the cluster's Argo CD is confirmed to be 2.6+, the design moves to a
+#   multi-source layout: a second source points at the GitOps repository's
+#   values file (which a GitLab CI job updates with the digest after each
+#   publish) and is referenced as `$values/values-gitops.yaml`. See the
+#   comment in values-staging.yaml for the exact migration steps.
+#
+# Ownership boundary:
+# - GitLab CI builds and publishes the immutable image; it does NOT deploy
+#   to the cluster.
+# - Argo CD owns deployment reconciliation: it watches the GitOps repository
+#   and syncs the cluster to the recorded desired state.
+# - Do NOT run `helm upgrade` directly against these resources — that would
+#   create a competing deployment controller.
+#
+# Adjust the following before applying:
+# - source.repoURL: the URL of THIS application source repository (where the
+#   Helm chart lives).
+# - source.path: the path to the Helm chart in this repo
+#   (deploy/helm/gossipgrid).
+# - syncPolicy: set to your cluster's Argo CD convention.
+# - dest.namespace: the target namespace (gossipgrid by default).
+# - helm.valueFiles[0]: "values-staging.yaml" — a path relative to the chart
+#   root. It resolves to deploy/helm/gossipgrid/values-staging.yaml, which
+#   exists in this repository (no manual copy required).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gossipgrid
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/component: gitops
+spec:
+  project: default
+  source:
+    repoURL: https://gitlab.example.internal/gossipgrid.git
+    path: deploy/helm/gossipgrid
+    targetRevision: main
+    helm:
+      releaseName: gossipgrid
+      # A single source: the values file is referenced by a path relative to
+      # the chart root. values-staging.yaml lives in the chart directory, so
+      # this reference is resolvable before any manual step and is valid for
+      # any Argo CD version (no Argo CD 2.6+ second source is required).
+      valueFiles:
+        - values-staging.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gossipgrid
+  syncPolicy:
+    # For a staging lab, auto-sync is acceptable. For production, use manual
+    # sync with a promotion gate.
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+  info:
+    - name: milestone
+      value: "7A (lifecycle enforcement disabled; see docs/kubernetes-deployment.md)"
+    - name: image
+      value: "Set in values-staging.yaml (7A: manual staging tag; M8: immutable digest via GitOps values file)"

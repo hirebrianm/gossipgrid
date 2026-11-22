@@ -1,0 +1,25 @@
+apiVersion: v2
+name: gossipgrid
+description: >-
+  GossipGrid is a Kubernetes distributed systems testbed — a Go-based
+  multi-replica service with gossip replication, anti-entropy, peer mTLS,
+  and browser password authentication. Milestone 7A: initial Kubernetes
+  staging with lifecycle enforcement disabled (Milestones 5B/5C not yet
+  implemented).
+type: application
+version: 0.1.0
+appVersion: "0.1.0-alpha.5"
+kubeVersion: ">=1.25.0-0"
+icon: ""
+maintainers:
+  - name: GossipGrid contributors
+keywords:
+  - gossip
+  - distributed-systems
+  - statefulset
+  - mtls
+  - anti-entropy
+  - kubernetes-testbed
+annotations:
+  category: infrastructure
+  milestone: "7A"

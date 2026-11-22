@@ -122,22 +122,36 @@ the **procedures** for safe bootstrap and recovery, which are reserved for Miles
 
 The `internal/lifecycle` package implements the state machine defined below. It is **opt-in** via
 `GOSSIPGRID_LIFECYCLE_ENABLED=true` (requires `GOSSIPGRID_PEER_TLS_ENABLED=true`). When disabled (the default), all
-existing Milestone 4 behavior is preserved.
+existing Milestone 4 behavior is preserved. The [SVG](diagrams/generated/lifecycle-5a.svg) and
+[PNG](diagrams/generated/lifecycle-5a.png) links are fallbacks.
 
+<!-- DIAGRAM:lifecycle-5a -->
 ```mermaid
 stateDiagram-v2
   [*] --> STARTING
   STARTING --> DISCOVERING: SQLite + credentials initialized
+  STARTING --> RECOVERY_REQUIRED: no safe path
   DISCOVERING --> SYNCING: eligible peer found
   DISCOVERING --> GENESIS: authorized initial cluster creation
-  DISCOVERING --> READY: metadata available; no local binding; cluster initialized
+  DISCOVERING --> READY: metadata available, no local binding, cluster initialized
   DISCOVERING --> RECOVERY_REQUIRED: known cluster, no safe sync source
   GENESIS --> READY: authorized epoch established (operator action, 5B)
+  GENESIS --> RECOVERY_REQUIRED: authorization lost
   SYNCING --> READY: snapshot ingested + initial catch-up
   SYNCING --> DISCOVERING: source unavailable
-  RECOVERY_REQUIRED --> DISCOVERING: peer recovers / epoch changes
+  SYNCING --> RECOVERY_REQUIRED: authority lost
   READY --> DEGRADED: peer partition / sync failure
+  READY --> RECOVERY_REQUIRED: epoch mismatch (fenced, data preserved)
   DEGRADED --> READY: reconciliation recovers
+  DEGRADED --> RECOVERY_REQUIRED: authority lost
+  RECOVERY_REQUIRED --> DISCOVERING: peer recovers / epoch changes
+  note right of READY
+      READY and DEGRADED return 200 from /readyz.
+      RECOVERY_REQUIRED returns 503.
+      The 5C operator recovery procedure
+      returns RECOVERY_REQUIRED to DISCOVERING.
+      Existing data is preserved.
+  end note
 ```
 
 **Transition table** (all other transitions are rejected with `ErrInvalidTransition`):

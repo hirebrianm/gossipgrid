@@ -1,0 +1,360 @@
+# GossipGrid Helm values — Milestone 7A (initial Kubernetes staging).
+#
+# Lifecycle enforcement is intentionally DISABLED in 7A (GOSSIPGRID_LIFECYCLE_ENABLED=false,
+# the default) because Milestones 5B (Kubernetes metadata provider) and 5C (operator recovery
+# procedure) are not yet implemented. The staging phase therefore has reduced safety
+# guarantees: a pod replacement loses its local SQLite data and is re-reconciled by
+# anti-entropy (best-effort, not an authoritative-snapshot guarantee). See
+# docs/kubernetes-deployment.md for the 7A vs 7B scope split.
+#
+# This chart deploys only GossipGrid workload resources. It does NOT install or configure
+# cluster-wide prerequisites (Cilium, cert-manager, Vault, Vault Secrets Operator, MetalLB,
+# Argo CD, cluster DNS) — those are owned by the cluster operations track. See the
+# "Ownership boundaries" section of docs/kubernetes-deployment.md.
+#
+# Secrets (the admin credential file and the workload CA trust bundle) are never stored in
+# Git and are never delivered through environment variables. The VSO-created Kubernetes
+# Secret is mounted as a full volume (no subPath) so the kubelet can atomically swap in
+# updated files on rotation.
+
+# -- Cluster / network defaults.
+#
+# The cluster DNS domain is not hard-coded: set `clusterDomain` if it differs from
+# `cluster.local` (the Kubernetes default). The peer identity suffix and the DNS
+# discovery name are derived from `namespace` and `clusterDomain` below.
+namespace: gossipgrid
+clusterDomain: cluster.local
+# The public FQDN the browser reaches via the Cilium Gateway (HTTPS termination).
+# This is the DNS name the browser must trust (the internal CA must have issued a
+# certificate for it). It is operator-configured, not derived.
+publicFQDN: gossipgrid.example.internal
+
+# -- StatefulSet configuration.
+replicas: 5
+podManagementPolicy: Parallel
+serviceName: gossipgrid
+# Name of the headless peer Service (also used as the DNS discovery base name).
+peerServiceName: gossipgrid-headless
+# Name of the public ClusterIP web Service.
+webServiceName: gossipgrid-web
+
+# -- Image.
+#
+# Use an immutable image reference (commit SHA or digest). Never `latest`.
+# The default below is a placeholder; set `image.repository` and `image.tag` to
+# the actual registry path and immutable tag/digest for the staging deployment.
+# Milestone 8 automation will record the digest in the GitOps repository and
+# Argo CD will reconcile to it.
+image:
+  repository: registry.gitlab.example.internal/gossipgrid
+  tag: dev
+  # Optional: pin by digest (e.g. sha256:abc...). When set, overrides tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# -- Ports.
+#
+# The public web listener (HTTP, behind the Gateway's HTTPS termination) and the
+# private peer listener (HTTPS, TLS 1.3 mTLS) are on separate ports. The peer
+# port must be named `peer` in the headless Service for DNS SRV discovery.
+webPort: 8080
+peerPort: 8443
+# The named port in SRV records for DNS discovery (the headless Service port name).
+peerSRVServiceName: peer
+
+# -- Resources.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# -- Security.
+#
+# The container runs as the non-root user 65534:65534 (the `nobody` UID/GID baked
+# into the static scratch image). Read-only root filesystem is enabled; writable
+# volumes are provided for /data (SQLite) and the mounted read-only credential
+# and certificate paths.
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+# -- Probes.
+#
+# Liveness: the HTTP event loop is alive. A peer outage must NOT trigger a
+# liveness restart (the liveness probe only checks /healthz, which always returns
+# 200 regardless of peer state).
+# Readiness: local storage usable and (when lifecycle is enabled) initial
+# synchronization complete. In 7A (lifecycle disabled) /readyz returns 200 once
+# the listeners are up.
+# Startup: accommodates time for CSI certificate issuance and credential load
+# before the liveness probe begins firing.
+probes:
+  startup:
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 30
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# -- Rollout and termination.
+terminationGracePeriodSeconds: 30
+# For a StatefulSet with Parallel pod management, the default rolling update
+# strategy is sufficient; the update strategy type is set below in the template.
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    partition: 0
+# Maximum number of pods that can be unavailable during a voluntary disruption.
+# For a 5-replica testbed, allowing all 5 to be unavailable during a node drain
+# is acceptable (no data survives pod replacement in 7A — emptyDir). Set to
+# 0 to prevent voluntary disruption until the workload is explicitly drained.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 0
+
+# -- Log level (debug, info, warn, error).
+logLevel: info
+
+# -- Graceful shutdown timeout (Go duration string).
+shutdownTimeout: 10s
+
+# -- Peer mTLS.
+#
+# Per-pod identity: each pod's certificate SAN is
+#   <statefulset-name>-<ordinal>.<peerIdentitySuffix>
+# e.g. gossipgrid-0.gossipgrid-headless.<namespace>.svc.<clusterDomain>
+# The suffix is derived from namespace and clusterDomain; set it explicitly only
+# if the cluster DNS domain differs or you want a non-default Service name.
+peerTLS:
+  enabled: true
+  # Explicitly set this only if you want a non-derived suffix. When empty, the
+  # chart derives it as "gossipgrid-headless.<namespace>.svc.<clusterDomain>".
+  identitySuffix: ""
+  # Polling interval for certificate and trust-bundle reload.
+  reloadInterval: 2s
+  # The Kubernetes Secret holding the workload CA trust bundle. This is a
+  # cluster-owned resource (owned by the cluster operations track /
+  # trust-manager), NOT created by this chart. The Secret must exist in the
+  # target namespace before the pods start; a missing Secret causes the pods
+  # to fail at startup (fail-closed).
+  trustBundleSecretName: gossipgrid-workload-ca-bundle
+  # The key name inside the trust bundle Secret that holds the CA bundle PEM.
+  # The Secret is mounted as a full volume (no subPath) at trustBundleMountPath;
+  # the bundle file appears at <trustBundleMountPath>/<secretKey> (e.g.
+  # /certs-ca/ca-bundle.pem), matching GOSSIPGRID_PEER_TRUST_BUNDLE_FILE.
+  # A full-volume mount (no subPath) is required so the kubelet can atomically
+  # swap in an updated bundle on CA rotation without a pod restart.
+  trustBundleSecretKey: ca-bundle.pem
+  # The volumeMount path for the trust bundle Secret volume (a directory).
+  # The bundle file appears inside it at <trustBundleMountPath>/<secretKey>.
+  # This is a SEPARATE path from the per-pod cert/key mount (/certs) to avoid
+  # a Kubernetes conflict (a full-volume mount and a CSI mount cannot share
+  # the same parent path).
+  trustBundleMountPath: /certs-ca
+  # The volumeMount paths for the per-pod certificate and key (mounted by the
+  # cert-manager CSI driver volumeSource). These are relative to the /certs
+  # mount point (the CSI driver creates the files at the volume root, and the
+  # volume is mounted at /certs).
+  certMountPath: /certs/tls.crt
+  keyMountPath: /certs/tls.key
+  # The directory the CSI driver mounts the per-pod cert/key into.
+  peerCertsMountPath: /certs
+  # NOTE: this chart does NOT render a peer mTLS Certificate resource and
+  # does NOT reference a peer Certificate in the StatefulSet. The cert-manager
+  # CSI driver issues a unique per-pod certificate directly from the Issuer
+  # (below) based on the StatefulSet's CSI volumeAttributes — no intermediate
+  # Certificate or Kubernetes Secret is needed. This value is intentionally
+  # unused and is kept only for clarity; do not expect a Certificate resource
+  # to be created from it.
+  certManagerIssuerName: vault-workload
+  # If the Issuer is a ClusterIssuer (namespace-scoped name with cluster-wide
+  # reach), set this to the ClusterIssuer name. If the Issuer is namespaced,
+  # set issuerName instead (leave clusterIssuerName empty).
+  certManagerClusterIssuerName: ""
+
+# -- DNS peer discovery.
+discovery:
+  mode: dns
+  # The headless Service DNS name. When empty, derived as
+  # "<peerServiceName>.<namespace>.svc.<clusterDomain>".
+  dnsName: ""
+  # Named port in SRV records (must match the headless Service port name).
+  srvService: peer
+  # DNS refresh period.
+  interval: 10s
+  # Per-lookup DNS timeout.
+  timeout: 3s
+  # Configured cluster size (must equal `replicas`).
+  expectedReplicas: 5
+  # StatefulSet name (used for deriving expected replica identities).
+  statefulSetName: gossipgrid
+
+# -- Peer message exchange (Milestone 4A).
+# When enabled, the private peer listener registers POST /internal/messages.
+# Requires peer mTLS.
+peerMessageExchange:
+  enabled: true
+
+# -- Epidemic gossip (Milestone 4B).
+gossip:
+  enabled: true
+  fanout: 2
+  rounds: 3
+  workers: 4
+  queueCapacity: 256
+  maxAttempts: 3
+  retryBase: 250ms
+  retryMax: 5s
+
+# -- Anti-entropy (Milestone 4C).
+antiEntropy:
+  enabled: true
+  interval: 30s
+  pageSize: 128
+  fetchBatchSize: 8
+  maxPagesPerPeer: 4
+  workers: 2
+  requestTimeout: 5s
+
+# -- Lifecycle (Milestone 5A).
+#
+# Milestone 7A runs with lifecycle enforcement DISABLED (the default) because
+# 5B (Kubernetes metadata provider) and 5C (operator recovery) are not yet
+# implemented. Do NOT enable this in 7A — a replica with lifecycle enabled but
+# no production metadata source will fail closed (RECOVERY_REQUIRED) and cannot
+# automatically return to READY.
+lifecycle:
+  enabled: false
+
+# -- Browser authentication (Milestone 6).
+#
+# Authentication is enabled by default (fail-closed). The credential file is
+# delivered via Vault KV v2 -> VSO -> Kubernetes Secret -> mounted volume.
+# The plaintext password is never stored in Git, in environment variables, or
+# in the Kubernetes Secret's annotation metadata — only the versioned credential
+# record (algorithm, version, PBKDF2 params, salt, verifier, generation,
+# signing key) is in the Secret.
+auth:
+  enabled: true
+  # Insecure, local-development-only opt-out. NEVER set this in a
+  # network-reachable or production deployment. In 7A it must be false.
+  insecureDevMode: false
+  # Path to the mounted credential file (inside the pod).
+  credentialFile: /credentials/admin
+  # Poll interval for credential reload.
+  reloadInterval: 2s
+  # Maximum age of the last successfully loaded credential before 503.
+  maxStale: 5m
+  # Session lifetime and idle timeout.
+  sessionTTL: 24h
+  sessionIdleTTL: 30m
+  # Secure cookie flag (true because the browser only ever sees the app over
+  # HTTPS via the Cilium Gateway).
+  cookieSecure: true
+  # The VSO-created Kubernetes Secret name. This is a cluster-owned resource
+  # (owned by the Vault Secrets Operator), NOT created by this chart. The
+  # Secret must exist in the target namespace before the pods start; a missing
+  # Secret causes authenticated requests to return 503 (fail-closed) until the
+  # Secret is provisioned.
+  secretName: gossipgrid-auth
+  # The key name inside the Secret that holds the credential file.
+  # VSO by default projects each Vault KV v2 data key as a Secret key with the
+  # same name. The credential file is a single JSON document; the Vault KV v2
+  # secret (gossipgrid/admin) has one data key — conventionally "admin" —
+  # whose value is the JSON credential file.
+  secretKey: admin
+  # The volumeMount path for the credential Secret volume. The Secret is
+  # mounted as a full volume (no subPath) at this directory; the credential
+  # file appears inside it at <mountPath>/<secretKey> (e.g. /credentials/admin).
+  # The credentialFile above must equal this path + "/" + secretKey.
+  mountPath: /credentials
+
+# -- Gateway (Cilium Gateway API).
+#
+# The Gateway and HTTPRoute are rendered by this chart when `gateway.enabled`
+# is true. The Gateway references the existing cluster-wide Cilium Gateway
+# class (owner: cluster operations track). The browser TLS certificate
+# (cert-manager Certificate -> TLS Secret) is cluster-owned; this chart only
+# references the Secret name in the HTTPRoute's TLS config.
+gateway:
+  enabled: true
+  # The Gateway API class name (must match the existing Cilium GatewayClass in
+  # the cluster; NOT created by this chart).
+  gatewayClassName: cilium
+  # The Gateway resource name.
+  name: gossipgrid-gateway
+  # The TLS Secret name holding the browser certificate (cert-manager managed;
+  # cluster-owned; NOT created by this chart).
+  tlsSecretName: gossipgrid-browser-tls
+  # The cert-manager Certificate name for the browser TLS (cluster-owned; NOT
+  # created by this chart).
+  browserCertificateName: gossipgrid-browser
+  # The Issuer (or ClusterIssuer) for the browser certificate.
+  browserIssuerName: vault-browser
+  browserClusterIssuerName: ""
+  # The hostname the Gateway serves (must match `publicFQDN`).
+  hostname: gossipgrid.example.internal
+  # The LoadBalancer type (Cilium can provision a LoadBalancer IP via MetalLB
+  # or L2 announcements). For a LAN-reachable staging lab, LoadBalancer is
+  # appropriate. Set to "ClusterIP" to restrict access to in-cluster only.
+  lbType: LoadBalancer
+  # Annotations for the LoadBalancer (e.g. MetalLB pool, L2 announcement
+  # settings). Empty by default; set per-cluster as needed.
+  lbAnnotations: {}
+
+# -- NetworkPolicy.
+#
+# Restricts peer mTLS traffic to GossipGrid pods only, and allows ingress to
+# the web port only from the Cilium Gateway pods. This is a defense-in-depth
+# measure; the peer mTLS identity check is the primary security boundary.
+networkPolicy:
+  enabled: true
+  # Allow ingress to the web port from the Cilium Gateway namespace (the
+  # namespace where the Cilium Gateway data-plane pods run). Adjust to the
+  # actual namespace where the Cilium Gateway pods run in your cluster.
+  gatewayNamespace: kube-system
+  # Allow ingress to the web port from a specific CIDR (e.g. the MetalLB
+  # pool, the node CIDR, or the LAN range). Set only if a specific
+  # non-Gateway, non-GossipGrid source needs access to the web port.
+  # Do NOT use 0.0.0.0/0 — that defeats the purpose of the NetworkPolicy.
+  # Empty by default (only Gateway and GossipGrid pods can reach the web port).
+  additionalIngressCIDRs: []
+
+# -- ServiceAccount.
+#
+# The GossipGrid pods do not need to call the Kubernetes API in 7A (no
+# ConfigMap watch, no metadata provider). A minimal ServiceAccount with no
+# RBAC is provided for identity and for future 5B RBAC.
+serviceAccount:
+  name: gossipgrid
+  annotations: {}
+
+# -- Additional labels/annotations applied to all GossipGrid resources.
+podLabels: {}
+podAnnotations: {}
+statefulSetAnnotations: {}
+
+# -- Tolerations / node affinity (empty by default; set per-cluster as needed).
+affinity: {}
+tolerations: []

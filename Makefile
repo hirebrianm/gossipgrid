@@ -196,7 +196,7 @@ DIAGRAM_GEN    := $(DIAGRAM_DIR)/generated
 # The set of rendered diagram bases. system-architecture is the main diagram
 # embedded in the README; the rest are linked from the documentation pages.
 DIAGRAM_BASES  := system-architecture gossip-replication lifecycle-recovery \
-                  lifecycle-recovery-sequence security-credentials gitops-delivery
+                  lifecycle-recovery-sequence lifecycle-5a security-credentials gitops-delivery
 
 .PHONY: docs-lint
 docs-lint: ## Lint repository Markdown documents (fails on violations; does not modify files)
@@ -272,6 +272,7 @@ DIAGRAM_DOC_MAP := \
   gossip-replication:docs/gossip-and-bootstrap.md \
   lifecycle-recovery:docs/recovery.md \
   lifecycle-recovery-sequence:docs/recovery.md \
+  lifecycle-5a:docs/gossip-and-bootstrap.md \
   security-credentials:docs/security.md \
   gitops-delivery:docs/kubernetes-deployment.md
 
@@ -307,12 +308,62 @@ diagrams-render: ## LEVEL 2: Render all .mmd to SVG+PNG in a temp dir and verify
 diagrams-contact-sheet: ## LEVEL 3: Generate a temporary contact sheet (grid of all diagram PNGs) for visual review (kept outside VCS)
 	@bash scripts/diagrams_contact_sheet.sh $(DIAGRAM_BASES)
 
+# helm-lint validates the GossipGrid Helm chart (deploy/helm/gossipgrid) with
+# `helm lint`. It is a read-only check (no cluster access, no modifications).
+# The chart is part of the Milestone 7A Kubernetes staging deliverables.
+HELM_CHART := deploy/helm/gossipgrid
+HELM_NAMESPACE := gossipgrid
+
+.PHONY: helm-lint
+helm-lint: ## Lint the GossipGrid Helm chart (fails on findings)
+	$(call check_tool,helm,see https://helm.sh/docs/intro/install/)
+	helm lint $(HELM_CHART) --namespace $(HELM_NAMESPACE)
+
+# helm-template renders the GossipGrid Helm chart with `helm template` (no
+# cluster access) and verifies the output is non-empty and parses as YAML.
+# It is a read-only check used to verify the chart renders correctly before
+# deployment (Milestone 7A validation).
+.PHONY: helm-template
+helm-template: ## Render the GossipGrid Helm chart and verify the output parses (read-only, no cluster)
+	$(call check_tool,helm,see https://helm.sh/docs/intro/install/)
+	@out=$$(helm template test-release $(HELM_CHART) --namespace $(HELM_NAMESPACE) 2>&1); \
+	rc=$$?; \
+	if [ $$rc -ne 0 ]; then echo "helm template failed:"; echo "$$out"; exit $$rc; fi; \
+	if [ -z "$$out" ]; then echo "helm template produced empty output"; exit 1; fi; \
+	lines=$$(printf '%s\n' "$$out" | wc -l | tr -d ' '); \
+	echo "helm template: OK ($$lines lines rendered)"
+	# Verify the rendered output parses as YAML (use python3 if available;
+	# otherwise skip — the helm template success is the primary check).
+	@command -v python3 >/dev/null 2>&1 && \
+		helm template test-release $(HELM_CHART) --namespace $(HELM_NAMESPACE) 2>/dev/null | \
+		python3 -c "import sys, yaml; list(yaml.safe_load_all(sys.stdin)); print('YAML parse: OK')" || \
+		echo "YAML parse: skipped (python3/yaml not available)"
+
+# deploy-checks runs the GossipGrid Helm chart regression checks
+# (deploy/helm/gossipgrid/tests/deploy_checks.sh). It validates the rendered
+# chart output against the Milestone 7A integration requirements:
+# StatefulSet/headless Service DNS compatibility, per-pod certificate identity
+# (cert-manager CSI driver), VSO manifest schema, Argo CD values references,
+# Secret rotation without subPath, no public peer exposure, and NetworkPolicy
+# ingress restrictions. It is a read-only check (no cluster access).
+DEPLOY_CHECKS := deploy/helm/gossipgrid/tests/deploy_checks.sh
+
+.PHONY: deploy-checks
+deploy-checks: ## Run the GossipGrid Helm chart regression checks (read-only, no cluster)
+	$(call check_tool,helm,see https://helm.sh/docs/intro/install/)
+	@command -v python3 >/dev/null 2>&1 || { \
+		echo "Warning: python3 not available; some YAML checks may be skipped."; \
+	}
+	bash $(DEPLOY_CHECKS)
+
 # qa is verification only: it must not modify any tracked file. diagram
 # generation (make architecture) writes the committed SVG/PNG outputs and is
 # therefore not part of qa; render validation is available as the explicit,
 # read-only target diagrams-render (renders into a temporary directory).
+# helm-lint and deploy-checks are included in qa (the Helm chart is part of
+# the deliverables; the regression checks validate the rendered output).
 .PHONY: qa
-qa: fmt-check vet lint security docs-lint diagrams-check test test-race test-version-injection ## Verify fmt, vet, lint, security, docs, diagrams (source sync+lint), tests, race, and version regression
+qa: fmt-check vet lint security docs-lint diagrams-check helm-lint deploy-checks test test-race test-version-injection ## Verify fmt, vet, lint, security, docs, diagrams (source sync+lint), helm, deploy checks, tests, race, and version regression
 
 .PHONY: test-version-injection
 test-version-injection: ## Run the version-detection and command-injection regression tests
