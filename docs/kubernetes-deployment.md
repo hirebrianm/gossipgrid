@@ -5,25 +5,40 @@ issuer, cert-manager, trust-manager, Cilium Gateway/LB configuration, DNS, GitLa
 separate cluster operations track.
 
 **Status:** This document describes the **target design** for the Kubernetes deployment (Milestones 7A and 7B)
-and the GitOps delivery pipeline (Milestone 8). None of these milestones are implemented yet. The Kubernetes
-objects described below are **designed but not implemented** — the Helm chart, manifests, and Argo CD application
-do not yet exist. The application code that will run in these pods (Milestones 0–5A) is **implemented and
-locally tested** but has not been deployed to Kubernetes.
+and the GitOps delivery pipeline (Milestone 8). Milestone 7A (initial Kubernetes staging) is **deployed and
+initially smoke-tested in Kubernetes**: the Helm chart (`deploy/helm/gossipgrid/`), Argo CD Application, Vault
+provisioning document (`deploy/vault/PROVISIONING.md`), and a 14-test staging runbook
+(`deploy/STAGING-RUNBOOK.md`) are committed (`v0.1.0-alpha.6`) and validated by `make qa` (helm-lint,
+deploy-checks). Five StatefulSet replicas are running and ready with zero restarts; peer mTLS, DNS discovery,
+browser HTTPS access through an existing shared Cilium Gateway, Vault-managed credentials, and the Go FIPS
+module are confirmed. The **remaining acceptance tests** (cross-replica convergence, recovery after pod
+replacement, live password rotation, fault tolerance) are pending. `deploy/argocd/application.yaml` is a
+reusable example; the actual staging Application is maintained in the separate `k8s-gitops` repository with
+environment-specific Helm values. The GossipGrid Helm chart sets `gateway.enabled=false`; the cluster uses an
+existing shared Cilium Gateway and GitOps-managed HTTPRoutes. Milestone 7B (lifecycle-aware staging) and Milestone 9
+(resilience/security lab) are **designed but not implemented**. Milestone 8 (GitOps delivery automation) is
+**partially implemented**: immutable image publishing and Argo CD digest-pinned reconciliation work; automated
+delivery and promotion are not complete. The application code that runs in the pods (Milestones 0–5A and 6) is
+**implemented and locally tested** and deployed in the staging cluster.
 
-## Kubernetes objects planned
+## Kubernetes objects (Milestone 7A — charted in the Helm chart)
 
-| Object | Function |
-| --- | --- |
-| StatefulSet | N replicas, stable names, `Parallel` startup, no PVC templates |
-| `emptyDir` | Pod-lifetime writable SQLite directory |
-| Headless Service | Direct peer addresses, named gossip port, publish not-ready pods |
-| ClusterIP Service | User-facing HTTP routing to ready pods |
-| Gateway / HTTPRoute | Browser HTTPS termination with Vault-issued cert |
-| cert-manager Certificate | Managed browser TLS Secret for Gateway |
-| cert-manager CSI volume | Unique short-lived mTLS certificate per pod |
-| ConfigMap | Non-secret cluster metadata/epoch and incident history reference |
-| ServiceAccount / Role / RoleBinding | Minimum metadata update permission only if app controls epochs |
-| NetworkPolicy | Later restriction of peer traffic and ingress |
+The table below lists the Kubernetes objects the GossipGrid Helm chart creates. The first nine rows are
+**deployed and verified** (Milestone 7A, `v0.1.0-alpha.6`); the ConfigMap and RBAC objects are **not charted**
+(they belong to Milestones 5B/5C and are intentionally absent from the 7A chart because the 7A pods do not
+call the Kubernetes API).
+
+| Object | Function | Status |
+| --- | --- | --- |
+| StatefulSet | 5 replicas, stable names, `Parallel` startup, no PVC templates | ✅ Deployed and verified |
+| `emptyDir` | Pod-lifetime writable SQLite directory | ✅ Deployed and verified |
+| Headless Service | Direct peer addresses, named gossip port, publish not-ready pods | ✅ Deployed and verified |
+| ClusterIP Service | User-facing HTTP routing to ready pods | ✅ Deployed and verified |
+| CiliumNetworkPolicy | Gateway reserved ingress identity (allows shared Gateway to reach web port) | ✅ Deployed and verified |
+| cert-manager CSI volume | Unique short-lived mTLS certificate per pod | ✅ Deployed and verified |
+| ConfigMap | Non-secret cluster metadata/epoch and incident history reference | 🔜 5B (not charted) |
+| ServiceAccount / Role / RoleBinding | Minimum metadata update permission only if app controls epochs | ✅ Deployed (SA only; RBAC in 5B) |
+| NetworkPolicy | Restriction of peer traffic and ingress | ✅ Deployed and verified |
 
 ## Ownership boundaries
 
@@ -41,20 +56,32 @@ resources; those are pre-existing prerequisites owned by the cluster operations 
 | **Argo CD** | Application deployment reconciliation (watches the GitOps repository, syncs the cluster to the recorded desired state) | GitLab CI, Helm templates, Vault, VSO |
 | **GitLab CI** | Build, test, publish (QA, container build, image publish by digest, GitOps revision commit) | Deployment to the cluster (that is Argo CD's job), Helm templates, Vault |
 
-The GossipGrid Helm chart creates **only** the resources in the "Kubernetes objects planned" table above. It
-does not install or configure Cilium, cert-manager, Vault, VSO, or the cluster DNS.
+The GossipGrid Helm chart creates **only** the charted resources in the "Kubernetes objects" table above
+(the StatefulSet, Services, Gateway, HTTPRoute, cert-manager Certificate, NetworkPolicy, PDB, and
+ServiceAccount). It does **not** install or configure Cilium, cert-manager, Vault, VSO, or the cluster
+DNS.
 
 ## Milestone 7A vs. 7B
 
-**Milestone 7A (initial Kubernetes staging)** validates the Kubernetes plumbing — DNS, peer mTLS, Gateway,
-VSO, cert-manager — plus existing gossip, anti-entropy, peer discovery, web authentication, and live password
-rotation, with **lifecycle enforcement disabled** (`GOSSIPGRID_LIFECYCLE_ENABLED=false`, the default).
+**Milestone 7A (initial Kubernetes staging)** validates the Kubernetes plumbing — DNS, peer mTLS, the shared
+Cilium Gateway, VSO, cert-manager — plus existing gossip, anti-entropy, peer discovery, and web authentication,
+with **lifecycle enforcement disabled** (`GOSSIPGRID_LIFECYCLE_ENABLED=false`, the default). The initial smoke
+tests are confirmed: five replicas running and ready with zero restarts, peer discovery, HTTPS access, browser
+login, Vault credentials, peer mTLS, and the Go FIPS module. The **remaining acceptance tests** (cross-replica
+convergence, recovery after pod replacement, live password rotation, fault tolerance) are pending.
 This means the staging phase has **reduced safety guarantees**: a pod replacement loses its local SQLite data
 and is re-reconciled by anti-entropy (a best-effort test, **not** an authoritative-snapshot guarantee). In
 7A there is no authoritative epoch fencing, no snapshot-source eligibility check, and no recovery lockout,
 and pod replacement is **not** validated as authoritative initial snapshot synchronization, safe genesis, or
 lifecycle readiness gating — those guarantees belong to 5B and 7B. The reduced guarantees are an intentional
 tradeoff to validate the Kubernetes infrastructure before enabling the lifecycle layer.
+
+**Deployment topology note:** The cluster uses an existing shared Cilium Gateway and GitOps-managed HTTPRoutes;
+the GossipGrid Helm chart sets `gateway.enabled=false`. The browser certificate is managed separately in the
+`gateway-system` namespace. The chart uses a CiliumNetworkPolicy for the Gateway's reserved ingress identity
+(`fromEntities: [ingress]`). The Argo CD Application for the staging deployment is maintained in the separate
+`k8s-gitops` repository with environment-specific Helm values; `deploy/argocd/application.yaml` in this
+repository is a reusable example.
 
 **Milestone 7B (lifecycle-aware Kubernetes staging)** enables lifecycle enforcement
 (`GOSSIPGRID_LIFECYCLE_ENABLED=true`) and exercises the full 5A/5B/5C protocol in-cluster: authoritative
@@ -75,10 +102,10 @@ the replacement-pod initialization and stale-epoch rejection flow is in
 
 ## Browser load balancing
 
-Target is **Cilium Gateway API** with a LAN-reachable LoadBalancer IP. Verify the local Cilium version, Gateway
-support, LB IPAM, and L2 announcements or an alternative advertisement mode. Do not assume Cilium deployment
-automatically enables these capabilities. The Gateway serves Vault-issued HTTPS; the upstream application listener is
-initially HTTP on `8080`.
+The staging deployment uses an **existing shared Cilium Gateway** (the GossipGrid chart sets
+`gateway.enabled=false`). HTTPRoutes are managed in the `k8s-gitops` repository. The browser certificate is
+managed separately in the `gateway-system` namespace. The Gateway serves HTTPS (the internal CA-issued
+certificate is confirmed in the cluster); the upstream application listener is plain HTTP on `8080`.
 
 A browser refresh can land on another ready replica. UI explicitly displays which replica responded, helping illustrate
 load balancing and replication lag. Session affinity is intentionally not required for v1.
@@ -89,13 +116,14 @@ load balancing and replication lag. Session affinity is intentionally not requir
 Never assume `cluster.local` if the cluster DNS domain differs. Headless DNS serves discovery; actual source
 validity is established by the private status API and mutual TLS, not by DNS results alone.
 
-## Browser credential provisioning (Milestone 6, deployed in 7A)
+## Browser credential provisioning (Milestone 6, deployed and verified in 7A)
 
 Milestone 6 (implemented) adds single-administrator password authentication for the public message API and the
-browser UI. It is **deployed in Milestone 7A** with the following credential-provisioning configuration. The
-code and the credential file format are implemented and tested locally; the Kubernetes objects below (Vault KV v2
-secret, VSO, the mounted Secret volume, and the env-var wiring) are **designed but not implemented** and will be
-added in 7A.
+browser UI. It is **deployed and verified in the staging cluster** (Milestone 7A) with the following
+credential-provisioning configuration. The code and the credential file format are implemented and tested
+locally; the Kubernetes objects below (Vault KV v2 secret, VSO, the mounted Secret volume, and the env-var
+wiring) are **deployed in the staging cluster** — Vault-managed credentials load successfully and browser
+login is confirmed.
 
 **Expected mounted credential format (the same file as local development).** The GossipGrid credential file is a
 single JSON document (format version 1, algorithm `PBKDF2-HMAC-SHA-256`) with hex-encoded binary fields:
@@ -127,7 +155,7 @@ plaintext password is never stored in this file.
 | `GOSSIPGRID_AUTH_CREDENTIAL_FILE` | Path to the mounted credential file | `/credentials/admin` |
 | `GOSSIPGRID_AUTH_RELOAD_INTERVAL` | Poll interval for credential reload | `2s` |
 | `GOSSIPGRID_AUTH_MAX_STALE` | Bounded stale-credential window before 503 | `5m` |
-| `GOSSIPGRID_AUTH_SESSION_TTL` | Absolute session lifetime | `24h` |
+| `GOSSIPGRID_AUTH_SESSION_TTL` | Absolute session lifetime (Go default is `2h`; Helm chart overrides to `24h`) | `24h` |
 | `GOSSIPGRID_AUTH_SESSION_IDLE_TTL` | Session idle timeout (must be ≤ session TTL) | `30m` |
 | `GOSSIPGRID_AUTH_COOKIE_SECURE` | Whether the session cookie is `Secure` | `true` |
 
@@ -176,41 +204,48 @@ the exact commands and the local-HTTPS/testing guidance.
   intended reset policy. Keep secrets out of source.
 - Implement manifests only after app behavior and local integration tests pass.
 
-## GitOps delivery (Milestone 8 — designed, not implemented)
+## GitOps delivery (Milestone 8 — partial: immutable image + Argo CD work; automation incomplete)
 
-The delivery pipeline uses GitOps: GitLab CI builds and publishes, a GitOps repository records the desired
-state, and Argo CD reconciles the cluster. CI does **not** deploy directly to the cluster. The full pipeline —
-commit/tag, CI QA and security checks, immutable image publication by digest, GitOps revision update, Argo CD
-reconciliation, and the promotion/rollback/validation boundary — is illustrated in
+The delivery pipeline uses GitOps: GitLab CI builds and publishes, the `k8s-gitops` repository records the
+desired state, and Argo CD reconciles the cluster. CI does **not** deploy directly to the cluster.
+In the staging cluster, an immutable image from the private GitLab registry is deployed through Argo CD with
+digest-pinned reconciliation. **Current state (partial):** the image was built manually with `make image` and
+pushed to the private GitLab Container Registry, identified by an immutable SHA256 digest. The GitOps
+Application in `k8s-gitops` was manually updated to reference that digest, and Argo CD reconciled the
+Kubernetes deployment. What remains: automated image publishing, automated GitOps revision updates, and the
+promotion/rollback procedure. The full pipeline — CI QA and security checks, immutable image publication by
+digest, GitOps revision update, Argo CD reconciliation, and the promotion/rollback/validation boundary — is
+illustrated in
 [gitops-delivery](diagrams/generated/gitops-delivery.svg) ([PNG](diagrams/generated/gitops-delivery.png)).
 
 ```text
-GitLab CI (build + test + publish)
+GitLab CI (QA + security checks)
     |
-    |  publishes immutable image by digest
+    |  (image build/publish is currently manual: make image + docker push)
     v
-Container registry
+Container registry (private GitLab) - immutable image by SHA256 digest
     |
-    |  records image digest in GitOps repository
+    |  (digest recorded manually in the GitOps repository today)
     v
 GitOps repository (Helm values / Argo CD application manifest)
     |
-    |  Argo CD watches and reconciles
+    |  Argo CD watches and reconciles (operational)
     v
 Kubernetes cluster
 ```
 
-- **GitLab CI** runs QA, builds the container, and pushes an immutable image tagged by commit SHA. The image
-  digest is recorded.
+- **GitLab CI** runs QA and security checks. Container image build and publish are currently **manual**
+  (`make image` followed by a push to the private GitLab Container Registry); automated CI-driven publishing
+  is not yet implemented.
 - **The GitOps repository** (a separate repository from the application source) contains the Helm values and
-  the Argo CD application manifest referencing the image digest. A GitLab CI job commits the new digest to
-  this repository.
+  the Argo CD application manifest referencing the image digest. The digest reference is currently updated
+  **manually**; a CI job that commits the new digest automatically is not yet implemented.
 - **Argo CD** watches the GitOps repository and reconciles the cluster to the recorded desired state. Argo CD
-  handles rollout, rollback, and failure recovery.
-- **Release promotion** is a tag push: `v0.1.0-alpha.N` triggers a full pipeline (QA, build, publish, GitOps
-  update). **Rollback** is a revert of the GitOps revision (Argo CD reconciles back to the previous digest).
-  **Failure handling** is observable: a failed Argo CD sync is visible in the Argo CD UI and in the GitOps
-  repository's commit history.
+  handles rollout, rollback, and failure recovery. This part is **operational** in the staging cluster.
+- **Release promotion** (target): a tag push triggers a full pipeline (QA, build, publish, GitOps update).
+  **Rollback** (target): a revert of the GitOps revision; Argo CD reconciles back to the previous digest.
+  **Failure handling**: a failed Argo CD sync is observable and reversible in the Argo CD UI and in the
+  GitOps repository's commit history.
 
 The full GitOps delivery pipeline — the ownership boundary between CI (build/publish only) and Argo CD
 (deployment reconciliation), the promotion/rollback/validation boundary, and the StatefulSet rollout — is
@@ -225,24 +260,32 @@ flowchart LR
   subgraph CILAB["GitLab CI (implemented)"]
     direction TB
     CI["QA + security checks (make qa: fmt, vet, golangci-lint, gosec, docs-lint, tests, race, version-injection)"]
-    IMG["Container image build (multistage static musl, scratch, non-root 65534)"]
-    PUBLISH["Publish immutable image by commit SHA / digest"]
+    IMG["Container image build (multistage static musl, scratch, non-root 65534) - currently manual: make image"]
+    PUBLISH["Publish immutable image by commit SHA / digest - currently manual push"]
     CI --> IMG --> PUBLISH
   end
 
-  subgraph M8["GitOps automation (M8, planned)"]
+  subgraph M8["GitOps delivery (M8, partial)"]
     direction TB
-    REG["Container registry - immutable image by digest"]
-    GOREPO["GitOps repository - Helm values + Argo CD application manifest (records the image digest)"]
-    ARGO["Argo CD - reconciles the cluster to the recorded revision"]
-    PUBLISH -->|publish by digest| REG
-    REG -->|CI job commits the digest| GOREPO
+    REG["Container registry - private GitLab, immutable image by SHA256 digest (operational)"]
+    GOREPO["GitOps repository - Helm values + Argo CD application manifest (digest updated manually today)"]
+    ARGO["Argo CD - reconciles the cluster to the recorded revision (operational)"]
+    PUBLISH -->|manual publish by digest| REG
+    REG -->|manual digest update| GOREPO
     GOREPO -->|watch and reconcile| ARGO
   end
 
   ARGO --> K8S["StatefulSet gossipgrid rollout (5 replicas, Parallel)"]
 
-  subgraph BOUND["Promotion / rollback / validation boundaries"]
+  subgraph PLANNED["Still planned (M8 automation)"]
+    direction TB
+    AUTO["Automated image publishing - CI commits digest to k8s-gitops"]
+    AUTOREV["Automated GitOps revision updates"]
+    PROMOTE["Automated promotion and delivery workflows"]
+    AUTO --- AUTOREV --- PROMOTE
+  end
+
+  subgraph BOUND["Promotion / rollback / validation boundaries (target)"]
     direction TB
     PROMO["Promotion = tag push: a full pipeline (QA, build, publish, GitOps update)"]
     ROLLBACK["Rollback = revert of the GitOps revision; Argo CD reconciles back to the previous digest"]
@@ -250,6 +293,7 @@ flowchart LR
     PROMO --- ROLLBACK --- VALIDATE
   end
   GOREPO -.-> BOUND
+  GOREPO -.-> PLANNED
 
   NOTE["Ownership boundary: GitLab CI builds and publishes only - it NEVER deploys directly to the cluster. Argo CD owns deployment reconciliation. No overlapping deployment ownership."]
   CI -.-> NOTE
@@ -258,16 +302,24 @@ flowchart LR
 
 ## Tests to demonstrate
 
-**Milestone 7A (lifecycle disabled, reduced safety guarantees):**
+**Milestone 7A (lifecycle disabled, reduced safety guarantees) — initial smoke tests confirmed, full acceptance
+tests pending:**
 
-1. Five pods gossip to convergence under normal operation.
-2. A pod replacement loses local SQLite and is re-reconciled by anti-entropy (a best-effort test; **not** an
-   authoritative initial-snapshot, safe-genesis, or readiness-gating guarantee — those are 5B/7B).
-3. A temporary partition causes missing/unreachable status, then heals via anti-entropy.
-4. Reload pod mTLS credentials as cert-manager rotates them.
-5. Gateway serves browser HTTPS with the trusted Vault CA certificate.
-6. Live password-rotation demonstration without pod restarts (VSO → mounted Secret → credential reload;
-   eventual, not instantaneous — the rotation window is measured, not assumed).
+1. Five pods running and ready with zero restarts, distributed across two worker nodes. ✅
+2. Kubernetes DNS peer discovery showing four remote peers plus the local replica. ✅
+3. HTTPS access at `gossipgrid.k8s.lan` through the shared Cilium Gateway. ✅
+4. Working browser login and authenticated dashboard. ✅
+5. Vault-managed authentication credentials loaded successfully. ✅
+6. Peer mTLS enabled with per-pod certificate configuration. ✅
+7. Go FIPS module v1.0.0 enabled in the running application. ✅
+8. An immutable container image deployed from a private GitLab registry through Argo CD. ✅
+9. Five pods gossip to convergence under normal operation. 🔜 Pending
+10. A pod replacement loses local SQLite and is re-reconciled by anti-entropy (a best-effort test; **not** an
+    authoritative initial-snapshot, safe-genesis, or readiness-gating guarantee — those are 5B/7B). 🔜 Pending
+11. A temporary partition causes missing/unreachable status, then heals via anti-entropy. 🔜 Pending
+12. Reload pod mTLS credentials as cert-manager rotates them. 🔜 Pending
+13. Live password-rotation demonstration without pod restarts (VSO → mounted Secret → credential reload;
+    eventual, not instantaneous — the rotation window is measured, not assumed). 🔜 Pending
 
 **Milestone 7B (lifecycle enabled, full safety guarantees):**
 
@@ -280,9 +332,12 @@ flowchart LR
 
 **Milestone 8 (GitOps delivery):**
 
-1. A pushed tag produces an immutable image by digest.
-2. The GitOps revision is updated by digest; Argo CD reconciles the cluster to the recorded revision.
-3. A failed Argo CD sync is observable and reversible; CI never deploys directly to the cluster.
+1. An immutable image is built with `make image` and published to the private GitLab Container Registry by
+   SHA256 digest (✅ done in staging — manual, not tag-triggered).
+2. The GitOps Application references the published digest; Argo CD reconciles the cluster to the recorded
+   revision (✅ done in staging — manual digest update, not automated).
+3. Automated image publishing (CI commits the digest to k8s-gitops) (🔜 pending).
+4. A failed Argo CD sync is observable and reversible; CI never deploys directly to the cluster.
 
 ## Cluster references
 

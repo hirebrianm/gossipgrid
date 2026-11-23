@@ -5,11 +5,18 @@ epoch fencing architecture (implemented in Milestone 5A), and the broader target
 system (Milestones 5B, 5C, 6, 7A, 7B, 8, and 9). It is not an assertion of deployed security or formal
 certification.
 
-**Status classification:** Peer mTLS (3B), message exchange (4A), gossip (4B), anti-entropy (4C), and
-lifecycle/epoch fencing (5A) are **implemented and locally tested**. The browser authentication and
-credential management design (M6), the Kubernetes metadata provider (5B), and the operator recovery procedure
-(5C) are **designed but not implemented**. No security feature is currently **configured and verified in
-Kubernetes**.
+**Status classification:** Peer mTLS (3B), message exchange (4A), gossip (4B), anti-entropy (4C),
+lifecycle/epoch fencing (5A), and browser authentication (M6) are **implemented and locally tested**.
+Milestone 7A (Kubernetes staging — Helm chart, Argo CD, Vault
+provisioning, staging runbook) is **deployed and initially smoke-tested**: five replicas running, peer mTLS
+with per-pod certificates confirmed, browser HTTPS access through the shared Cilium Gateway confirmed,
+Vault-managed credentials loaded, the Go FIPS module enabled in the running application, Kubernetes
+NetworkPolicy and CiliumNetworkPolicy protections deployed, and non-root container configuration in place.
+The **remaining acceptance tests** (cross-replica convergence, recovery after pod replacement, live
+password rotation, fault tolerance) are pending. The M5A lifecycle functionality is implemented in code but
+**intentionally disabled** in the current M7A Kubernetes staging deployment
+(`GOSSIPGRID_LIFECYCLE_ENABLED=false`) because the required 5B implementation is incomplete. The Kubernetes
+metadata provider (5B) and the operator recovery procedure (5C) are **designed but not implemented**.
 
 ## Threat model and trust boundaries
 
@@ -27,10 +34,10 @@ Kubernetes**.
 
 ## Two PKI trust domains
 
-**Browser HTTPS:** Vault PKI role/issuer signs the certificate for a deliberate internal DNS hostname; cert-manager
-creates/rotates the TLS Secret referenced by Gateway API. Browsers trust the appropriate CA chain already installed in
-their trusted store. Browser HTTPS ends at Gateway; initial Gateway-to-app traffic is internal HTTP. Backend TLS is a
-separate exercise.
+**Browser HTTPS:** Vault PKI role/issuer signs the certificate for a deliberate internal DNS hostname; the
+certificate is managed in the `gateway-system` namespace (separately from the GossipGrid chart). Browsers
+trust the appropriate CA chain already installed in their trusted store. Browser HTTPS ends at the shared
+Cilium Gateway; Gateway-to-app traffic is internal HTTP. Backend TLS is a separate exercise.
 
 **Workload mTLS:** A separate Vault PKI issuer/CA signs per-pod certificates requested by cert-manager CSI.
 Certificates and private keys are mounted for each pod, renewed automatically, and hot-reloaded by Go (implemented in
@@ -594,17 +601,25 @@ include signing keys, a shell, or package managers in the final image.
 Reference starting point supplied by project owner: [go-sdk-demo Dockerfile](https://github.com/hirebrianm/go-sdk-demo/blob/main/Dockerfile).
 Adapt it after review; it is not copied into the initial documentation-only commit.
 
-## Future security exercises
+## Security exercises and verification status
 
-These exercises are planned for Milestones 7A, 7B, and 9 (all **designed but not implemented**):
+The following security controls are **deployed in the staging cluster** (Milestone 7A) but have not yet been
+exhaustively verified through dedicated security testing:
 
-- Cilium NetworkPolicy to restrict `8443` only to GossipGrid peers (7A).
+- **Kubernetes NetworkPolicy** restricting peer traffic and ingress (deployed; verification testing pending).
+- **CiliumNetworkPolicy** for the Gateway's reserved ingress identity (deployed; verification testing pending).
+- **Non-root container configuration** (deployed; the read-only root filesystem aspect is not yet verified).
+- **Go FIPS module v1.0.0** enabled in the running application (deployed and confirmed; full FIPS profile
+  verification — TLS behavior, binary static linkage, container digest — is a Milestone 9 exercise).
+
+The following security exercises remain **unverified and are future work** (Milestones 7A acceptance, 7B, and
+9):
+
 - Gateway exposure limits and TLS rotation under load (7A).
 - Failed trust rotation and dynamic revocation behavior (7A).
 - RBAC negative tests for the 5B metadata ConfigMap and the 5C recovery endpoint (7B).
 - Live password-rotation demonstration without pod restarts (7A).
 - Audit logs for reset incidents and recovery events (7B, 5C).
 - Container vulnerability/SBOM scan (7A).
-- Non-root and read-only root filesystem (7A).
 - Cryptographic module verification (FIPS runtime state, TLS behavior, and PBKDF2-HMAC-SHA-256 under the
   `GOFIPS140` build profile) (9).

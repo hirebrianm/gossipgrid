@@ -9,7 +9,7 @@ flowchart TB
 
   subgraph K8S["Kubernetes cluster"]
     direction TB
-    GW["Cilium Gateway - browser HTTPS termination, LAN LB"]
+    GW["Shared Cilium Gateway - existing, gateway.enabled=false in GossipGrid chart; HTTPRoutes managed in k8s-gitops"]
     WEB["ClusterIP web Service - ready pods only"]
 
     subgraph SS["StatefulSet gossipgrid - 5 replicas, Parallel, no PVCs"]
@@ -34,7 +34,7 @@ flowchart TB
     CM -. per-pod mTLS certs .-> APP
     CM -. browser TLS Secret .-> GW
 
-    subgraph CRED["Browser auth credentials (M6 planned)"]
+    subgraph CRED["Browser auth credentials (M6 implemented locally; in-cluster delivery via VSO in M7A)"]
       direction LR
       VKV["Vault KV v2 - versioned credential: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key"]
       VSO["Vault Secrets Operator"]
@@ -52,10 +52,10 @@ flowchart TB
     CMETA -. metadata watch .-> APP
   end
 
-  subgraph GITOPS["GitOps delivery (M8 planned)"]
+  subgraph GITOPS["GitOps delivery (M8 partial: immutable image + Argo CD work; automation incomplete)"]
     direction LR
     REG["Container registry - immutable image by digest"]
-    GOREPO["GitOps repository - Helm values + Argo CD application manifest"]
+    GOREPO["k8s-gitops repository - environment-specific Helm values + Argo CD application"]
     ARGO["Argo CD - reconciles the cluster"]
     GLCI -->|publish by digest| REG
     REG -->|record digest| GOREPO
