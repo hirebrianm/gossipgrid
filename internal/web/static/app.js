@@ -199,7 +199,25 @@
     if (meta) {
       var n = d.peer_count || 0;
       var expected = d.expected_replicas || 0;
-      meta.textContent = n + " peer(s) discovered" + (expected ? " of " + expected + " expected" : "") + (d.discovery_stale ? " (stale)" : "");
+      // peer_count is the number of REMOTE (self-excluded) discovered peers;
+      // expected_replicas is the total replica count (local included). A
+      // healthy N-replica cluster therefore reports (N-1) of (N-1) remote
+      // peers with N total. This describes discovery only — it is NOT a
+      // health or reachability check (a discovered peer is not confirmed
+      // reachable).
+      var remote = expected > 0 ? Math.max(expected - 1, 0) : null;
+      var text;
+      if (remote !== null) {
+        text = n + " of " + remote + " remote peer" + (remote === 1 ? "" : "s") + " discovered";
+        text += " (" + expected + " replica" + (expected === 1 ? "" : "s") + " total)";
+      } else {
+        // Replica count unknown (0 or unset): no completion ratio, just count.
+        text = n + " remote peer" + (n === 1 ? "" : "s") + " discovered";
+      }
+      if (d.discovery_stale) {
+        text += " (stale)";
+      }
+      meta.textContent = text;
     }
     if (!list) return;
     list.innerHTML = "";

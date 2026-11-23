@@ -124,6 +124,11 @@ type credentialSnapshot struct {
 	localPodID string
 	loadedAt   time.Time
 	certSHA256 [32]byte
+	// trustSHA256 is the SHA-256 of the raw trust-bundle PEM that produced
+	// caPool. It is used by tryReload to detect a genuine reload (a
+	// trust-bundle rotation) even when the leaf certificate is unchanged,
+	// while still treating an identical-material tick as a no-op.
+	trustSHA256 [32]byte
 }
 
 // Manager loads and manages peer mTLS credentials with hot reload. It is safe
@@ -259,6 +264,17 @@ func (m *Manager) runReloadLoop(ctx context.Context, cancel context.CancelFunc) 
 
 // tryReload attempts to load credentials and atomically publishes the new
 // snapshot. A failed load preserves the previous valid snapshot.
+//
+// A reload is only counted when the loaded credential material actually
+// differs from the currently published snapshot — either the leaf
+// certificate changed (a certificate rotation) or the CA trust bundle
+// changed (a trust rotation). When the material is unchanged, the new
+// snapshot is still published (so a concurrent change that lands between
+// ticks is picked up on the next handshake) but the reload counter is left
+// alone and no "reloaded" log line is emitted. This is the correct behavior
+// for the diagnostics "reload count" metric: it should reflect how many
+// times the credential material actually changed, not how many times the
+// reload worker ran a periodic check.
 func (m *Manager) tryReload() {
 	snap, err := m.loadCredentials()
 	if err != nil {
@@ -268,12 +284,22 @@ func (m *Manager) tryReload() {
 		return
 	}
 	m.mu.Lock()
+	prev := m.cred
 	m.cred = snap
-	m.reloadCount++
+	if prev == nil || prev.certSHA256 != snap.certSHA256 || prev.trustSHA256 != snap.trustSHA256 {
+		m.reloadCount++
+		m.mu.Unlock()
+		m.logger.Info("peer TLS credentials reloaded",
+			slog.String("cert_fingerprint", fingerprintHex(snap.certSHA256)),
+			slog.String("local_pod_id", snap.localPodID),
+		)
+		return
+	}
 	m.mu.Unlock()
-	m.logger.Info("peer TLS credentials reloaded",
+	// Identical credential material (same leaf and same trust bundle): publish
+	// the new snapshot without incrementing the reload counter.
+	m.logger.Debug("peer TLS reload tick: credential material unchanged; snapshot updated",
 		slog.String("cert_fingerprint", fingerprintHex(snap.certSHA256)),
-		slog.String("local_pod_id", snap.localPodID),
 	)
 }
 
@@ -406,6 +432,9 @@ func (m *Manager) loadCredentials() (*credentialSnapshot, error) {
 
 	// Compute the SHA-256 fingerprint of the leaf for diagnostics.
 	certSHA256 := sha256.Sum256(leaf.Raw)
+	// Hash the raw trust-bundle PEM so tryReload can detect a trust rotation
+	// (a genuine reload) without parsing the pool into a comparable form.
+	trustSHA256 := sha256.Sum256(trustPEM)
 
 	podID, err := m.authorizePeerIdentity(leaf)
 	if err != nil {
@@ -420,11 +449,12 @@ func (m *Manager) loadCredentials() (*credentialSnapshot, error) {
 	}
 
 	return &credentialSnapshot{
-		cert:       tls.Certificate{Certificate: derCerts, PrivateKey: privKey},
-		caPool:     caPool,
-		localPodID: podID,
-		loadedAt:   time.Now(),
-		certSHA256: certSHA256,
+		cert:        tls.Certificate{Certificate: derCerts, PrivateKey: privKey},
+		caPool:      caPool,
+		localPodID:  podID,
+		loadedAt:    time.Now(),
+		certSHA256:  certSHA256,
+		trustSHA256: trustSHA256,
 	}, nil
 }
 
@@ -435,8 +465,16 @@ type Diagnostics struct {
 	CertFingerprint string `json:"cert_fingerprint"`
 	LocalPodID      string `json:"local_pod_id"`
 	LoadedAt        string `json:"loaded_at"`
-	// ReloadCount is the number of successful reloads since Start (0 after the
-	// initial load). Exposed for tests to detect that a reload occurred.
+	// ReloadCount is the number of times the local credential material
+	// actually changed since Start (0 after the initial load). A "genuine"
+	// reload — a leaf certificate rotation OR a CA trust-bundle rotation —
+	// increments this counter. A reload worker tick that reads back identical
+	// credential material (same leaf, same trust bundle) does NOT increment
+	// it: the new snapshot is still published (so a concurrent change is
+	// picked up on the next handshake) but the counter only reflects actual
+	// material changes, not periodic check ticks. Exposed for tests to detect
+	// that a genuine reload occurred and for diagnostics to report material
+	// changes without conflating them with periodic check ticks.
 	ReloadCount int `json:"reload_count"`
 }
 

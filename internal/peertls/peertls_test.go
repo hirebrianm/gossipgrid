@@ -566,6 +566,78 @@ func TestMalformedReloadPreservesPreviousConfig(t *testing.T) {
 	mustWriteFile(t, certFile, certKeyPEMChain(t, c1, k1, ca))
 }
 
+// --- 16b. Unchanged credential material: no-op reload does not increment
+// ---
+//
+// A regression test for the diagnostic-counter behavior. Two distinct reload
+// cases are covered:
+//
+//  1. The reload worker reads back IDENTICAL credential material (same leaf,
+//     same key, same trust bundle) across several ticks — this is a no-op
+//     reload and must NOT increment ReloadCount (the counter reflects actual
+//     credential-material changes, not periodic check ticks).
+//
+//  2. A CA trust-bundle rotation (leaf unchanged) IS a genuine reload — the
+//     trust-bundle material changed — so it MUST increment ReloadCount and
+//     the new snapshot must be picked up on the next handshake. This is the
+//     "trust rotation is still a reload" property that a leaf-fingerprint-only
+//     check would break.
+func TestUnchangedMaterialNoOpReloadNotCounted(t *testing.T) {
+	ca1 := newTestCA(t, "ca1")
+	ca2 := newTestCA(t, "ca2")
+	dir := t.TempDir()
+	pod := "gossipgrid-0"
+
+	c1, k1 := issueLeaf(t, ca1, leafCertSpec{dnsNames: []string{pod + "." + testSuffix}})
+	certFile := writePEM(t, dir, "cert.pem", certKeyPEMChain(t, c1, k1, ca1))
+	keyFile := writePEM(t, dir, "key.pem", keyPEM(t, k1))
+	trustFile := writePEM(t, dir, "ca-bundle.pem", ca1.pem)
+
+	mgr := newTestManager(t, certFile, keyFile, trustFile, "gossipgrid-0", 20*time.Millisecond)
+	addr, stop := startTestServer(t, mgr, statusHandler(pod, "v"))
+	defer stop()
+
+	fpBefore := mgr.Diagnostics().CertFingerprint
+	rcBefore := mgr.Diagnostics().ReloadCount
+
+	// (1) Give the reload worker several ticks (well beyond the 20ms interval)
+	// with UNCHANGED credential material. The leaf fingerprint, key, and trust
+	// bundle are all unchanged, so every tick is a no-op: ReloadCount must
+	// stay at rcBefore (0) and the fingerprint must stay at fpBefore.
+	settleWait(t, 200)
+
+	rcAfter := mgr.Diagnostics().ReloadCount
+	fpAfter := mgr.Diagnostics().CertFingerprint
+	if rcAfter != rcBefore {
+		t.Fatalf("ReloadCount incremented on unchanged material: before=%d after=%d (want %d)", rcBefore, rcAfter, rcBefore)
+	}
+	if fpAfter != fpBefore {
+		t.Fatalf("fingerprint changed on unchanged material: before=%s after=%s", fpBefore, fpAfter)
+	}
+
+	// (2) Now rotate the CA trust bundle (ca1 -> ca1+ca2). The leaf is
+	// unchanged but the trust-bundle material changed, so this IS a genuine
+	// reload: ReloadCount must increment, and the new snapshot must be picked
+	// up on the next handshake. A ca2-signed client, rejected before the
+	// rotation, must now be accepted.
+	c2, k2 := issueLeaf(t, ca2, leafCertSpec{dnsNames: []string{"gossipgrid-1." + testSuffix}})
+	if err := mTLSGet(t, addr, pod+"."+testSuffix, c2, k2, loadPool(t, trustFile)); err == nil {
+		t.Fatal("expected ca2-signed client to be rejected before trust rotation, got success")
+	}
+	mustWriteFile(t, trustFile, trustBundlePEM(ca1, ca2))
+
+	// A genuine reload (trust-bundle material changed) increments ReloadCount,
+	// so waitForReload is safe here.
+	waitForReload(t, mgr, rcAfter)
+	rcAfterRotation := mgr.Diagnostics().ReloadCount
+	if rcAfterRotation != rcAfter+1 {
+		t.Fatalf("ReloadCount after trust rotation = %d, want %d (exactly one genuine reload)", rcAfterRotation, rcAfter+1)
+	}
+	if err := mTLSGet(t, addr, pod+"."+testSuffix, c2, k2, loadPool(t, trustFile)); err != nil {
+		t.Fatalf("expected ca2-signed client to be accepted after trust rotation: %v", err)
+	}
+}
+
 // --- 17. Concurrent credential access and rotation under race detector ---
 
 func TestConcurrentAccessAndRotation(t *testing.T) {
@@ -733,10 +805,22 @@ func mustWriteFile(t *testing.T, path string, data []byte) {
 	}
 }
 
-// waitForReload waits (bounded) until the Manager's ReloadCount increases
-// (i.e. a successful reload has published a new snapshot). If the deadline
-// elapses without a reload, the test is marked as failed (a reload was
-// expected).
+// waitForReload waits (bounded) until the Manager's ReloadCount increases.
+//
+// Counter semantics (see tryReload): ReloadCount increments when the
+// credential material changes — that is, when EITHER the leaf certificate
+// changes (cert rotation) OR the CA trust bundle changes (trust rotation). A
+// reload worker tick that reads identical credential material (same leaf and
+// same trust bundle) does NOT increment the counter, though it still
+// publishes a new snapshot so a concurrent change is picked up on the next
+// handshake.
+//
+// Helper assumption: this helper is safe to call after any change that
+// alters the credential material — a leaf certificate rotation or a
+// trust-bundle rotation (including a trust-bundle-only change with the leaf
+// unchanged). It is NOT safe to call when no credential material has
+// changed, because ReloadCount will not increment; such callers should use
+// settleWait and verify behavior via the mTLS handshake directly.
 func waitForReload(t *testing.T, mgr *Manager, prevCount int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
