@@ -52,7 +52,7 @@ type Diagnostics struct {
 	// Peer mTLS (when enabled).
 	PeerTLSEnabled      bool   `json:"peer_tls_enabled"`
 	PeerCertFingerprint string `json:"peer_cert_fingerprint,omitempty"`
-	PeerReloadCount     int    `json:"peer_reload_count,omitempty"`
+	PeerReloadCount     int    `json:"peer_reload_count"`
 
 	// Browser credential (when authentication is enabled).
 	AuthEnabled          bool   `json:"auth_enabled"`

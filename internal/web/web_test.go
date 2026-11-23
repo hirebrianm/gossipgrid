@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -113,6 +114,17 @@ func doLogin(t *testing.T, base, password string) (int, *http.Cookie, *http.Cook
 	}
 	defer drainBody(t, res)
 	return res.StatusCode, findCookie(res, auth.SessionCookieName), findCookie(res, auth.CSRFCookieName)
+}
+
+// readBody reads and returns the full response body, then closes it.
+func readBody(t *testing.T, res *http.Response) string {
+	t.Helper()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
+	_ = res.Body.Close()
+	return string(data)
 }
 
 // drainBody closes a response body (and discards any unread content).
@@ -348,6 +360,120 @@ func TestDiagnosticsUnauthenticated(t *testing.T) {
 	drainBody(t, res)
 	if res.StatusCode != http.StatusUnauthorized {
 		t.Errorf("GET /api/diagnostics (unauthenticated) status = %d, want 401", res.StatusCode)
+	}
+}
+
+// TestDiagnosticsPeerReloadCountZero verifies that the diagnostics JSON
+// includes "peer_reload_count" as the numeric value 0 when no TLS credential
+// changes have occurred. Regression for the omitempty bug where a zero
+// PeerReloadCount was omitted from the JSON, causing the dashboard to display
+// "Peer TLS reloads: undefined".
+func TestDiagnosticsPeerReloadCountZero(t *testing.T) {
+	const password = "admin-pw"
+	srv, cleanup := newTestServer(t, password)
+	defer cleanup()
+
+	_, session, _ := doLogin(t, srv.URL, password)
+	if session == nil {
+		t.Fatal("no session cookie")
+	}
+
+	r := doRequest(t, http.MethodGet, srv.URL+"/api/diagnostics", nil, func(req *http.Request) {
+		req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Value})
+	})
+	defer drainBody(t, r)
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/diagnostics (authenticated) status = %d, want 200", r.StatusCode)
+	}
+	body := readBody(t, r)
+
+	// The field must be present (not omitted by omitempty).
+	if !strings.Contains(body, `"peer_reload_count":`) {
+		t.Errorf("diagnostics JSON missing \"peer_reload_count\" key:\n%s", body)
+	}
+	// The value must be numeric 0 (not null, not a string, not missing).
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("json.Unmarshal diagnostics body: %v", err)
+	}
+	v, ok := parsed["peer_reload_count"]
+	if !ok {
+		t.Fatalf("\"peer_reload_count\" not present in JSON (omitempty suppressed it)")
+	}
+	if n, ok := v.(float64); !ok || n != 0 {
+		t.Errorf("peer_reload_count = %T %v, want float64 0", v, v)
+	}
+}
+
+// TestDiagnosticsPeerReloadCountNonZero verifies that a non-zero
+// PeerReloadCount is correctly serialized in the diagnostics JSON.
+func TestDiagnosticsPeerReloadCountNonZero(t *testing.T) {
+	const password = "admin-pw"
+	dir := t.TempDir()
+	credPath := filepath.Join(dir, "admin-credential.json")
+	cf, err := auth.GenerateCredential(password, 1000, 1, nil)
+	if err != nil {
+		t.Fatalf("GenerateCredential: %v", err)
+	}
+	if err := writeCredFile(credPath, cf); err != nil {
+		t.Fatalf("writeCredFile: %v", err)
+	}
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	st, err := store.New(dbPath)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	rel := auth.NewReloader(credPath, time.Hour, time.Hour, nil)
+	if err := rel.Start(t.Context()); err != nil {
+		t.Fatalf("reloader.Start: %v", err)
+	}
+	provider := auth.NewProvider(rel)
+
+	const reloadCount = 3
+	h := NewHandler(Config{
+		Node:         server.Node{ID: "gossipgrid-0"},
+		Store:        st,
+		AuthProvider: provider,
+		CookieSecure: false,
+		PeerTLDiagnostics: func() PeerTLDiagnostics {
+			return PeerTLDiagnostics{
+				CertFingerprint: "abc123",
+				ReloadCount:     reloadCount,
+				Enabled:         true,
+			}
+		},
+	})
+	srv := httptest.NewServer(h)
+	defer func() {
+		srv.Close()
+		rel.Shutdown()
+		_ = st.Close()
+	}()
+
+	_, session, _ := doLogin(t, srv.URL, password)
+	if session == nil {
+		t.Fatal("no session cookie")
+	}
+
+	r := doRequest(t, http.MethodGet, srv.URL+"/api/diagnostics", nil, func(req *http.Request) {
+		req.AddCookie(&http.Cookie{Name: auth.SessionCookieName, Value: session.Value})
+	})
+	defer drainBody(t, r)
+	if r.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/diagnostics (authenticated) status = %d, want 200", r.StatusCode)
+	}
+	body := readBody(t, r)
+
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("json.Unmarshal diagnostics body: %v", err)
+	}
+	v, ok := parsed["peer_reload_count"]
+	if !ok {
+		t.Fatalf("\"peer_reload_count\" not present in JSON")
+	}
+	if n, ok := v.(float64); !ok || n != float64(reloadCount) {
+		t.Errorf("peer_reload_count = %T %v, want float64 %d", v, v, reloadCount)
 	}
 }
 
