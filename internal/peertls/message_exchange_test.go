@@ -985,6 +985,11 @@ func TestSendMessageAfterCertRotation(t *testing.T) {
 	}
 	cert, key := issueLeaf(t, ca, leafCertSpec{dnsNames: []string{"gossipgrid-1." + testSuffix}})
 	chainPEM, keyPEM := certKeyPEM(t, cert, key, ca)
+	// Capture the reload baseline BEFORE writing the rotated material: the
+	// reload worker polls every 50ms, so a reload can complete before a
+	// post-write baseline is read, and the wait would then target a second
+	// reload that never occurs.
+	prevRC := nodeB.mgr.Diagnostics().ReloadCount
 	//nolint:gosec/G306 // test fixture in temp dir
 	if err := os.WriteFile(nodeB.certFile, chainPEM, 0o600); err != nil {
 		t.Fatalf("writing rotated cert: %v", err)
@@ -993,7 +998,6 @@ func TestSendMessageAfterCertRotation(t *testing.T) {
 	if err := os.WriteFile(nodeB.keyFile, keyPEM, 0o600); err != nil {
 		t.Fatalf("writing rotated key: %v", err)
 	}
-	prevRC := nodeB.mgr.Diagnostics().ReloadCount
 	waitForReload(t, nodeB.mgr, prevRC)
 	msg2 := makeValidMessage(t, "after-rotate")
 	if _, err := nodeA.client.SendMessage(context.Background(), nodeB.addr, "gossipgrid-1."+testSuffix, msg2); err != nil {

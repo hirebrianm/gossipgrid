@@ -235,8 +235,9 @@ func TestIntegrationTwoNodesMTLS(t *testing.T) {
 	// cert (new key, same identity) and verify node0 can still connect to
 	// node1 over a NEW connection, and that the new cert is presented.
 	fpBefore := node1.mgr.Diagnostics().CertFingerprint
+	rcBefore := node1.mgr.Diagnostics().ReloadCount
 	rotateNodeCert(t, node1, sharedCA)
-	waitForNodeReload(t, node1)
+	waitForNodeReload(t, node1, rcBefore)
 	fpAfter := node1.mgr.Diagnostics().CertFingerprint
 	if fpBefore == fpAfter {
 		t.Fatal("node1 cert fingerprint did not change after rotation")
@@ -251,11 +252,12 @@ func TestIntegrationTwoNodesMTLS(t *testing.T) {
 
 	// (f) Rotate node1's trust bundle to include the untrusted CA: after the
 	// rotation, a client signed by the untrusted CA must now be accepted.
+	rcBeforeTrust := node1.mgr.Diagnostics().ReloadCount
 	//nolint:gosec/G306 // test fixture in temp dir
 	if err := os.WriteFile(node1.trustFile, trustBundlePEMTwo(sharedCA, untrustedCA), 0o600); err != nil {
 		t.Fatalf("writing node1 trust bundle: %v", err)
 	}
-	waitForNodeReload(t, node1)
+	waitForNodeReload(t, node1, rcBeforeTrust)
 	if err := untrustedClientGet(t, node1, untrustedCA); err != nil {
 		t.Fatalf("expected untrusted-CA client to be accepted after trust rotation, got: %v", err)
 	}
@@ -558,13 +560,16 @@ func rotateNodeCert(t *testing.T, node *integrationNode, ca *testCA) {
 }
 
 // waitForNodeReload waits (bounded) for the node's Manager to complete a
-// successful reload (ReloadCount increases).
-func waitForNodeReload(t *testing.T, node *integrationNode) {
+// successful reload (ReloadCount increases beyond prevCount). prevCount MUST be
+// captured BEFORE the credential material is modified, not inside this helper:
+// the reload worker polls every 50ms, so a reload can complete before a
+// post-write baseline is read, and the helper would then wait for a second
+// reload that never occurs.
+func waitForNodeReload(t *testing.T, node *integrationNode, prevCount int) {
 	t.Helper()
-	prev := node.mgr.Diagnostics().ReloadCount
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if node.mgr.Diagnostics().ReloadCount > prev {
+		if node.mgr.Diagnostics().ReloadCount > prevCount {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
