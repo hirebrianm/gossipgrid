@@ -103,7 +103,7 @@ func newAENode(t *testing.T, ca *testCA, podID string) *aeNode {
 	t.Cleanup(closeStore)
 
 	// Peer server WITH anti-entropy sync endpoints enabled.
-	peerSrv := peertls.NewPeerServerWithSync(mgr, ":0", podID, "v0.1.0-ae", st, true, true, nil)
+	peerSrv := peertls.NewPeerServerWithSync(mgr, ":0", podID, "v0.1.0-ae", st, true, true, nil, 0)
 
 	// Listen on a random loopback port.
 	tlsListener, err := aeTlsListen("127.0.0.1:0", mgr.TLSConfigForServer())
@@ -477,7 +477,7 @@ func TestIntegrationFiveNodesAntiEntropy(t *testing.T) {
 
 		// Create the peer server with the replacement (empty) store and
 		// sync endpoints enabled.
-		replPeerSrv := peertls.NewPeerServerWithSync(replMgr, ":0", "gossipgrid-4", "v0.1.0-ae-repl", replNode.store, true, true, nil)
+		replPeerSrv := peertls.NewPeerServerWithSync(replMgr, ":0", "gossipgrid-4", "v0.1.0-ae-repl", replNode.store, true, true, nil, 0)
 		tlsListener, err := aeTlsListen("127.0.0.1:0", replMgr.TLSConfigForServer())
 		if err != nil {
 			t.Fatalf("replacement node tls.Listen: %v", err)

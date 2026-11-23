@@ -601,6 +601,156 @@ func TestGossipValidOverrides(t *testing.T) {
 	}
 }
 
+// TestMessageRetentionDefaultsDisabled verifies that message retention is
+// disabled by default (TTL zero) when the TTL variable is unset, and that no
+// cleanup interval is parsed in that case (the default 1h is not applied).
+func TestMessageRetentionDefaultsDisabled(t *testing.T) {
+	cfg, err := load(env(nil))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.MessageRetentionTTL != 0 {
+		t.Errorf("default TTL = %v, want 0 (disabled)", cfg.MessageRetentionTTL)
+	}
+	// The interval is only set when retention is enabled; when disabled it
+	// remains the zero value.
+	if cfg.MessageRetentionInterval != 0 {
+		t.Errorf("default interval = %v, want 0 (not applied when disabled)", cfg.MessageRetentionInterval)
+	}
+}
+
+// TestMessageRetentionEnabled verifies that a non-zero TTL enables retention
+// with the documented default cleanup interval (1h), and that an explicit
+// interval override is honoured.
+func TestMessageRetentionEnabled(t *testing.T) {
+	cfg, err := load(env(map[string]string{
+		EnvMessageRetentionTTL: "168h", // 7 days
+	}))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.MessageRetentionTTL != 7*24*time.Hour {
+		t.Errorf("TTL = %v, want 168h (7 days)", cfg.MessageRetentionTTL)
+	}
+	if cfg.MessageRetentionInterval != time.Hour {
+		t.Errorf("default interval = %v, want 1h", cfg.MessageRetentionInterval)
+	}
+
+	cfg2, err := load(env(map[string]string{
+		EnvMessageRetentionTTL:      "168h",
+		EnvMessageRetentionInterval: "30m",
+	}))
+	if err != nil {
+		t.Fatalf("load (interval override): %v", err)
+	}
+	if cfg2.MessageRetentionInterval != 30*time.Minute {
+		t.Errorf("interval override = %v, want 30m", cfg2.MessageRetentionInterval)
+	}
+}
+
+// TestMessageRetentionSweepBudgets verifies that the optional sweep-budget
+// env vars (max rows and max duration) are parsed, default to 0 (the "use the
+// documented defaults" sentinel) when unset, and are honoured when set. A
+// negative value is rejected (it would disable the bound entirely).
+func TestMessageRetentionSweepBudgets(t *testing.T) {
+	// Defaults: unset budgets are 0 (the cleaner applies the documented
+	// defaults).
+	cfg, err := load(env(map[string]string{
+		EnvMessageRetentionTTL: "168h",
+	}))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.MessageRetentionMaxSweepRows != 0 {
+		t.Errorf("default MaxSweepRows = %d, want 0 (sentinel for documented default)", cfg.MessageRetentionMaxSweepRows)
+	}
+	if cfg.MessageRetentionMaxSweepDuration != 0 {
+		t.Errorf("default MaxSweepDuration = %v, want 0 (sentinel for documented default)", cfg.MessageRetentionMaxSweepDuration)
+	}
+
+	// Overrides are honoured.
+	cfg2, err := load(env(map[string]string{
+		EnvMessageRetentionTTL:              "168h",
+		EnvMessageRetentionMaxSweepRows:     "2000",
+		EnvMessageRetentionMaxSweepDuration: "5s",
+	}))
+	if err != nil {
+		t.Fatalf("load (budget overrides): %v", err)
+	}
+	if cfg2.MessageRetentionMaxSweepRows != 2000 {
+		t.Errorf("MaxSweepRows override = %d, want 2000", cfg2.MessageRetentionMaxSweepRows)
+	}
+	if cfg2.MessageRetentionMaxSweepDuration != 5*time.Second {
+		t.Errorf("MaxSweepDuration override = %v, want 5s", cfg2.MessageRetentionMaxSweepDuration)
+	}
+
+	// A negative value is rejected (it would disable the bound).
+	_, err = load(env(map[string]string{
+		EnvMessageRetentionTTL:          "168h",
+		EnvMessageRetentionMaxSweepRows: "-5",
+	}))
+	if err == nil {
+		t.Error("negative MaxSweepRows: expected error, got nil")
+	}
+}
+
+// TestMessageRetentionDisabledExplicitZero verifies that an explicit "0" TTL
+// disables retention (the documented off value) without error.
+func TestMessageRetentionDisabledExplicitZero(t *testing.T) {
+	cfg, err := load(env(map[string]string{
+		EnvMessageRetentionTTL: "0",
+	}))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.MessageRetentionTTL != 0 {
+		t.Errorf("TTL = %v, want 0 (explicit 0 disables)", cfg.MessageRetentionTTL)
+	}
+}
+
+// TestMessageRetentionInvalidValues verifies that malformed or out-of-range
+// retention values are rejected (a typo must not silently change a data
+// lifetime policy).
+func TestMessageRetentionInvalidValues(t *testing.T) {
+	cases := []struct {
+		name string
+		vars map[string]string
+	}{
+		{"malformed TTL", map[string]string{EnvMessageRetentionTTL: "soon"}},
+		{"negative TTL", map[string]string{EnvMessageRetentionTTL: "-5m"}},
+		{"sub-minute TTL", map[string]string{EnvMessageRetentionTTL: "30s"}},
+		{"malformed interval", map[string]string{EnvMessageRetentionTTL: "1h", EnvMessageRetentionInterval: "soon"}},
+		{"zero interval", map[string]string{EnvMessageRetentionTTL: "1h", EnvMessageRetentionInterval: "0s"}},
+		{"interval too small", map[string]string{EnvMessageRetentionTTL: "1h", EnvMessageRetentionInterval: "500ms"}},
+		{"interval too large", map[string]string{EnvMessageRetentionTTL: "1h", EnvMessageRetentionInterval: "48h"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := load(env(c.vars))
+			if err == nil {
+				t.Errorf("expected an error for %s", c.name)
+			}
+		})
+	}
+}
+
+// TestMessageRetentionValidationUnit exercises Config-level validation directly
+// (the function the cleaner also uses).
+func TestMessageRetentionValidationUnit(t *testing.T) {
+	valid := Config{MessageRetentionTTL: 7 * 24 * time.Hour, MessageRetentionInterval: time.Hour}
+	if err := validateMessageRetentionConfig(&valid); err != nil {
+		t.Errorf("valid retention: err = %v, want nil", err)
+	}
+	disabled := Config{MessageRetentionTTL: 0}
+	if err := validateMessageRetentionConfig(&disabled); err != nil {
+		t.Errorf("disabled retention: err = %v, want nil", err)
+	}
+	tooSmall := Config{MessageRetentionTTL: 30 * time.Second, MessageRetentionInterval: time.Hour}
+	if err := validateMessageRetentionConfig(&tooSmall); err == nil {
+		t.Error("sub-minute TTL: expected an error, got nil")
+	}
+}
+
 // mergeVars returns a new map with the given key-value pairs added to base.
 func mergeVars(base map[string]string, kv ...string) map[string]string {
 	out := make(map[string]string, len(base)+len(kv)/2)

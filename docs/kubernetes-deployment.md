@@ -192,6 +192,29 @@ process arguments, 0600 atomic write), `rotate` (increment the generation; optio
 `GOSSIPGRID_AUTH_CREDENTIAL_FILE` at it; the same code path reads the file. See [security.md](security.md) for
 the exact commands and the local-HTTPS/testing guidance.
 
+**Message retention (not yet deployed).** Message retention is **disabled by default** and is not enabled in the
+current staging deployment. To enable it in staging, set the following in the k8s-gitops Helm values
+(implementation is complete and locally tested; staging enablement is a separate deployment step):
+
+| Env var | Recommended staging value | Notes |
+| --- | --- | --- |
+| `GOSSIPGRID_MESSAGE_RETENTION_TTL` | `168h` | Retain messages for 7 days (168 hours). All 5 replicas must use the same value. Uses Go's standard `time.ParseDuration` syntax (no `d` suffix) |
+| `GOSSIPGRID_MESSAGE_RETENTION_INTERVAL` | `1h` | Sweep hourly. Default; no need to override |
+
+Retention excludes expired messages from the API, gossip, and anti-entropy, and periodically deletes them from
+each replica's local SQLite database. See [architecture.md](architecture.md#message-retention-opt-in) for the
+full semantics and operational limitations (clock skew, no tombstones, per-replica TTL).
+
+**SQLite storage maintenance (not yet deployed).** When retention is enabled, the cleaner also performs
+bounded SQLite maintenance after each sweep: incremental page reclamation
+(`PRAGMA incremental_vacuum(100)`) and a PASSIVE WAL checkpoint, with
+`journal_size_limit` set to 64 MiB. New databases are created with
+`auto_vacuum=INCREMENTAL`; existing databases are not silently converted (a one-time `VACUUM`
+is required to enable incremental reclamation — see
+[architecture.md](architecture.md#sqlite-storage-maintenance) for details). No additional
+environment variables are needed for maintenance; it is driven by the same retention
+`TTL` and `INTERVAL` settings.
+
 ## Container and CI/CD
 
 - Build using Go, CGO, and static musl/SQLite linkage in a builder image; final runtime `scratch`.

@@ -326,6 +326,79 @@ and GitLab; the [SVG](diagrams/generated/system-architecture.svg) and
 
 Primary key conflict on replicated insert is a successful no-op. Message deletion and mutation are outside v1 scope.
 
+## Message retention (opt-in)
+
+Retention is **disabled by default** (`GOSSIPGRID_MESSAGE_RETENTION_TTL` unset or `0`). When enabled, messages
+expire based on their immutable `created_at` timestamp: a message is expired when
+`created_at < now - TTL` (strict less-than; a message exactly at the cutoff is retained).
+
+When enabled, expired messages are:
+
+- **Excluded from the API**: `GET /api/messages` omits them (and the `total` count reflects only retained
+  messages); `GET /api/messages/{id}` returns `404` for them (indistinguishable from an absent message).
+- **Excluded from gossip and anti-entropy**: the sync inventory (`GET /internal/sync/ids`) does not advertise
+  expired IDs, and the sync fetch (`POST /internal/sync/messages`) reports expired IDs as "not found"
+  (defense in depth). This prevents anti-entropy from re-inserting (resurrecting) a message that a
+  replica has already expired.
+- **Periodically deleted**: a background sweeper runs an initial sweep on startup and then on a configurable
+  interval (`GOSSIPGRID_MESSAGE_RETENTION_INTERVAL`, default 1h), deleting rows where
+  `created_at < now - TTL`. The sweeper shuts down cleanly with the application.
+
+**Operational limitations:**
+
+- **Clock skew**: expiration uses each replica's local clock. If replicas' clocks diverge by more than the TTL,
+  a message may be expired on one replica but retained on another. Keep clocks synchronized (NTP) to minimize
+  this window.
+- **Per-replica TTL**: each replica independently evaluates its own `created_at < now - TTL` check. All replicas
+  should be configured with the **same** `GOSSIPGRID_MESSAGE_RETENTION_TTL` for consistent behavior.
+- **No tombstones**: expired messages are simply deleted from the local SQLite database. There is no
+  distributed tombstone or "delete" record that propagates to peers. A peer that has not yet expired a message
+  (e.g. because its TTL is longer or its clock is behind) will retain it until its own sweep runs.
+- **Sub-minute TTLs are rejected**: the minimum `GOSSIPGRID_MESSAGE_RETENTION_TTL` is `1m` (to avoid
+  excessive sweep churn and clock-skew sensitivity).
+- **Sub-second intervals are rejected**: the minimum `GOSSIPGRID_MESSAGE_RETENTION_INTERVAL` is `1s`.
+
+### SQLite storage maintenance
+
+When retention is enabled, each sweep also performs bounded SQLite maintenance to keep the logical
+database size (and, with incremental vacuum, the physical file size) in check over long-running
+operation:
+
+- **Incremental auto-vacuum**: new databases are created with `auto_vacuum=INCREMENTAL` so that
+  deleted pages are tracked on the freelist and can be reclaimed without a full `VACUUM`. When
+  enabled, SQLite can truncate the physical main database file down to the logical size
+  (`page_count × page_size`) as freelist pages are reclaimed (subject to WAL-mode checkpoint
+  behavior); a full `VACUUM` also rebuilds and shrinks the physical database file. The logical page
+  count, freelist page count, main database file length, and physical WAL file length are distinct
+  quantities and are reported separately. Existing databases (created before this feature) are
+  **not** silently converted — the operator can run a one-time `VACUUM` during a maintenance window
+  to enable incremental reclamation.
+- **Bounded page reclamation**: after each cleanup sweep, `PRAGMA incremental_vacuum(N)` reclaims
+  up to N freelist pages (default N=100, ~800 KiB at 8 KiB page size). This is a single bounded
+  operation that does not hold the writer lock for long and does not perform a full `VACUUM`.
+- **WAL maintenance**: `PRAGMA journal_size_limit=64 MiB` sets the target size
+  SQLite retains for the WAL file under normal (unobstructed) checkpointing.
+  This is a retained-file-size management setting, **not** an absolute
+  maximum: SQLite can let the WAL file exceed this value, particularly when
+  checkpoint progress is obstructed by active readers. A
+  `PRAGMA wal_checkpoint(PASSIVE)` is run after each sweep to copy outstanding
+  WAL frames into the main database file (moving the uncheckpointed data from
+  the WAL into the main file). A PASSIVE checkpoint does not block readers; if
+  readers are active, the checkpoint is deferred to the next cycle. A
+  "successful empty" checkpoint (no outstanding frames) is reported as
+  success, not as a failure.
+- **Cancellable**: all maintenance operations accept the cleaner's context, so shutdown
+  cancellation interrupts in-flight work (no unbounded cleanup loop monopolizing SQLite).
+- **Disabled by default**: when retention is disabled (`TTL=0`), no cleaner is started and no
+  maintenance runs. Enabling retention in an existing deployment does not automatically trigger
+  a destructive cleanup; the first sweep only deletes rows already past the expiration threshold.
+
+**Observability:** the cleaner logs (via `slog`) the number of rows deleted, cleanup duration,
+pages reclaimed, freelist page count (before/after), database logical size, WAL file size,
+and checkpoint status. Routine maintenance cycles are logged at `DEBUG` level; deletions and
+failures at `INFO`/`WARN`. The cumulative `TotalDeleted` and `TotalPagesReclaimed` counters are
+available for diagnostics.
+
 ## Application boundaries
 
 **Public side:** `GET /`, `GET /api/messages`, `POST /api/messages`, `GET /api/messages/{id}/status`,

@@ -97,6 +97,25 @@ const (
 	EnvAuthSessionTTL     = "GOSSIPGRID_AUTH_SESSION_TTL"
 	EnvAuthSessionIdleTTL = "GOSSIPGRID_AUTH_SESSION_IDLE_TTL"
 	EnvAuthCookieSecure   = "GOSSIPGRID_AUTH_COOKIE_SECURE"
+
+	// Message retention. When a non-zero TTL is configured,
+	// messages older than the TTL are expired: they are excluded from API
+	// listings, not propagated through gossip, not synced via anti-entropy,
+	// and physically removed from SQLite by a periodic cleaner. The feature
+	// is DISABLED by default (TTL = 0): when unset, all existing message
+	// behavior is preserved and no cleaner is started. It is independent of
+	// peer mTLS, gossip, and anti-entropy (it can be enabled with any of them
+	// off).
+	EnvMessageRetentionTTL      = "GOSSIPGRID_MESSAGE_RETENTION_TTL"
+	EnvMessageRetentionInterval = "GOSSIPGRID_MESSAGE_RETENTION_INTERVAL"
+	// GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_ROWS caps the total rows a single
+	// scheduled retention sweep may delete (0/unset = default 5000; the
+	// backlog resumes on the next sweep).
+	EnvMessageRetentionMaxSweepRows = "GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_ROWS"
+	// GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_DURATION caps the wall-clock time
+	// a single scheduled retention sweep's delete phase may take (0/unset =
+	// default 10s; the backlog resumes on the next sweep).
+	EnvMessageRetentionMaxSweepDuration = "GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_DURATION"
 )
 
 // Config holds the validated, runtime configuration for a GossipGrid node.
@@ -188,6 +207,23 @@ type Config struct {
 	AuthSessionTTL      string
 	AuthSessionIdleTTL  string
 	AuthCookieSecure    bool
+
+	// Message retention. MessageRetentionTTL == 0 disables
+	// retention (the default): no expiration, no cleaner. When non-zero,
+	// messages older than the TTL are expired. MessageRetentionInterval is
+	// the period between cleaner sweeps (it only matters when retention is
+	// enabled; it is still validated when retention is on).
+	//
+	// MessageRetentionMaxSweepRows caps the total rows a single scheduled
+	// sweep may delete (0 = default 5000; the backlog resumes on the next
+	// sweep). MessageRetentionMaxSweepDuration caps the delete-phase
+	// wall-clock time of a single sweep (0 = default 10s). Both bound a
+	// single sweep in work and time so a large backlog cannot keep one sweep
+	// running indefinitely.
+	MessageRetentionTTL              time.Duration
+	MessageRetentionInterval         time.Duration
+	MessageRetentionMaxSweepRows     int64
+	MessageRetentionMaxSweepDuration time.Duration
 }
 
 // envFunc is the lookup used to read environment values. It is a function field
@@ -449,6 +485,41 @@ func load(lookup envFunc) (*Config, error) {
 		errs = append(errs, err)
 	}
 
+	// Message retention. Disabled by default: when the TTL is
+	// unset, retention is off and the cleaner is not started. An explicit "0"
+	// also disables retention (the documented "off" value). A non-zero TTL
+	// must be a valid positive duration (a typo is an error, not a silent
+	// default). The cleanup interval defaults to 1h and is only meaningful
+	// (and validated) when retention is enabled.
+	if v, ok := lookup(EnvMessageRetentionTTL); ok && v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %q is not a valid duration: %w", EnvMessageRetentionTTL, v, err))
+		} else if d < 0 {
+			errs = append(errs, fmt.Errorf("%s: %v must not be negative (use 0 to disable)", EnvMessageRetentionTTL, d))
+		} else {
+			cfg.MessageRetentionTTL = d
+			if d > 0 {
+				cfg.MessageRetentionInterval, err = parseDurationEnv(lookup, EnvMessageRetentionInterval, time.Hour)
+				if err != nil {
+					errs = append(errs, err)
+				}
+				// Sweep budgets (optional; 0/unset = documented defaults).
+				cfg.MessageRetentionMaxSweepRows, err = parseInt64Env(lookup, EnvMessageRetentionMaxSweepRows, 0)
+				if err != nil {
+					errs = append(errs, err)
+				}
+				cfg.MessageRetentionMaxSweepDuration, err = parseDurationEnv(lookup, EnvMessageRetentionMaxSweepDuration, 0)
+				if err != nil {
+					errs = append(errs, err)
+				}
+				if err := validateMessageRetentionConfig(cfg); err != nil {
+					errs = append(errs, err)
+				}
+			}
+		}
+	}
+
 	return cfg, errors.Join(errs...)
 }
 
@@ -478,6 +549,19 @@ func parseIntEnvGossip(lookup envFunc, key string, fallback int) (int, error) {
 func parseIntEnv(lookup envFunc, key string, fallback int) (int, error) {
 	if v, ok := lookup(key); ok && v != "" {
 		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, fmt.Errorf("%s: %q is not a valid integer: %w", key, v, err)
+		}
+		return n, nil
+	}
+	return fallback, nil
+}
+
+// parseInt64Env reads a 64-bit integer environment variable. Unset values use
+// the documented fallback; an explicitly supplied malformed value is an error.
+func parseInt64Env(lookup envFunc, key string, fallback int64) (int64, error) {
+	if v, ok := lookup(key); ok && v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			return 0, fmt.Errorf("%s: %q is not a valid integer: %w", key, v, err)
 		}
@@ -944,6 +1028,40 @@ func validateAuthConfig(cfg *Config) error {
 	// subset of the absolute lifetime).
 	if idleTTL > sessionTTL {
 		return fmt.Errorf("%s: idle TTL (%v) must not exceed the absolute session TTL (%v)", EnvAuthSessionIdleTTL, idleTTL, sessionTTL)
+	}
+	return nil
+}
+
+// validateMessageRetentionConfig checks the message retention fields
+// (message retention). The cleanup interval only matters when retention is enabled
+// (a non-zero TTL); when the TTL is zero (the default), no validation is
+// performed and no cleaner is started. When enabled, the TTL must be positive
+// and the cleanup interval must be a positive duration within documented
+// bounds. Retention is independent of peer mTLS, gossip, and anti-entropy.
+func validateMessageRetentionConfig(cfg *Config) error {
+	if cfg.MessageRetentionTTL <= 0 {
+		return nil
+	}
+	if cfg.MessageRetentionTTL < 1*time.Minute {
+		return fmt.Errorf("%s: message retention TTL must be at least 1m (got %v); sub-minute TTLs would delete messages before they are meaningfully usable", EnvMessageRetentionTTL, cfg.MessageRetentionTTL)
+	}
+	if cfg.MessageRetentionInterval <= 0 {
+		return fmt.Errorf("%s: message retention cleanup interval must be a positive duration (got %v)", EnvMessageRetentionInterval, cfg.MessageRetentionInterval)
+	}
+	if cfg.MessageRetentionInterval < 1*time.Second {
+		return fmt.Errorf("%s: message retention cleanup interval must be at least 1s (got %v)", EnvMessageRetentionInterval, cfg.MessageRetentionInterval)
+	}
+	if cfg.MessageRetentionInterval > 24*time.Hour {
+		return fmt.Errorf("%s: message retention cleanup interval must be at most 24h (got %v)", EnvMessageRetentionInterval, cfg.MessageRetentionInterval)
+	}
+	// Sweep budgets (0/unset = documented defaults, validated in retention).
+	// A negative value is an error: a non-positive budget would disable the
+	// bound entirely, defeating the purpose of a bounded sweep.
+	if cfg.MessageRetentionMaxSweepRows < 0 {
+		return fmt.Errorf("%s: max sweep rows must be a non-negative integer (got %d); use 0 for the default", EnvMessageRetentionMaxSweepRows, cfg.MessageRetentionMaxSweepRows)
+	}
+	if cfg.MessageRetentionMaxSweepDuration < 0 {
+		return fmt.Errorf("%s: max sweep duration must be a non-negative duration (got %v); use 0 for the default", EnvMessageRetentionMaxSweepDuration, cfg.MessageRetentionMaxSweepDuration)
 	}
 	return nil
 }

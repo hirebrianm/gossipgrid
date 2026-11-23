@@ -177,7 +177,7 @@ func newLifecycleTestNode(t *testing.T, ca *testCA, podID string, opts nodeTestO
 	publicAddr := publicLn.Addr().String()
 
 	// Build the peer server with lifecycle fencing on the actual address.
-	peerSrv := peertls.NewPeerServerWithSyncAndLifecycle(mgr, peerAddr, podID, "v0.1.0-lc", st, true, true, nil, ctrl)
+	peerSrv := peertls.NewPeerServerWithSyncAndLifecycle(mgr, peerAddr, podID, "v0.1.0-lc", st, true, true, nil, ctrl, 0)
 	publicSrv := server.NewServer(publicAddr, publicHandler)
 
 	// Peer client wired to the controller's current authorization decision.
@@ -1686,7 +1686,7 @@ func newLegacyPeerNode(t *testing.T, ca *testCA, podID string) *lifecycleTestNod
 	publicAddr := publicLn.Addr().String()
 
 	// Peer server with lifecycle disabled (lifecycleEnabled=false).
-	peerSrv := peertls.NewPeerServerWithSyncAndLifecycle(mgr, peerAddr, podID, "v0.1.0-legacy", st, true, true, nil, nil)
+	peerSrv := peertls.NewPeerServerWithSyncAndLifecycle(mgr, peerAddr, podID, "v0.1.0-legacy", st, true, true, nil, nil, 0)
 	publicSrv := server.NewServer(publicAddr, publicHandler)
 	// Client with no EpochProvider (legacy: outbound epoch not enforced).
 	peerClient := peertls.NewClient(mgr)

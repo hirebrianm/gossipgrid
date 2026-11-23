@@ -91,6 +91,12 @@ type Config struct {
 	AuthProvider auth.Provider
 	CookieSecure bool
 
+	// Message retention TTL. When non-zero, expired messages
+	// are excluded from the public message API (GET /api/messages and GET
+	// /api/messages/{id}). When zero (the default), retention is disabled and
+	// the message API behaves exactly as before.
+	RetentionTTL time.Duration
+
 	// Clock (for tests; nil uses time.Now).
 	Now func() time.Time
 }
@@ -142,9 +148,12 @@ func NewHandler(cfg Config) *Handler {
 	// are preserved unchanged.
 	var publicMux http.Handler
 	if cfg.Lifecycle != nil {
-		publicMux = server.NewWithStoreAndCallbackAndLifecycle(cfg.Node, cfg.Store, cfg.OnMessage, cfg.Lifecycle)
+		// Message retention: the retention-aware mux excludes expired messages from
+		// the public API when the TTL is non-zero; a zero TTL preserves the
+		// legacy behavior exactly.
+		publicMux = server.NewWithStoreAndCallbackAndRetention(cfg.Node, cfg.Store, cfg.OnMessage, cfg.Lifecycle, cfg.RetentionTTL)
 	} else {
-		publicMux = server.NewWithStoreAndCallback(cfg.Node, cfg.Store, cfg.OnMessage)
+		publicMux = server.NewWithStoreAndCallbackAndRetention(cfg.Node, cfg.Store, cfg.OnMessage, nil, cfg.RetentionTTL)
 	}
 
 	h.authOn = cfg.AuthProvider != nil

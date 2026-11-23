@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -643,7 +644,7 @@ func postSyncFetch(t *testing.T, handler http.Handler, body []byte) (int, []byte
 // that prevents an authenticated client from requesting an excessive response.
 func TestSyncFetchHandlerBatchBoundRejected(t *testing.T) {
 	st := newMessageTestStore(t)
-	handler := newSyncFetchHandler(st)
+	handler := newSyncFetchHandler(st, 0, time.Now)
 
 	// Request 9 IDs (1 more than the max batch of 8).
 	body, _ := json.Marshal(fetchMessagesRequest{IDs: genTestUUIDs(9)})
@@ -660,7 +661,7 @@ func TestSyncFetchHandlerBatchBoundRejected(t *testing.T) {
 // the serialized response is finite and within the bound.
 func TestSyncFetchHandlerValidBatchWithinBound(t *testing.T) {
 	st := newMessageTestStore(t)
-	handler := newSyncFetchHandler(st)
+	handler := newSyncFetchHandler(st, 0, time.Now)
 
 	const maxBatch = 8
 	// Insert 8 max-size messages (4096-byte "<" body, 253-byte origin) into
@@ -703,7 +704,7 @@ func TestSyncFetchHandlerValidBatchWithinBound(t *testing.T) {
 // response-size bounding in the handler is what catches it.
 func TestSyncFetchHandlerOversizedRecordExplicitError(t *testing.T) {
 	st := newMessageTestStore(t)
-	handler := newSyncFetchHandler(st)
+	handler := newSyncFetchHandler(st, 0, time.Now)
 
 	// Directly insert 8 records, each with a 60000-byte body (far beyond the
 	// 4096 store limit and beyond what would fit in the response bound).
@@ -735,4 +736,284 @@ func TestSyncFetchHandlerOversizedRecordExplicitError(t *testing.T) {
 // errorsAs wraps errors.As for convenience in test assertions.
 func errorsAs(err error, target interface{}) bool {
 	return errors.As(err, target)
+}
+
+// TestFetchMessages404RetryOnExpiration verifies the client's 404-retry
+// behavior: when the peer's sync-fetch endpoint returns a structured 404
+// (one or more requested IDs absent or expired, reported in the
+// "missing_ids" field), the client validates the missing IDs against the
+// original request, retries with only the present IDs, and returns the valid
+// records. This prevents one expired ID from stalling the entire batch (and
+// the anti-entropy engine's cursor).
+//
+// The test uses a real mTLS server whose handler returns a structured 404 on
+// the first request (listing one ID as missing) and 200 on the retry
+// (returning only the present ID's record). This exercises the actual client
+// code path.
+func TestFetchMessages404RetryOnExpiration(t *testing.T) {
+	ids := genTestUUIDs(2) // [presentID, expiredID]
+	presentID, expiredID := ids[0], ids[1]
+	timestamp := "2026-11-20T12:00:00Z"
+
+	var mu sync.Mutex
+	requestCount := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/sync/messages", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requestCount++
+		count := requestCount
+		mu.Unlock()
+
+		if count == 1 {
+			// First request: structured 404 with the expired ID in
+			// missing_ids. The peer's retention filter excluded the expired
+			// message between inventory enumeration and this fetch.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(missingIDsResponse{
+				Error:      "message IDs not found: " + expiredID,
+				MissingIDs: []string{expiredID},
+			})
+			return
+		}
+		// Retry (count >= 2): 200 with only the present ID's record.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"messages": []map[string]string{
+				{"id": presentID, "body": "body-0", "origin": "node-1", "created_at": timestamp},
+			},
+		})
+	})
+	addr, client := setupSyncTest(t, mux)
+
+	// Request both IDs. The client should handle the 404 by retrying with
+	// only the present ID and return the valid record.
+	msgs, err := client.FetchMessages(context.Background(), addr, "gossipgrid-0."+testSuffix, ids)
+	if err != nil {
+		t.Fatalf("FetchMessages with 404: err = %v, want nil (404-retry should succeed)", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("FetchMessages: len = %d, want 1 (only the present ID); got %+v", len(msgs), msgs)
+	}
+	if msgs[0].ID != presentID {
+		t.Errorf("FetchMessages: ID = %q, want %q (the present ID)", msgs[0].ID, presentID)
+	}
+	// The retry must have occurred (2 total requests: original + retry).
+	mu.Lock()
+	defer mu.Unlock()
+	if requestCount != 2 {
+		t.Errorf("requestCount = %d, want 2 (original + retry after 404)", requestCount)
+	}
+}
+
+// TestFetchMessages404AllMissing verifies that when ALL requested IDs are
+// confirmed missing/expired (a structured 404 listing every requested ID in
+// missing_ids), the client treats this as SUCCESSFUL reconciliation with zero
+// fetched messages: it returns an empty slice and nil error (no retry is made;
+// there are no present IDs to fetch). The peer's inventory, which excludes
+// expired records, will not re-advertise these IDs, so the anti-entropy engine
+// can advance its cursor without stalling the batch.
+func TestFetchMessages404AllMissing(t *testing.T) {
+	ids := genTestUUIDs(2)
+
+	var mu sync.Mutex
+	requestCount := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/sync/messages", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requestCount++
+		mu.Unlock()
+		// Structured 404: all requested IDs are missing/expired.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(missingIDsResponse{
+			Error:      "message IDs not found: " + ids[0] + ", " + ids[1],
+			MissingIDs: ids,
+		})
+	})
+	addr, client := setupSyncTest(t, mux)
+
+	msgs, err := client.FetchMessages(context.Background(), addr, "gossipgrid-0."+testSuffix, ids)
+	if err != nil {
+		t.Fatalf("FetchMessages with all IDs missing: err = %v, want nil (all-missing is successful reconciliation)", err)
+	}
+	if msgs == nil || len(msgs) != 0 {
+		t.Fatalf("FetchMessages: len = %d, want 0 (zero fetched messages); got %+v", len(msgs), msgs)
+	}
+	// No retry must be made for an all-missing 404.
+	mu.Lock()
+	defer mu.Unlock()
+	if requestCount != 1 {
+		t.Errorf("requestCount = %d, want 1 (no retry for all-missing 404)", requestCount)
+	}
+}
+
+// TestFetchMessages404RetryFailsVerifies that when the 404-retry itself fails
+// with a non-404 error (a genuine protocol error, not legitimate expiration),
+// the client returns the retry's error (not the original 404). This preserves
+// the "do not silently ignore unrelated protocol errors" guarantee.
+func TestFetchMessages404RetryFails(t *testing.T) {
+	ids := genTestUUIDs(2)
+	presentID := ids[0]
+
+	var mu sync.Mutex
+	requestCount := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/sync/messages", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requestCount++
+		count := requestCount
+		mu.Unlock()
+
+		if count == 1 {
+			// First request: structured 404 (one ID missing).
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(missingIDsResponse{
+				Error:      "message IDs not found: " + ids[1],
+				MissingIDs: []string{ids[1]},
+			})
+			return
+		}
+		// Retry: 500 (a genuine server error, not expiration).
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "internal server error",
+		})
+	})
+	addr, client := setupSyncTest(t, mux)
+
+	_, err := client.FetchMessages(context.Background(), addr, "gossipgrid-0."+testSuffix, ids)
+	if err == nil {
+		t.Fatal("FetchMessages with failed retry: expected error, got nil")
+	}
+	var httpErr *PeerHTTPStatusError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("FetchMessages: error type = %T, want *PeerHTTPStatusError", err)
+	}
+	// The retry's 500 must be propagated (not the original 404).
+	if httpErr.status != http.StatusInternalServerError {
+		t.Errorf("FetchMessages: status = %d, want 500 (the retry's error, not the original 404)", httpErr.status)
+	}
+	_ = presentID
+}
+
+// TestFetchMessages404MalformedBodyRejected verifies that a 404 whose body is
+// not a valid structured missing-ID response (no "missing_ids" field) is
+// rejected as a protocol error (PeerAckError) rather than interpreted as an
+// expiration. This prevents an unrelated or malformed 404 from being treated
+// as a legitimate expiration and stalling or advancing the cursor incorrectly.
+func TestFetchMessages404MalformedBodyRejected(t *testing.T) {
+	ids := genTestUUIDs(2)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/sync/messages", func(w http.ResponseWriter, _ *http.Request) {
+		// A 404 with only a free-form error string and no missing_ids field:
+		// this does not reliably report which IDs are missing, so it must be
+		// rejected (not parsed as an expiration).
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+	})
+	addr, client := setupSyncTest(t, mux)
+
+	_, err := client.FetchMessages(context.Background(), addr, "gossipgrid-0."+testSuffix, ids)
+	if err == nil {
+		t.Fatal("FetchMessages with malformed 404 body: expected error, got nil")
+	}
+	var ackErr *PeerAckError
+	if !errors.As(err, &ackErr) {
+		t.Fatalf("FetchMessages: error type = %T, want *PeerAckError (malformed 404)", err)
+	}
+}
+
+// TestFetchMessages404UnexpectedIDRejected verifies that a structured 404 whose
+// missing_ids contains an ID that was NOT part of the original request is
+// rejected (the response is unrelated to this fetch and must not be
+// interpreted as an expiration).
+func TestFetchMessages404UnexpectedIDRejected(t *testing.T) {
+	requested := genTestUUIDs(2)
+	unexpected := genTestUUIDs(10)[5] // a valid UUIDv7 not in the request
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/sync/messages", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(missingIDsResponse{
+			Error:      "message IDs not found",
+			MissingIDs: []string{requested[0], unexpected},
+		})
+	})
+	addr, client := setupSyncTest(t, mux)
+
+	_, err := client.FetchMessages(context.Background(), addr, "gossipgrid-0."+testSuffix, requested)
+	if err == nil {
+		t.Fatal("FetchMessages with unexpected missing ID: expected error, got nil")
+	}
+	var ackErr *PeerAckError
+	if !errors.As(err, &ackErr) {
+		t.Fatalf("FetchMessages: error type = %T, want *PeerAckError (unexpected ID)", err)
+	}
+}
+
+// TestFetchMessages404RepeatedExpirationDuringRetry verifies the bounded-retry
+// guarantee: when only some IDs are missing and the single retry (with the
+// present IDs) encounters a SECOND 404 (records expiring across successive
+// attempts), the client returns the retry's error (a failed page) rather than
+// retrying again. This is what prevents unbounded retries as records expire
+// during successive attempts: at most one retry is ever made after a 404.
+func TestFetchMessages404RepeatedExpirationDuringRetry(t *testing.T) {
+	ids := genTestUUIDs(2)
+	presentID := ids[0]
+
+	var mu sync.Mutex
+	requestCount := 0
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/sync/messages", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		requestCount++
+		count := requestCount
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		if count == 1 {
+			// First request: one ID missing.
+			_ = json.NewEncoder(w).Encode(missingIDsResponse{
+				Error:      "message IDs not found: " + ids[1],
+				MissingIDs: []string{ids[1]},
+			})
+			return
+		}
+		// Retry (count == 2): the present ID has ALSO now expired → second
+		// 404. The client must NOT retry again; it returns this 404 error.
+		_ = json.NewEncoder(w).Encode(missingIDsResponse{
+			Error:      "message IDs not found: " + presentID,
+			MissingIDs: []string{presentID},
+		})
+	})
+	addr, client := setupSyncTest(t, mux)
+
+	_, err := client.FetchMessages(context.Background(), addr, "gossipgrid-0."+testSuffix, ids)
+	if err == nil {
+		t.Fatal("FetchMessages with repeated 404 during retry: expected error, got nil")
+	}
+	var httpErr *PeerHTTPStatusError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("FetchMessages: error type = %T, want *PeerHTTPStatusError (retry 404)", err)
+	}
+	if httpErr.status != http.StatusNotFound {
+		t.Errorf("FetchMessages: status = %d, want 404 (the retry's 404)", httpErr.status)
+	}
+	// Exactly two requests: the original + ONE retry (no unbounded retries).
+	mu.Lock()
+	defer mu.Unlock()
+	if requestCount != 2 {
+		t.Errorf("requestCount = %d, want 2 (original + single retry, no unbounded retries)", requestCount)
+	}
 }

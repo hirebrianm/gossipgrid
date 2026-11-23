@@ -1984,3 +1984,220 @@ func TestConcurrentStatsAndSyncWithExpectedMembership(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestAntiEntropyRejectsExpiredMessages verifies that, with retention enabled,
+// the anti-entropy engine does NOT insert fetched messages whose creation
+// timestamp is older than the current expiration threshold. This is the
+// regression test for the resurrection-through-anti-entropy defect: without
+// this check, anti-entropy would reinsert (resurrect) messages that the local
+// replica has already expired (e.g. after a cleanup sweep).
+//
+// The test verifies:
+//  1. An expired message is NOT inserted (the local store does not gain it).
+//  2. A fresh message IS inserted (retention does not block valid messages).
+//  3. The page is NOT failed (no error returned; cursor advances normally).
+func TestAntiEntropyRejectsExpiredMessages(t *testing.T) {
+	base := "2026-06-01T12:00:00Z"
+	freshTime := "2026-06-01T11:30:00Z"   // 30 min before base (within 2h TTL)
+	expiredTime := "2026-06-01T06:00:00Z" // 6h before base (exceeds 2h TTL)
+
+	freshID := "019a0000-0000-7000-0000-000000000001"
+	expiredID := "019a0000-0001-7000-0000-000000000002"
+	peerKey := "gossipgrid-1.suffix"
+
+	src := &fakePeerSource{}
+	src.setPeers([]PeerTarget{{DialAddr: "127.0.0.1:8443", ExpectedIdentity: peerKey, PodIdentity: "gossipgrid-1"}})
+
+	// Peer advertises both IDs.
+	inv := &fakeInventoryClient{inv: map[string][]string{peerKey: {freshID, expiredID}}}
+
+	// Peer has both messages.
+	fetcher := &fakeMessageFetcher{msgs: map[string]peertls.SyncMessageWire{
+		freshID:   {ID: freshID, Body: "fresh", Origin: "gossipgrid-1", CreatedAt: freshTime},
+		expiredID: {ID: expiredID, Body: "expired", Origin: "gossipgrid-1", CreatedAt: expiredTime},
+	}}
+
+	// Local has neither message (both are "missing").
+	local := &fakeLocalStore{ids: map[string]bool{}}
+
+	ttl := 2 * time.Hour
+	fixedNow, _ := time.Parse(time.RFC3339, base)
+
+	cfg := Config{Interval: 100 * time.Hour, PageSize: 10, FetchBatchSize: 5, MaxPagesPerPeer: 4, Workers: 1, RequestTimeout: time.Second}
+	e := WithClock(cfg, src, inv, fetcher, local, nil, func() time.Time { return fixedNow })
+	e.SetRetentionTTL(ttl)
+
+	// Call syncPeer directly.
+	ctx := context.Background()
+	e.syncPeer(ctx, PeerTarget{DialAddr: "127.0.0.1:8443", ExpectedIdentity: peerKey, PodIdentity: "gossipgrid-1"})
+
+	// The fresh message must have been inserted.
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	if !local.ids[freshID] {
+		t.Errorf("fresh message not inserted; retention should not block valid messages")
+	}
+	// The expired message must NOT have been inserted.
+	if local.ids[expiredID] {
+		t.Errorf("expired message was inserted (resurrection through anti-entropy)")
+	}
+	// Only 1 insert should have occurred.
+	if len(local.inserted) != 1 {
+		t.Errorf("inserted = %v, want only the fresh ID", local.inserted)
+	}
+}
+
+// TestAntiEntropyExpirationDuringFetch verifies that when a message expires
+// between inventory enumeration and the batch fetch (the peer's 404
+// response lists the expired ID as missing), the anti-entropy engine does
+// NOT stall: the valid messages in the same batch are still inserted, the
+// page is NOT failed, and the cursor advances. This is the regression test
+// for the defect where one expired ID caused the entire batch to fail
+// (404 on any missing ID), stalling reconciliation indefinitely.
+//
+// The 404-retry logic lives in the client's FetchMessages (it parses the
+// 404 body, identifies the missing IDs, retries with only the present
+// IDs, and returns a 200 with the valid records). The engine's
+// fetchAndInsert calls FetchMessages and receives only the present
+// messages (not the 404 error), so the page is processed successfully and
+// the cursor advances. This test simulates that outcome: the fetcher
+// returns only the valid message (as the real client would after its
+// 404-retry), and the engine must insert it without failing the page.
+func TestAntiEntropyExpirationDuringFetch(t *testing.T) {
+	freshTime := "2026-06-01T11:30:00Z" // 30 min before base (within 2h TTL)
+
+	freshID := "019a0000-0000-7000-0000-000000000001"
+	expiredID := "019a0000-0001-7000-0000-000000000002"
+	peerKey := "gossipgrid-1.suffix"
+
+	src := &fakePeerSource{}
+	src.setPeers([]PeerTarget{{DialAddr: "127.0.0.1:8443", ExpectedIdentity: peerKey, PodIdentity: "gossipgrid-1"}})
+
+	// Peer advertises both IDs (the inventory was enumerated before the
+	// expired message crossed the expiration boundary on the peer).
+	inv := &fakeInventoryClient{inv: map[string][]string{peerKey: {freshID, expiredID}}}
+
+	// The fetcher simulates the client's 404-retry outcome: the peer's
+	// inventory advertised both IDs, but by the time the fetch arrived the
+	// expired message had been excluded (404 listing it as missing). The
+	// client's FetchMessages parsed the 404, retried with only the fresh
+	// ID, and got a 200 with only the fresh message. The engine receives
+	// only the fresh message (the subset that is still present).
+	fetcher := &subsetFetcher{
+		// When asked for both IDs, return only the fresh one (simulating
+		// the client's 404-retry result).
+		result: map[string]peertls.SyncMessageWire{
+			freshID: {ID: freshID, Body: "fresh", Origin: "gossipgrid-1", CreatedAt: freshTime},
+		},
+	}
+
+	// Local has neither message.
+	local := &fakeLocalStore{ids: map[string]bool{}}
+
+	ttl := 2 * time.Hour
+	fixedNow, _ := time.Parse(time.RFC3339, "2026-06-01T12:00:00Z")
+
+	cfg := Config{Interval: 100 * time.Hour, PageSize: 10, FetchBatchSize: 5, MaxPagesPerPeer: 4, Workers: 1, RequestTimeout: time.Second}
+	e := WithClock(cfg, src, inv, fetcher, local, nil, func() time.Time { return fixedNow })
+	e.SetRetentionTTL(ttl)
+
+	ctx := context.Background()
+	e.syncPeer(ctx, PeerTarget{DialAddr: "127.0.0.1:8443", ExpectedIdentity: peerKey, PodIdentity: "gossipgrid-1"})
+
+	// The fresh message must have been inserted (the valid message in the
+	// batch was retrievable despite the expired ID's 404).
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	if !local.ids[freshID] {
+		t.Errorf("fresh message not inserted; a 404 for one ID should not block retrieval of valid messages in the same batch")
+	}
+	// The expired message must NOT have been inserted (the fetcher did not
+	// return it; the client's 404-retry excluded it).
+	if local.ids[expiredID] {
+		t.Errorf("expired message was inserted (resurrection)")
+	}
+	// The page must have been processed successfully (no failed pass).
+	if e.Stats().FailedPasses != 0 {
+		t.Errorf("FailedPasses = %d, want 0 (expiration during fetch must not fail the page)", e.Stats().FailedPasses)
+	}
+	// The completed pass must be recorded (full sweep reached has_more=false
+	// with no errors).
+	if e.Stats().CompletedPasses != 1 {
+		t.Errorf("CompletedPasses = %d, want 1 (page processed without failure)", e.Stats().CompletedPasses)
+	}
+}
+
+// subsetFetcher simulates the client's 404-retry outcome: when asked for a
+// batch of IDs, it returns only the messages that are still present on the
+// peer (the subset). This models the production behavior where the client
+// receives a 404, parses the missing IDs, retries with only the present
+// IDs, and gets a 200 with the valid records.
+type subsetFetcher struct {
+	mu     sync.Mutex
+	result map[string]peertls.SyncMessageWire
+	calls  int
+}
+
+func (f *subsetFetcher) FetchMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string) ([]peertls.SyncMessageWire, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	var result []peertls.SyncMessageWire
+	for _, id := range ids {
+		if m, ok := f.result[id]; ok {
+			result = append(result, m)
+		}
+	}
+	// No error: the client's 404-retry succeeded (or there was no 404).
+	// The engine receives the subset of present messages.
+	return result, nil
+}
+
+// TestAntiEntropyExpiredAfterCleanupSweep verifies that, after a cleanup sweep
+// removes an expired message from the local store, anti-entropy does NOT
+// reinsert (resurrect) it when a peer still advertises it. This is the
+// "resurrection after cleanup" regression test for the anti-entropy path.
+func TestAntiEntropyExpiredAfterCleanupSweep(t *testing.T) {
+	freshTime := "2026-06-01T11:30:00Z"
+	expiredTime := "2026-06-01T06:00:00Z"
+	fixedNow, _ := time.Parse(time.RFC3339, "2026-06-01T12:00:00Z")
+
+	freshID := "019a0000-0000-7000-0000-000000000001"
+	expiredID := "019a0000-0001-7000-0000-000000000002"
+	peerKey := "gossipgrid-1.suffix"
+
+	src := &fakePeerSource{}
+	src.setPeers([]PeerTarget{{DialAddr: "127.0.0.1:8443", ExpectedIdentity: peerKey, PodIdentity: "gossipgrid-1"}})
+
+	// Peer advertises both IDs (the peer's retention may differ, or the
+	// peer may not have run its cleanup sweep yet).
+	inv := &fakeInventoryClient{inv: map[string][]string{peerKey: {freshID, expiredID}}}
+
+	fetcher := &fakeMessageFetcher{msgs: map[string]peertls.SyncMessageWire{
+		freshID:   {ID: freshID, Body: "fresh", Origin: "gossipgrid-1", CreatedAt: freshTime},
+		expiredID: {ID: expiredID, Body: "expired", Origin: "gossipgrid-1", CreatedAt: expiredTime},
+	}}
+
+	// Local has neither message (both are "missing" from FindMissingIDs).
+	// Simulates the state after a cleanup sweep removed the expired message.
+	local := &fakeLocalStore{ids: map[string]bool{}}
+
+	ttl := 2 * time.Hour
+	cfg := Config{Interval: 100 * time.Hour, PageSize: 10, FetchBatchSize: 5, MaxPagesPerPeer: 4, Workers: 1, RequestTimeout: time.Second}
+	e := WithClock(cfg, src, inv, fetcher, local, nil, func() time.Time { return fixedNow })
+	e.SetRetentionTTL(ttl)
+
+	ctx := context.Background()
+	e.syncPeer(ctx, PeerTarget{DialAddr: "127.0.0.1:8443", ExpectedIdentity: peerKey, PodIdentity: "gossipgrid-1"})
+
+	local.mu.Lock()
+	defer local.mu.Unlock()
+	// The expired message must NOT be reinserted (resurrection prevented).
+	if local.ids[expiredID] {
+		t.Errorf("expired message resurrected after cleanup sweep via anti-entropy")
+	}
+	// The fresh message should have been inserted.
+	if !local.ids[freshID] {
+		t.Errorf("fresh message not inserted")
+	}
+}

@@ -112,7 +112,7 @@ func TestInboundEpochChangeHandlerRevocation(t *testing.T) {
 	st := newInboundTestStore(t)
 	ctrl := newInboundTestController(t, lifecycle.READY, "c1", "e1")
 
-	handler := newLifecycleSyncInventoryHandler(st, ctrl)
+	handler := newLifecycleSyncInventoryHandler(st, ctrl, 0, time.Now)
 
 	// Send a request under the current epoch (c1/e1).
 	req := httptest.NewRequestWithContext(context.Background(), "GET", "/internal/sync/ids?limit=10", nil)
@@ -143,7 +143,7 @@ func TestInboundEpochChangeHandlerEpochMismatch(t *testing.T) {
 	// Controller is authorized for c1/e1.
 	ctrl := newInboundTestController(t, lifecycle.READY, "c1", "e1")
 
-	handler := newLifecycleSyncInventoryHandler(st, ctrl)
+	handler := newLifecycleSyncInventoryHandler(st, ctrl, 0, time.Now)
 
 	// Send a request under a DIFFERENT epoch (c2/e2).
 	req := httptest.NewRequestWithContext(context.Background(), "GET", "/internal/sync/ids?limit=10", nil)
@@ -165,7 +165,7 @@ func TestInboundEpochChangeHandlerValidRequest(t *testing.T) {
 	st := newInboundTestStore(t)
 	ctrl := newInboundTestController(t, lifecycle.READY, "c1", "e1")
 
-	handler := newLifecycleSyncInventoryHandler(st, ctrl)
+	handler := newLifecycleSyncInventoryHandler(st, ctrl, 0, time.Now)
 
 	// Send a request under the current epoch (c1/e1).
 	req := httptest.NewRequestWithContext(context.Background(), "GET", "/internal/sync/ids?limit=10", nil)

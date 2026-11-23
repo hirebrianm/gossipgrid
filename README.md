@@ -315,6 +315,8 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_AUTH_SESSION_TTL` | `2h` | Absolute session lifetime. **Note:** the Helm chart's `auth.sessionTTL` default is `24h`, overriding this Go default for Kubernetes deployments |
 | `GOSSIPGRID_AUTH_SESSION_IDLE_TTL` | `30m` | Maximum session idle time |
 | `GOSSIPGRID_AUTH_COOKIE_SECURE` | (auto) | Override the session cookie `Secure` attribute. Default: `true` when the public listener has a TLS certificate, `false` otherwise |
+| `GOSSIPGRID_MESSAGE_RETENTION_TTL` | (empty) | Message retention TTL (e.g. `72h`, `168h`). When unset or `0`, retention is **disabled** (the default; messages are never expired or deleted). When set, messages with `created_at` older than `now - TTL` are excluded from the API, excluded from gossip/anti-entropy, and periodically deleted from SQLite. Must be >= `1m` when set. Uses Go's standard `time.ParseDuration` syntax (hours, minutes, seconds; no `d` suffix) |
+| `GOSSIPGRID_MESSAGE_RETENTION_INTERVAL` | `1h` | Periodic cleanup sweep interval (only used when `GOSSIPGRID_MESSAGE_RETENTION_TTL` is set and > 0). Range `1s`–`24h` |
 
 When `GOSSIPGRID_AUTH_ENABLED=true` (the default) and the credential file is absent or malformed, the web
 endpoints **fail closed** with `503 Service Unavailable` (the browser UI and all API endpoints require

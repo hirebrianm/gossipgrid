@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"gossipgrid/internal/lifecycle"
 	"gossipgrid/internal/store"
@@ -30,11 +31,20 @@ type messageHandler struct {
 	nodeID        string
 	onMessage     MessageCallback
 	lifecycleCtrl *lifecycle.Controller
+
+	// retention: when TTL > 0, expired messages are excluded
+	// from the public API (GET /api/messages and GET /api/messages/{id}).
+	// A zero TTL (the default) disables retention and the read paths behave
+	// exactly as before. now is injectable for deterministic tests.
+	retentionTTL time.Duration
+	now          func() time.Time
 }
 
-// newMessageHandler creates a messageHandler with the given store.
+// newMessageHandler creates a messageHandler with the given store. The clock
+// defaults to time.Now; tests may override the retentionTTL and now fields
+// directly to drive deterministic expiration scenarios.
 func newMessageHandler(s *store.Store) *messageHandler {
-	return &messageHandler{store: s}
+	return &messageHandler{store: s, now: time.Now}
 }
 
 // postMessages handles POST /api/messages.
@@ -217,7 +227,11 @@ func (h *messageHandler) getMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	msgs, total, err := h.store.List(limit, offset)
+	// Message retention: when enabled, exclude expired messages from
+	// the listing and the total count. When disabled (the default), this is
+	// identical to the legacy List.
+	threshold := store.ExpirationThreshold(h.retentionTTL, h.now())
+	msgs, total, err := h.store.ListWithExpiration(limit, offset, threshold)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "failed to list messages")
 		return
@@ -250,7 +264,11 @@ func (h *messageHandler) getMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg, err := h.store.GetByID(id)
+	// Message retention: when enabled, an expired message is
+	// treated as not found (404), indistinguishable from an absent message.
+	// When disabled (the default), this is identical to GetByID.
+	threshold := store.ExpirationThreshold(h.retentionTTL, h.now())
+	msg, err := h.store.GetByIDWithExpiration(id, threshold)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "message not found")

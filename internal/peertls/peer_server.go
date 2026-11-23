@@ -87,6 +87,14 @@ type PeerServer struct {
 	// no-ops or conflicts. Used by the gossip engine (Milestone 4B) to
 	// forward newly received messages to other peers.
 	onNewMessage func(msg *store.Message, senderPodID string)
+
+	// retentionTTL: when non-zero, the private sync endpoints
+	// (GET /internal/sync/ids and POST /internal/sync/messages) exclude expired
+	// messages, preventing anti-entropy from resurrecting them. A zero TTL
+	// (the default) disables retention and the sync endpoints behave exactly
+	// as before. now is the clock used to compute the expiration threshold.
+	retentionTTL time.Duration
+	now          func() time.Time
 }
 
 // maxPeerRequestBodyBytes bounds the inbound request body for
@@ -146,27 +154,45 @@ func NewPeerServerWithStore(mgr *Manager, addr, nodeID, version string, s *store
 
 // NewPeerServerWithStoreAndCallback is like NewPeerServerWithStore but also
 // accepts an optional callback invoked after a successfully inserted (new row)
-// replicated message. The callback receives the message and the authenticated
-// sender's pod identity (extracted from the mTLS client certificate). It is
-// NOT called for duplicate no-ops or conflicts.
-func NewPeerServerWithStoreAndCallback(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
-	return newPeerServer(mgr, addr, nodeID, version, s, enabledMessageExchange, false, onNewMessage)
+// replicated message and a message retention TTL. The callback receives the
+// message and the authenticated sender's pod identity (extracted from the
+// mTLS client certificate). It is NOT called for duplicate no-ops or conflicts.
+// When retentionTTL is non-zero, the inbound message-exchange endpoint
+// (POST /internal/messages) rejects expired messages, so gossip forwarding
+// does not resurrect messages the local replica has already expired. A zero
+// TTL (the default) disables retention and preserves the legacy behavior.
+func NewPeerServerWithStoreAndCallback(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange bool, onNewMessage func(msg *store.Message, senderPodID string), retentionTTL time.Duration) *PeerServer {
+	return newPeerServerWithLifecycle(mgr, addr, nodeID, version, s, enabledMessageExchange, false, onNewMessage, nil, retentionTTL, time.Now)
 }
 
 // NewPeerServerWithSync builds a PeerServer with the given listen address,
-// node identity, application version, local message store, and both the
-// message-exchange and anti-entropy sync flags. When enabledAntiEntropy is
-// true and a store is supplied, the private sync endpoints
-// (GET /internal/sync/ids and POST /internal/sync/messages) are additionally
-// registered on the private peer listener.
-func NewPeerServerWithSync(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
-	return NewPeerServerWithSyncAndLifecycle(mgr, addr, nodeID, version, s, enabledMessageExchange, enabledAntiEntropy, onNewMessage, nil)
+// node identity, application version, local message store, both the
+// message-exchange and anti-entropy sync flags, and a message retention TTL.
+// When enabledAntiEntropy is true and a store is supplied, the private sync
+// endpoints (GET /internal/sync/ids and POST /internal/sync/messages) are
+// additionally registered on the private peer listener. When retentionTTL is
+// non-zero, the sync endpoints exclude expired messages so that anti-entropy
+// does not resurrect them; a zero TTL (the default) preserves the legacy
+// behavior.
+func NewPeerServerWithSync(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string), retentionTTL time.Duration) *PeerServer {
+	return newPeerServerWithLifecycle(mgr, addr, nodeID, version, s, enabledMessageExchange, enabledAntiEntropy, onNewMessage, nil, retentionTTL, time.Now)
+}
+
+// NewPeerServerWithSyncAndRetention is like NewPeerServerWithSyncAndLifecycle
+// but additionally accepts a message retention TTL. When the
+// TTL is non-zero, the private sync endpoints (GET /internal/sync/ids and
+// POST /internal/sync/messages) exclude expired messages so that anti-entropy
+// does not resurrect them. A zero TTL (the default) is identical to
+// NewPeerServerWithSyncAndLifecycle.
+func NewPeerServerWithSyncAndRetention(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string), ctrl *lifecycle.Controller, retentionTTL time.Duration) *PeerServer {
+	return newPeerServerWithLifecycle(mgr, addr, nodeID, version, s, enabledMessageExchange, enabledAntiEntropy, onNewMessage, ctrl, retentionTTL, time.Now)
 }
 
 // NewPeerServerWithSyncAndLifecycle is like NewPeerServerWithSync but also
-// accepts an optional lifecycle.Controller. When the controller is non-nil
-// and lifecycle protection is enabled, all replication endpoints are fenced
-// on the controller's accepted metadata and state:
+// accepts an optional lifecycle.Controller and a message retention TTL. When
+// the controller is non-nil and lifecycle protection is enabled, all
+// replication endpoints are fenced on the controller's accepted metadata and
+// state:
 //
 //   - GET /internal/status exposes the local accepted epoch and lifecycle
 //     state;
@@ -176,23 +202,31 @@ func NewPeerServerWithSync(mgr *Manager, addr, nodeID, version string, s *store.
 //     requests from unready replicas (HTTP 503) and requests with a
 //     mismatched epoch context (HTTP 409).
 //
+// When retentionTTL is non-zero, the message-exchange and sync endpoints
+// reject or exclude expired messages (preventing resurrection through gossip
+// or anti-entropy); a zero TTL (the default) preserves the legacy behavior.
+//
 // The epoch context is carried in bounded HTTP headers (X-GossipGrid-Cluster-ID
 // and X-GossipGrid-Epoch-ID). These headers are NOT proof of peer identity —
 // mTLS is the sole basis for peer identity. The headers carry the caller's
 // self-reported epoch context that the receiver compares against its own
 // authorized metadata.
-func NewPeerServerWithSyncAndLifecycle(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string), ctrl *lifecycle.Controller) *PeerServer {
-	return newPeerServerWithLifecycle(mgr, addr, nodeID, version, s, enabledMessageExchange, enabledAntiEntropy, onNewMessage, ctrl)
+func NewPeerServerWithSyncAndLifecycle(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string), ctrl *lifecycle.Controller, retentionTTL time.Duration) *PeerServer {
+	return newPeerServerWithLifecycle(mgr, addr, nodeID, version, s, enabledMessageExchange, enabledAntiEntropy, onNewMessage, ctrl, retentionTTL, time.Now)
 }
 
-// newPeerServer is the shared builder for PeerServer variants.
+// newPeerServer is the shared builder for PeerServer variants without
+// lifecycle protection or retention (the legacy defaults).
 func newPeerServer(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string)) *PeerServer {
-	return newPeerServerWithLifecycle(mgr, addr, nodeID, version, s, enabledMessageExchange, enabledAntiEntropy, onNewMessage, nil)
+	return newPeerServerWithLifecycle(mgr, addr, nodeID, version, s, enabledMessageExchange, enabledAntiEntropy, onNewMessage, nil, 0, time.Now)
 }
 
 // newPeerServerWithLifecycle is the shared builder for PeerServer variants
-// with optional lifecycle epoch fencing.
-func newPeerServerWithLifecycle(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string), ctrl *lifecycle.Controller) *PeerServer {
+// with optional lifecycle epoch fencing and an optional message retention
+// TTL. When retentionTTL is non-zero, the private sync
+// endpoints exclude expired messages (preventing anti-entropy resurrection);
+// a zero TTL preserves the legacy behavior.
+func newPeerServerWithLifecycle(mgr *Manager, addr, nodeID, version string, s *store.Store, enabledMessageExchange, enabledAntiEntropy bool, onNewMessage func(msg *store.Message, senderPodID string), ctrl *lifecycle.Controller, retentionTTL time.Duration, now func() time.Time) *PeerServer {
 	mux := http.NewServeMux()
 
 	// Status handler: when a lifecycle controller is provided and enabled,
@@ -207,29 +241,41 @@ func newPeerServerWithLifecycle(mgr *Manager, addr, nodeID, version string, s *s
 	// Milestone 4A/4B: register the private message exchange endpoint only
 	// when (a) the message-exchange flag is enabled AND (b) a store is
 	// supplied. When disabled, the endpoint is NOT registered at all.
+	// When retention is enabled, the handler rejects expired inbound
+	// messages (preventing resurrection through gossip). The expiration
+	// threshold is computed dynamically (from the injectable clock) at each
+	// request, not captured once at handler registration.
 	if enabledMessageExchange && s != nil {
 		if ctrl != nil && ctrl.Admission().Enabled() {
-			mux.HandleFunc("POST /internal/messages", newLifecycleMessageExchangeHandler(mgr, s, onNewMessage, ctrl))
+			mux.HandleFunc("POST /internal/messages", newLifecycleMessageExchangeHandler(mgr, s, onNewMessage, ctrl, retentionTTL, now))
 		} else {
-			mux.HandleFunc("POST /internal/messages", newMessageExchangeHandler(mgr, s, onNewMessage))
+			mux.HandleFunc("POST /internal/messages", newMessageExchangeHandler(mgr, s, onNewMessage, retentionTTL, now))
 		}
 	}
 
 	// Milestone 4C: register the private anti-entropy sync endpoints only
 	// when (a) the anti-entropy flag is enabled AND (b) a store is supplied.
+	// When retention is enabled, the sync endpoints exclude expired messages
+	// so anti-entropy does not resurrect them. The expiration threshold is
+	// computed dynamically (from the injectable clock) at each request, not
+	// captured once at handler registration, so a long-running replica whose
+	// clock advances past the TTL does not keep advertising or fetching
+	// messages that have since expired.
 	if enabledAntiEntropy && s != nil {
 		if ctrl != nil && ctrl.Admission().Enabled() {
-			mux.HandleFunc("GET /internal/sync/ids", newLifecycleSyncInventoryHandler(s, ctrl))
-			mux.HandleFunc("POST /internal/sync/messages", newLifecycleSyncFetchHandler(s, ctrl))
+			mux.HandleFunc("GET /internal/sync/ids", newLifecycleSyncInventoryHandler(s, ctrl, retentionTTL, now))
+			mux.HandleFunc("POST /internal/sync/messages", newLifecycleSyncFetchHandler(s, ctrl, retentionTTL, now))
 		} else {
-			mux.HandleFunc("GET /internal/sync/ids", newSyncInventoryHandler(s))
-			mux.HandleFunc("POST /internal/sync/messages", newSyncFetchHandler(s))
+			mux.HandleFunc("GET /internal/sync/ids", newSyncInventoryHandler(s, retentionTTL, now))
+			mux.HandleFunc("POST /internal/sync/messages", newSyncFetchHandler(s, retentionTTL, now))
 		}
 	}
 
 	return &PeerServer{
 		mgr:          mgr,
 		onNewMessage: onNewMessage,
+		retentionTTL: retentionTTL,
+		now:          now,
 		HTTPServer: &http.Server{
 			Addr:              addr,
 			Handler:           mux,
@@ -393,148 +439,9 @@ func setResponseEpochEnvelope(w http.ResponseWriter, snap lifecycle.Authorizatio
 // The message's origin field is immutable metadata identifying its original
 // creator (which may differ from the forwarding peer); mTLS alone does not
 // prove the historical origin of a forwarded message.
-func newMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessage func(msg *store.Message, senderPodID string)) http.HandlerFunc {
+func newMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessage func(msg *store.Message, senderPodID string), retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Reject oversized bodies before reading. MaxBytesReader provides a
-		// second line of defense for chunked requests without Content-Length.
-		if r.ContentLength > maxPeerRequestBodyBytes {
-			writePeerJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxPeerRequestBodyBytes)
-
-		// Validate Content-Type: the endpoint accepts JSON only. A missing
-		// or different content type is a client error (415).
-		if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
-			writePeerJSONError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
-			return
-		}
-
-		dec := json.NewDecoder(r.Body)
-		dec.DisallowUnknownFields()
-
-		var req sendRequest
-		if err := dec.Decode(&req); err != nil {
-			// A type error (e.g. message.body is a number) is a client error.
-			var typeErr *json.UnmarshalTypeError
-			if errors.As(err, &typeErr) {
-				writePeerJSONError(w, http.StatusBadRequest, "invalid request: message field has wrong type")
-				return
-			}
-			// An empty body is a client error.
-			if errors.Is(err, io.EOF) {
-				writePeerJSONError(w, http.StatusBadRequest, "invalid request: empty body")
-				return
-			}
-			// MaxBytesReader returns *http.MaxBytesError when the body exceeds the
-			// limit; the JSON decoder may also surface this as a syntax error
-			// at the offset where the body was truncated.
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
-				writePeerJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
-				return
-			}
-			var syntaxErr *json.SyntaxError
-			if errors.As(err, &syntaxErr) && syntaxErr.Offset > maxPeerRequestBodyBytes {
-				writePeerJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
-				return
-			}
-			writePeerJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid JSON: %v", err))
-			return
-		}
-
-		// Reject multiple JSON values (e.g. {} {} ).
-		var extra any
-		if err := dec.Decode(&extra); err != io.EOF {
-			if err != nil {
-				var maxErr *http.MaxBytesError
-				if errors.As(err, &maxErr) {
-					writePeerJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
-					return
-				}
-				var syntaxErr *json.SyntaxError
-				if errors.As(err, &syntaxErr) && syntaxErr.Offset > maxPeerRequestBodyBytes {
-					writePeerJSONError(w, http.StatusRequestEntityTooLarge, "request body too large")
-					return
-				}
-			}
-			writePeerJSONError(w, http.StatusBadRequest, "invalid JSON: multiple values in request body")
-			return
-		}
-
-		// Parse the message's immutable fields into a store.Message. The
-		// created_at field is a string in the wire format; parse it as an
-		// RFC3339 timestamp.
-		var msg store.Message
-		msg.ID = req.Message.ID
-		msg.Body = req.Message.Body
-		msg.Origin = req.Message.Origin
-		if req.Message.CreatedAt != "" {
-			createdAt, err := time.Parse(time.RFC3339Nano, req.Message.CreatedAt)
-			if err != nil {
-				// Fall back to plain RFC3339 (no fractional seconds).
-				createdAt, err = time.Parse(time.RFC3339, req.Message.CreatedAt)
-				if err != nil {
-					writePeerJSONError(w, http.StatusBadRequest, "invalid request: created_at must be an RFC3339 timestamp")
-					return
-				}
-			}
-			msg.CreatedAt = createdAt
-		}
-
-		// Use the store's validation and idempotent insert. The store
-		// enforces canonical UUIDv7, nonempty body/origin, non-zero
-		// timestamp, bounded body (4096 bytes), and atomic ON CONFLICT DO
-		// NOTHING insert with conflict detection.
-		// Milestone 4B: use InsertReplicatedMessageReturningInserted to
-		// distinguish "new row created" from "duplicate no-op" so that
-		// only genuinely new messages trigger gossip forwarding.
-		inserted, err := s.InsertReplicatedMessageReturningInserted(&msg)
-		if err != nil {
-			switch {
-			case errors.Is(err, store.ErrInvalidID):
-				writePeerJSONError(w, http.StatusBadRequest, "invalid message: id must be a canonical UUIDv7")
-			case errors.Is(err, store.ErrEmptyOrigin):
-				writePeerJSONError(w, http.StatusBadRequest, "invalid message: origin must not be empty")
-			case errors.Is(err, store.ErrMissingTimestamp):
-				writePeerJSONError(w, http.StatusBadRequest, "invalid message: created_at must be a valid non-zero timestamp")
-			case errors.Is(err, store.ErrEmptyBody):
-				writePeerJSONError(w, http.StatusBadRequest, "invalid message: body must not be empty")
-			case errors.Is(err, store.ErrBodyTooLarge):
-				writePeerJSONError(w, http.StatusRequestEntityTooLarge, "invalid message: body exceeds 4096 bytes")
-			case errors.Is(err, store.ErrOriginTooLarge):
-				writePeerJSONError(w, http.StatusRequestEntityTooLarge, "invalid message: origin exceeds 253 bytes")
-			case errors.Is(err, store.ErrDuplicateIDConflict):
-				writePeerJSONError(w, http.StatusConflict, "message ID already exists with conflicting content")
-			default:
-				writePeerJSONError(w, http.StatusInternalServerError, "failed to store message")
-			}
-			return
-		}
-
-		// Milestone 4B: if a new row was created and a callback is
-		// configured, notify the gossip engine to forward this message
-		// to other peers. The callback receives the message and the
-		// authenticated sender's pod identity (for duplicate suppression:
-		// avoid forwarding back to the peer we just received from).
-		if inserted && onNewMessage != nil {
-			senderPodID := extractSenderPodID(r, mgr)
-			onNewMessage(&msg, senderPodID)
-		}
-
-		// Echo the stored message for the caller to confirm what was
-		// persisted. The peer field is the receiver's pod identity (the
-		// authenticated peer the message was sent to), not the sender's.
-		resp := sendResponse{
-			Message: &MessageWire{
-				ID:        msg.ID,
-				Body:      msg.Body,
-				Origin:    msg.Origin,
-				CreatedAt: msg.CreatedAt.UTC().Format(time.RFC3339Nano),
-			},
-			Peer: mgr.Diagnostics().LocalPodID,
-		}
-		writePeerJSON(w, http.StatusOK, resp)
+		newMessageExchangeHandlerInner(w, r, mgr, s, onNewMessage, nil, retentionTTL, now)
 	}
 }
 
@@ -597,7 +504,7 @@ func finalAdmissionCheck(snap lifecycle.AuthorizationSnapshot, reqCtx lifecycle.
 //   - A valid epoch-A request must never be processed using epoch-B
 //     authorization (the final admission boundary revalidates the request
 //     context against the current snapshot).
-func newLifecycleMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessage func(msg *store.Message, senderPodID string), ctrl *lifecycle.Controller) http.HandlerFunc {
+func newLifecycleMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessage func(msg *store.Message, senderPodID string), ctrl *lifecycle.Controller, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Parse the caller's epoch context from headers.
 		reqCtx, err := lifecycle.ParseRequestContext(
@@ -648,14 +555,18 @@ func newLifecycleMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessa
 		}
 
 		// Defer to the existing handler logic for validation and insert.
-		newMessageExchangeHandlerInner(w, r, mgr, s, onNewMessage, preInsertAdmission)
+		// retentionTTL and now are forwarded so the inner handler can
+		// enforce the retention expiration check on inbound messages.
+		newMessageExchangeHandlerInner(w, r, mgr, s, onNewMessage, preInsertAdmission, retentionTTL, now)
 	}
 }
 
 // newLifecycleSyncInventoryHandler returns the handler for
 // GET /internal/sync/ids when lifecycle protection is enabled. It checks the
 // caller's epoch context and the local readiness before serving inventory.
-func newLifecycleSyncInventoryHandler(s *store.Store, ctrl *lifecycle.Controller) http.HandlerFunc {
+// retentionTTL and now are forwarded to the inner handler which computes the
+// expiration threshold dynamically at each request.
+func newLifecycleSyncInventoryHandler(s *store.Store, ctrl *lifecycle.Controller, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqCtx, err := lifecycle.ParseRequestContext(
 			func(name string) []string { return r.Header.Values(name) },
@@ -693,13 +604,15 @@ func newLifecycleSyncInventoryHandler(s *store.Store, ctrl *lifecycle.Controller
 		}
 
 		setResponseEpochEnvelope(w, snap)
-		newSyncInventoryHandlerWithAdmission(s, preDataAdmission)(w, r)
+		newSyncInventoryHandlerWithAdmission(s, preDataAdmission, retentionTTL, now)(w, r)
 	}
 }
 
 // newLifecycleSyncFetchHandler returns the handler for
 // POST /internal/sync/messages when lifecycle protection is enabled.
-func newLifecycleSyncFetchHandler(s *store.Store, ctrl *lifecycle.Controller) http.HandlerFunc {
+// retentionTTL and now are forwarded to the inner handler which computes the
+// expiration threshold dynamically at each request.
+func newLifecycleSyncFetchHandler(s *store.Store, ctrl *lifecycle.Controller, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		reqCtx, err := lifecycle.ParseRequestContext(
 			func(name string) []string { return r.Header.Values(name) },
@@ -736,7 +649,7 @@ func newLifecycleSyncFetchHandler(s *store.Store, ctrl *lifecycle.Controller) ht
 		}
 
 		setResponseEpochEnvelope(w, snap)
-		newSyncFetchHandlerWithAdmission(s, preDataAdmission)(w, r)
+		newSyncFetchHandlerWithAdmission(s, preDataAdmission, retentionTTL, now)(w, r)
 	}
 }
 
@@ -755,7 +668,7 @@ func newLifecycleSyncFetchHandler(s *store.Store, ctrl *lifecycle.Controller) ht
 // request-body I/O) and the store mutation: if authorization is revoked
 // or the epoch changes during request-body parsing, the insert is rejected
 // and the gossip callback is NOT triggered.
-func newMessageExchangeHandlerInner(w http.ResponseWriter, r *http.Request, mgr *Manager, s *store.Store, onNewMessage func(msg *store.Message, senderPodID string), preInsertAdmission func() (int, string)) {
+func newMessageExchangeHandlerInner(w http.ResponseWriter, r *http.Request, mgr *Manager, s *store.Store, onNewMessage func(msg *store.Message, senderPodID string), preInsertAdmission func() (int, string), retentionTTL time.Duration, now func() time.Time) {
 	// Reject oversized bodies before reading. MaxBytesReader provides a
 	// second line of defense for chunked requests without Content-Length.
 	if r.ContentLength > maxPeerRequestBodyBytes {
@@ -848,6 +761,20 @@ func newMessageExchangeHandlerInner(w http.ResponseWriter, r *http.Request, mgr 
 			writePeerJSONError(w, status, reason)
 			return
 		}
+	}
+
+	// Retention expiration check: when retention is enabled (retentionTTL > 0),
+	// reject inbound messages whose creation timestamp is strictly older than
+	// the current expiration threshold (now - TTL). This prevents an expired
+	// message from being reinserted (resurrected) through gossip forwarding
+	// after a cleanup sweep removed it locally. The threshold is computed from
+	// the current clock (not a value captured at handler registration) so a
+	// long-running replica reflects time progression. A zero retentionTTL
+	// (the default) disables this check and preserves the legacy behavior.
+	if retentionTTL > 0 && msg.CreatedAt.Before(store.ExpirationThreshold(retentionTTL, now())) {
+		writePeerJSONError(w, http.StatusConflict,
+			"message expired: created_at is before the retention cutoff")
+		return
 	}
 
 	// Use the store's validation and idempotent insert.
@@ -970,7 +897,13 @@ func extractSenderPodID(r *http.Request, mgr *Manager) string {
 // optional query parameters: after (the exclusive cursor, a canonical UUIDv7)
 // and limit (the page size, 1-1024). It returns a bounded page of message IDs
 // in strict ascending order using keyset pagination.
-func newSyncInventoryHandler(s *store.Store) http.HandlerFunc {
+//
+// retentionTTL and now are used to compute the expiration threshold
+// dynamically at each request (store.ExpirationThreshold(retentionTTL, now())),
+// so a long-running replica does not keep advertising messages that have
+// since expired. A zero retentionTTL (the default) disables retention and the
+// behavior is identical to the legacy ListIDsAfter.
+func newSyncInventoryHandler(s *store.Store, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 
@@ -997,7 +930,15 @@ func newSyncInventoryHandler(s *store.Store) http.HandlerFunc {
 			after = v
 		}
 
-		page, err := s.ListIDsAfter(r.Context(), after, limit)
+		// Exclude expired messages from the inventory so that anti-entropy
+		// does not fetch (and resurrect) messages the local replica has
+		// already expired. The threshold is computed from the current clock
+		// (not a value captured at handler registration) so a long-running
+		// replica reflects time progression. When retention is disabled
+		// (retentionTTL is zero), the threshold is the zero time and this is
+		// identical to ListIDsAfter.
+		threshold := store.ExpirationThreshold(retentionTTL, now())
+		page, err := s.ListIDsAfterWithExpiration(r.Context(), after, limit, threshold)
 		if err != nil {
 			writePeerJSONError(w, http.StatusInternalServerError, "failed to list message IDs")
 			return
@@ -1021,7 +962,12 @@ func newSyncInventoryHandler(s *store.Store) http.HandlerFunc {
 // max 1024 entries) and returns the complete message records in ascending ID
 // order. If any requested ID is missing, an explicit error is returned
 // (partial results are not silently presented as complete).
-func newSyncFetchHandler(s *store.Store) http.HandlerFunc {
+//
+// retentionTTL and now are used to compute the expiration threshold
+// dynamically at each request, so a long-running replica does not return
+// messages that have since expired. A zero retentionTTL (the default) disables
+// retention and the behavior is identical to the legacy GetMessagesByIDs.
+func newSyncFetchHandler(s *store.Store, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Reject oversized bodies before reading.
 		if r.ContentLength > maxSyncRequestBodyBytes {
@@ -1105,10 +1051,37 @@ func newSyncFetchHandler(s *store.Store) http.HandlerFunc {
 		}
 
 		// Fetch the messages. The store returns an error listing missing IDs.
-		msgs, err := s.GetMessagesByIDs(r.Context(), req.IDs)
+		// When retention is enabled, an expired ID is reported as "not found"
+		// (defense in depth: even if the inventory advertised it, the fetch
+		// would not return it, so the peer would not re-insert / resurrect
+		// it). The threshold is computed from the current clock (not a value
+		// captured at handler registration) so a long-running replica
+		// reflects time progression. When retention is disabled (the
+		// threshold is the zero time), this is identical to GetMessagesByIDs.
+		threshold := store.ExpirationThreshold(retentionTTL, now())
+		msgs, err := s.GetMessagesByIDsWithExpiration(r.Context(), req.IDs, threshold)
 		if err != nil {
-			// The error contains the list of missing IDs.
-			writePeerJSONError(w, http.StatusNotFound, err.Error())
+			// A non-nil error means one or more requested IDs are absent or
+			// expired. Convey the missing IDs in a structured 404 response
+			// ("missing_ids" field, request order) so the client can validate
+			// them against the original request instead of parsing a
+			// human-readable error string. The error is guaranteed to be a
+			// *store.missingIDsError (GetMessagesByIDsWithExpiration returns
+			// no other error for this path); a type assertion failure is
+			// impossible but guarded against defensively.
+			var missingErr *store.MissingIDsError
+			if errors.As(err, &missingErr) {
+				missing := missingErr.MissingIDs()
+				if missing == nil {
+					missing = []string{}
+				}
+				writePeerJSON(w, http.StatusNotFound, struct {
+					Error      string   `json:"error,omitempty"`
+					MissingIDs []string `json:"missing_ids"`
+				}{Error: err.Error(), MissingIDs: missing})
+				return
+			}
+			writePeerJSONError(w, http.StatusInternalServerError, "internal error resolving requested message IDs")
 			return
 		}
 
@@ -1154,7 +1127,11 @@ func newSyncFetchHandler(s *store.Store) http.HandlerFunc {
 // small. However, the recheck still provides a precise linearization
 // boundary: a concurrent revocation that happens before the recheck is
 // observed and the request is rejected.
-func newSyncInventoryHandlerWithAdmission(s *store.Store, preDataAdmission func() (int, string)) http.HandlerFunc {
+//
+// retentionTTL and now are used to compute the expiration threshold
+// dynamically at each request (after the admission check passes), so a
+// long-running replica does not advertise messages that have since expired.
+func newSyncInventoryHandlerWithAdmission(s *store.Store, preDataAdmission func() (int, string), retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 
@@ -1190,7 +1167,12 @@ func newSyncInventoryHandlerWithAdmission(s *store.Store, preDataAdmission func(
 			}
 		}
 
-		page, err := s.ListIDsAfter(r.Context(), after, limit)
+		// Exclude expired messages from the inventory (identical to
+		// ListIDsAfter when retention is disabled). The threshold is computed
+		// from the current clock (not a value captured at handler
+		// registration) so a long-running replica reflects time progression.
+		threshold := store.ExpirationThreshold(retentionTTL, now())
+		page, err := s.ListIDsAfterWithExpiration(r.Context(), after, limit, threshold)
 		if err != nil {
 			writePeerJSONError(w, http.StatusInternalServerError, "failed to list message IDs")
 			return
@@ -1219,7 +1201,11 @@ func newSyncInventoryHandlerWithAdmission(s *store.Store, preDataAdmission func(
 // callback closes this gap: if authorization is revoked or the epoch
 // changes during body parsing, the request is rejected before any data is
 // served.
-func newSyncFetchHandlerWithAdmission(s *store.Store, preDataAdmission func() (int, string)) http.HandlerFunc {
+//
+// retentionTTL and now are used to compute the expiration threshold
+// dynamically at each request (after the admission check passes), so a
+// long-running replica does not return messages that have since expired.
+func newSyncFetchHandlerWithAdmission(s *store.Store, preDataAdmission func() (int, string), retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Reject oversized bodies before reading.
 		if r.ContentLength > maxSyncRequestBodyBytes {
@@ -1307,7 +1293,13 @@ func newSyncFetchHandlerWithAdmission(s *store.Store, preDataAdmission func() (i
 		}
 
 		// Fetch the messages. The store returns an error listing missing IDs.
-		msgs, err := s.GetMessagesByIDs(r.Context(), req.IDs)
+		// When retention is enabled, an expired ID is reported as "not found"
+		// (defense in depth). The threshold is computed from the current
+		// clock (not a value captured at handler registration) so a
+		// long-running replica reflects time progression. Identical to
+		// GetMessagesByIDs when retention is disabled.
+		threshold := store.ExpirationThreshold(retentionTTL, now())
+		msgs, err := s.GetMessagesByIDsWithExpiration(r.Context(), req.IDs, threshold)
 		if err != nil {
 			writePeerJSONError(w, http.StatusNotFound, err.Error())
 			return

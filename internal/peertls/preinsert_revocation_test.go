@@ -105,7 +105,7 @@ func TestInboundMessageExchangeRevocationDuringBodyParse(t *testing.T) {
 	}
 
 	mgr := newInboundTestManager(t)
-	handler := newLifecycleMessageExchangeHandler(mgr, st, onNewMessage, ctrl)
+	handler := newLifecycleMessageExchangeHandler(mgr, st, onNewMessage, ctrl, 0, time.Now)
 
 	// Build a valid message request body.
 	body := `{"message":{"id":"019a0000-0000-7000-0000-000000000001","body":"test-body","origin":"gossipgrid-0.test","created_at":"2026-11-21T00:00:00Z"}}`
@@ -192,7 +192,7 @@ func TestInboundMessageExchangeNoRevocationDuringBodyParse(t *testing.T) {
 	}
 
 	mgr := newInboundTestManager(t)
-	handler := newLifecycleMessageExchangeHandler(mgr, st, onNewMessage, ctrl)
+	handler := newLifecycleMessageExchangeHandler(mgr, st, onNewMessage, ctrl, 0, time.Now)
 
 	body := `{"message":{"id":"019a0000-0000-7000-0000-000000000001","body":"test-body","origin":"gossipgrid-0.test","created_at":"2026-11-21T00:00:00Z"}}`
 	blockingReader := newBlockingBodyReader([]byte(body))
@@ -289,7 +289,7 @@ func TestInboundInventoryRevocationAtDataBoundary(t *testing.T) {
 
 	// Now test the full handler path: the initial admission check should
 	// reject (the controller is stopped), so the handler returns early.
-	handler := newLifecycleSyncInventoryHandler(st, ctrl)
+	handler := newLifecycleSyncInventoryHandler(st, ctrl, 0, time.Now)
 	req := httptest.NewRequestWithContext(context.Background(), "GET", "/internal/sync/ids?limit=10", nil)
 	req.Header.Set(lifecycle.HeaderClusterID, "c1")
 	req.Header.Set(lifecycle.HeaderEpochID, "e1")
@@ -320,7 +320,7 @@ func TestInboundFetchRevocationAtDataBoundary(t *testing.T) {
 	st := newInboundTestStore(t)
 	ctrl := newInboundTestController(t, lifecycle.READY, "c1", "e1")
 
-	handler := newLifecycleSyncFetchHandler(st, ctrl)
+	handler := newLifecycleSyncFetchHandler(st, ctrl, 0, time.Now)
 
 	// A valid fetch request body with one UUIDv7 ID.
 	body := `{"ids":["019a0000-0000-7000-0000-000000000001"]}`

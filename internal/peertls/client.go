@@ -763,6 +763,22 @@ type fetchMessagesResponse struct {
 	Messages []SyncMessageWire `json:"messages"`
 }
 
+// missingIDsResponse is the structured 404 response body returned by the peer's
+// sync-fetch endpoint when one or more requested IDs are absent or have expired
+// on the peer. It carries the exact IDs (in request order) that the peer could
+// not serve, in a machine-readable "missing_ids" field, so the client can
+// validate that the reported missing IDs are a subset of the original request
+// instead of parsing a human-readable error string.
+//
+// The "error" field is retained for backward compatibility with a legacy peer
+// that emits the old free-form 404 error body: a client that cannot find a
+// valid "missing_ids" field falls back to the legacy text parse (or, when that
+// also fails, rejects the 404 as malformed).
+type missingIDsResponse struct {
+	Error      string   `json:"error,omitempty"`
+	MissingIDs []string `json:"missing_ids"`
+}
+
 // FetchInventoryPage requests a bounded page of message IDs from a specific
 // expected peer over mTLS. The after parameter is the exclusive cursor
 // (empty string for the first page). The limit is the maximum page size.
@@ -863,12 +879,41 @@ func (c *Client) FetchInventoryPage(ctx context.Context, dialAddr, expectedIdent
 // a specific expected peer over mTLS. The IDs must be validated as canonical
 // UUIDv7 before the call (the server enforces this too).
 //
-// The response is validated:
-//   - The number of returned messages must exactly match the number of
-//     requested IDs (no extra unsolicited records, no missing records);
-//   - Messages must be in deterministic ID-ascending order;
-//   - Each message ID must match one of the requested IDs;
-//   - Timestamps must be valid RFC3339.
+// Success (HTTP 200): the response is validated — the number of returned
+// messages must exactly match the number of requested IDs (no extra
+// unsolicited records, no missing records), messages must be in
+// deterministic ID-ascending order, each message ID must match one of the
+// requested IDs, and timestamps must be valid RFC3339.
+//
+// A 404 (HTTP 404) from the peer's sync-fetch endpoint indicates that one or
+// more requested IDs are absent or have expired on the peer. This is a
+// legitimate, expected outcome when a message expires between the inventory
+// enumeration and the batch fetch: the peer's inventory advertised the ID, but
+// by the time the fetch arrived the message had been expired (and excluded by
+// the peer's retention filter). The 404 response is a structured missing-ID
+// response (a "missing_ids" field carrying the exact IDs the peer could not
+// serve, in request order). FetchMessages validates it against the original
+// request:
+//
+//   - every reported missing ID must be a canonical UUIDv7 that was in the
+//     original request (an unexpected, duplicated, or malformed ID is rejected
+//     — the response is malformed, not a legitimate expiration);
+//   - when every requested ID is missing, this is SUCCESSFUL reconciliation
+//     with zero fetched messages: an empty slice and nil error is returned.
+//     The peer reliably confirmed those IDs are absent/expired, and its
+//     inventory (which excludes expired records) will not re-advertise them,
+//     so the caller can advance its cursor without stalling the batch.
+//   - when only some IDs are missing, a single retry is made with the
+//     remaining present IDs; the retry must return 200 with exactly those
+//     records, which are returned.
+//
+// A 404 whose body is not a valid missing-ID response (no "missing_ids"
+// field, or a legacy text parse that yields no valid request IDs) is rejected
+// as malformed rather than interpreted as an expiration. No retry is ever
+// made for an unexpected ID, so records expiring across successive attempts
+// cannot drive unbounded retries: the anti-entropy cursor is not advanced on
+// a rejected 404 and the IDs are not re-advertised, so the same page is not
+// re-fetched in a loop.
 func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string) ([]SyncMessageWire, error) {
 	body, err := json.Marshal(fetchMessagesRequest{IDs: ids})
 	if err != nil {
@@ -878,7 +923,58 @@ func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity s
 	if err != nil {
 		return nil, err
 	}
-	if status != http.StatusOK {
+	if status == http.StatusNotFound {
+		// Validate the response epoch envelope BEFORE trusting the 404
+		// missing-ID response. A 404 carrying missing_ids can be accepted as
+		// successful reconciliation without envelope validation when lifecycle
+		// enforcement is active; this would allow a wrong-epoch or legacy
+		// peer to confirm message absence (or partial absence) and drive the
+		// cursor forward. Apply the same epoch validation guarantees used
+		// for HTTP 200: reject missing, contradictory, or wrong-epoch
+		// envelopes. When lifecycle enforcement is disabled, the validator
+		// returns nil (legacy behavior preserved).
+		if err := validateResponseEnvelope(respHeaders, expectedIdentity, c.getProvider(), reqCtx); err != nil {
+			return nil, &PeerAckError{identity: expectedIdentity, reason: err.Error()}
+		}
+		// A 404 is only meaningful if it reliably reports which of the
+		// requested IDs are absent/expired. Validate the structured response
+		// against the original request; a malformed or contradictory 404 is
+		// rejected as a protocol error (not a legitimate expiration).
+		missingSet, ok := parseMissingIDsResponse(respBody, ids)
+		if !ok {
+			return nil, &PeerAckError{identity: expectedIdentity,
+				reason: "404 response is not a valid missing-ID response (no missing_ids field, or missing IDs do not match the request); rejected as malformed"}
+		}
+		var presentIDs []string
+		for _, id := range ids {
+			if !missingSet[id] {
+				presentIDs = append(presentIDs, id)
+			}
+		}
+		if len(presentIDs) == 0 {
+			// All requested IDs are confirmed missing/expired. This is
+			// successful reconciliation with zero fetched messages: the peer
+			// reliably confirmed their absence and its inventory will not
+			// re-advertise them, so the caller can advance its cursor.
+			return []SyncMessageWire{}, nil
+		}
+		// Only some IDs are missing: retry once with the present IDs.
+		retryBody, rerr := json.Marshal(fetchMessagesRequest{IDs: presentIDs})
+		if rerr != nil {
+			return nil, fmt.Errorf("encoding retry fetch request: %w", rerr)
+		}
+		respBody, status, respHeaders, reqCtx, err = c.doRequest(ctx, http.MethodPost, "/internal/sync/messages", dialAddr, expectedIdentity, retryBody, maxSyncResponseBodyBytes)
+		if err != nil {
+			return nil, err
+		}
+		if status != http.StatusOK {
+			// The retry failed with a non-200 (genuine protocol error,
+			// network failure, or a second 404). Return the error; the caller
+			// treats this as a failed page and does not advance the cursor.
+			return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
+		}
+		ids = presentIDs // effective ID list after the 404-retry
+	} else if status != http.StatusOK {
 		return nil, &PeerHTTPStatusError{identity: expectedIdentity, status: status, body: string(respBody)}
 	}
 	// Validate the response epoch envelope against the captured request
@@ -894,12 +990,13 @@ func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity s
 	if err := json.Unmarshal(respBody, &out); err != nil {
 		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("decoding fetch response: %v", err)}
 	}
-	// The response must contain exactly the requested number of messages.
+	// The response must contain exactly the number of effective requested
+	// messages (after any 404-retry that reduced the ID list).
 	if len(out.Messages) != len(ids) {
 		return nil, &PeerAckError{identity: expectedIdentity, reason: fmt.Sprintf("expected %d messages but received %d", len(ids), len(out.Messages))}
 	}
-	// Validate: messages must be in ascending order, each ID must be a
-	// requested ID, and no duplicates.
+	// Validate: messages must be in ascending order, each ID must be an
+	// effective requested ID, and no duplicates.
 	requested := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		requested[id] = true
@@ -940,6 +1037,57 @@ func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity s
 		}
 	}
 	return out.Messages, nil
+}
+
+// parseMissingIDsResponse parses a peer's 404 sync-fetch body and returns the
+// set of message IDs reliably reported as missing (or expired), validated
+// against the original request. It returns ok=false when the body does not
+// establish a legitimate missing-ID set:
+//
+//   - the body is not valid JSON, or
+//   - it carries no "missing_ids" field (a malformed or unrelated 404 error
+//     body that does not report which IDs are missing), or
+//   - a reported missing ID is not a canonical UUIDv7, is duplicated, or was
+//     NOT part of the original request (an unrelated or contradictory
+//     response must not be interpreted as an expiration).
+//
+// The returned map contains exactly the validated, request-member missing IDs.
+func parseMissingIDsResponse(body []byte, requested []string) (map[string]bool, bool) {
+	var m missingIDsResponse
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, false
+	}
+	if m.MissingIDs == nil {
+		// No "missing_ids" field: the body does not report missing IDs in a
+		// structured, verifiable form. Reject as malformed (do not fall back
+		// to a legacy text parse: a human-readable error string cannot
+		// establish that the reported IDs belong to the original request).
+		return nil, false
+	}
+	requestedSet := make(map[string]bool, len(requested))
+	for _, id := range requested {
+		requestedSet[id] = true
+	}
+	seen := make(map[string]bool, len(m.MissingIDs))
+	result := make(map[string]bool, len(m.MissingIDs))
+	for _, id := range m.MissingIDs {
+		if validateCanonicalUUIDv7(id) != nil {
+			return nil, false
+		}
+		if !requestedSet[id] {
+			// A reported missing ID that was not in the original request:
+			// the response is unrelated to this fetch. Reject.
+			return nil, false
+		}
+		if seen[id] {
+			// A duplicated missing ID: a well-formed 404 reports each missing
+			// ID at most once. Reject as malformed.
+			return nil, false
+		}
+		seen[id] = true
+		result[id] = true
+	}
+	return result, true
 }
 
 // validateCanonicalUUIDv7 checks that s is a valid canonical UUIDv7 in

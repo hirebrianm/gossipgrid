@@ -56,6 +56,22 @@ func NewWithStoreAndCallback(node Node, s *store.Store, onMessage MessageCallbac
 // existing Milestone 4 behavior is preserved: /readyz always returns 200
 // and POST /api/messages is always accepted.
 func NewWithStoreAndCallbackAndLifecycle(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller) http.Handler {
+	return newMux(node, s, onMessage, ctrl, 0, time.Now)
+}
+
+// NewWithStoreAndCallbackAndRetention is like NewWithStoreAndCallbackAnd
+// Lifecycle but additionally accepts a message retention TTL.
+// When ttl is non-zero, expired messages are excluded from the public
+// message API (GET /api/messages and GET /api/messages/{id}). When ttl is
+// zero (the default), retention is disabled and the behavior is identical to
+// NewWithStoreAndCallbackAndLifecycle.
+func NewWithStoreAndCallbackAndRetention(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller, ttl time.Duration) http.Handler {
+	return newMux(node, s, onMessage, ctrl, ttl, time.Now)
+}
+
+// newMux builds the public message-API mux with an optional lifecycle
+// controller and an optional message retention TTL.
+func newMux(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller, ttl time.Duration, now func() time.Time) http.Handler {
 	mux := http.NewServeMux()
 	// "GET /{$}" matches the root path exactly ({$} = end-of-path), so
 	// unrecognized paths fall through to 404 rather than serving the root page.
@@ -80,6 +96,8 @@ func NewWithStoreAndCallbackAndLifecycle(node Node, s *store.Store, onMessage Me
 		if ctrl != nil && ctrl.Admission().Enabled() {
 			mh.lifecycleCtrl = ctrl
 		}
+		mh.retentionTTL = ttl
+		mh.now = now
 		mux.HandleFunc("POST /api/messages", mh.postMessages)
 		mux.HandleFunc("GET /api/messages", mh.getMessages)
 		mux.HandleFunc("GET /api/messages/{id}", mh.getMessage)

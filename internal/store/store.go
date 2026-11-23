@@ -7,8 +7,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -73,18 +75,68 @@ var (
 
 // Store holds the database handle for local message persistence.
 type Store struct {
-	db *gorm.DB
+	db     *gorm.DB
+	dbPath string // absolute path to the SQLite database file (for WAL file size checks)
+}
+
+// NewWithLogger is like New but uses the supplied logger for non-fatal
+// maintenance initialisation warnings (auto_vacuum, journal_size_limit).
+// A nil logger falls back to the default New behaviour (stderr).
+func NewWithLogger(path string, logger *slog.Logger) (*Store, error) {
+	return newStore(path, logger)
 }
 
 // New opens (or creates) the SQLite database at path, applies WAL and busy
 // timeout pragmas, sets up the connection pool, and runs AutoMigrate.
 // It returns the Store and a close function that cleanly releases the DB.
+//
+// Non-fatal maintenance initialisation failures (auto_vacuum on a new
+// database, journal_size_limit) are logged to stderr (no logger available).
+// Use NewWithLogger to route them through a configured logger instead.
 func New(path string) (*Store, error) {
+	return newStore(path, nil)
+}
+
+// newStore is the shared implementation of New and NewWithLogger.
+func newStore(path string, log *slog.Logger) (*Store, error) {
 	dir := filepath.Dir(path)
 	if dir != "." && dir != "" {
 		//nolint:gosec/G301 // 0o750: directory is owned by the application user; world-read is not needed
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return nil, fmt.Errorf("creating database directory %q: %w", dir, err)
+		}
+	}
+
+	// Determine whether the database file already exists (before GORM
+	// opens it). A non-existent file means a new database; we can set
+	// auto_vacuum=INCREMENTAL before any schema is created. An existing
+	// file means an existing database; we must NOT silently convert its
+	// auto_vacuum mode (a full VACUUM is deferred to a manual operator
+	// action).
+	_, statErr := os.Stat(path)
+	isNewDB := os.IsNotExist(statErr)
+
+	// For a new database, set auto_vacuum=INCREMENTAL before GORM opens
+	// it. This pragma can only be changed when the database is empty
+	// (no tables), so it must be set before any schema is created.
+	// For an existing database, skip this step (no silent conversion).
+	//
+	// Failure policy (new database): a failed auto_vacuum init is NOT
+	// fatal — the database is fully functional, just without incremental
+	// reclamation. The operator can manually run a full VACUUM + set
+	// auto_vacuum=INCREMENTAL during a maintenance window. The failure is
+	// logged (stderr) so it is observable rather than silently ignored.
+	if isNewDB {
+		if err := setNewDatabaseAutoVacuum(path); err != nil {
+			msg := fmt.Sprintf("gossipgrid: warning: failed to set auto_vacuum=INCREMENTAL on new database %q: %v "+
+				"(the database is functional; incremental page reclamation is unavailable; "+
+				"run a full VACUUM during a maintenance window to convert the database)",
+				path, err)
+			if log != nil {
+				log.Warn(msg)
+			} else {
+				fmt.Fprintf(os.Stderr, "%s\n", msg)
+			}
 		}
 	}
 
@@ -105,6 +157,23 @@ func New(path string) (*Store, error) {
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetMaxIdleConns(1)
 
+	// Apply WAL maintenance pragmas (journal_size_limit) after the
+	// database is open. This is safe for both new and existing databases.
+	//
+	// Failure policy: a failed journal_size_limit is NOT fatal — the WAL
+	// still works (it just may grow larger than the limit under normal
+	// checkpointing). The failure is logged (stderr) so it is observable.
+	if err := applyWALPragmas(sqlDB); err != nil {
+		msg := fmt.Sprintf("gossipgrid: warning: failed to set PRAGMA journal_size_limit=%d on database %q: %v "+
+			"(the database is functional; the WAL may grow beyond the 64 MiB retained-file target)",
+			walJournalSizeLimitBytes, path, err)
+		if log != nil {
+			log.Warn(msg)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s\n", msg)
+		}
+	}
+
 	// AutoMigrate creates or updates the schema for both the messages table
 	// and the local_metadata table (Milestone 5A). The local_metadata table
 	// is a singleton row that binds the entire SQLite database to exactly
@@ -115,7 +184,31 @@ func New(path string) (*Store, error) {
 		return nil, fmt.Errorf("auto-migrating schema: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	// Create the created_at index for efficient expiration queries
+	// (DeleteExpired and the expiration filter in List/Get/Inventory).
+	// The index is idempotent: on an existing database without the index,
+	// this creates it; on a database that already has it, this is a no-op.
+	// The created_at column is a plain TEXT column (no GORM auto-managed
+	// index), so the index must be created explicitly. It is a non-unique
+	// index (many messages share a creation timestamp).
+	//
+	// The index cost on an existing database is a one-time O(n) build (n =
+	// number of rows). This is acceptable because it runs once at startup
+	// and significantly speeds up every subsequent expiration query.
+	// The index is NOT a migration that changes existing data; it only
+	// adds a secondary structure.
+	if err := ensureCreatedAtIndex(db); err != nil {
+		return nil, fmt.Errorf("ensuring created_at index: %w", err)
+	}
+
+	// Resolve the absolute path for the WAL file size check.
+	absPath := path
+	if !filepath.IsAbs(path) {
+		if cwd, err := os.Getwd(); err == nil {
+			absPath = filepath.Join(cwd, path)
+		}
+	}
+	return &Store{db: db, dbPath: absPath}, nil
 }
 
 // Close releases the underlying database connection.
@@ -394,8 +487,8 @@ func (s *Store) FindMissingIDs(ctx context.Context, ids []string) ([]string, err
 // GetMessagesByIDs retrieves complete message records for the supplied IDs.
 // It validates each ID as a canonical UUIDv7 and returns the found messages
 // in deterministic ID-ascending order. If any supplied ID is not found, the
-// method returns the found messages plus an error listing the missing IDs
-// (the caller decides whether partial results are acceptable).
+// method returns the found messages plus a *missingIDsError carrying the
+// missing IDs (the caller decides whether partial results are acceptable).
 //
 // The query is cancellable through context.
 func (s *Store) GetMessagesByIDs(ctx context.Context, ids []string) ([]*Message, error) {
@@ -414,8 +507,14 @@ func (s *Store) GetMessagesByIDs(ctx context.Context, ids []string) ([]*Message,
 	if err := query.Order("id ASC").Find(&msgs).Error; err != nil {
 		return nil, fmt.Errorf("fetching messages by ID: %w", err)
 	}
+	return splitMissing(msgs, ids)
+}
 
-	// Determine which requested IDs are missing.
+// splitMissing splits the found messages from the requested IDs into the
+// found records (in ID-ascending order) and the requested IDs that were not
+// found. When any IDs are missing it returns the found records plus a
+// *MissingIDsError; otherwise it returns the records with a nil error.
+func splitMissing(msgs []Message, ids []string) ([]*Message, error) {
 	found := make(map[string]bool, len(msgs))
 	for i := range msgs {
 		found[msgs[i].ID] = true
@@ -426,19 +525,384 @@ func (s *Store) GetMessagesByIDs(ctx context.Context, ids []string) ([]*Message,
 			missing = append(missing, id)
 		}
 	}
-	if len(missing) > 0 {
-		result := make([]*Message, len(msgs))
-		for i := range msgs {
-			result[i] = &msgs[i]
-		}
-		return result, fmt.Errorf("message IDs not found: %v", missing)
-	}
-
 	result := make([]*Message, len(msgs))
 	for i := range msgs {
 		result[i] = &msgs[i]
 	}
+	if len(missing) > 0 {
+		return result, &MissingIDsError{missing: missing}
+	}
 	return result, nil
+}
+
+// MissingIDsError is a typed error carrying the set of message IDs that were
+// requested but were not found (absent, or expired under a retention
+// threshold). It exists so the sync-fetch endpoint can convey the missing IDs
+// to a peer in a structured, machine-readable form (the 404 response's
+// "missing_ids" field) rather than relying on a peer parsing a
+// human-readable error string.
+//
+// The error is only ever produced by GetMessagesByIDs /
+// GetMessagesByIDsWithExpiration for the exact IDs that were requested and
+// not returned, so a peer that receives the corresponding 404 response can
+// validate each reported ID against its original request and trust the set.
+type MissingIDsError struct {
+	missing []string
+}
+
+func (e *MissingIDsError) Error() string {
+	return fmt.Sprintf("message IDs not found: %v", e.missing)
+}
+
+// MissingIDs returns the message IDs reported as missing by this error, in
+// the order they were requested. The empty set means no IDs were missing.
+func (e *MissingIDsError) MissingIDs() []string {
+	return e.missing
+}
+
+// ExpirationThreshold returns the strict upper bound on a message's creation
+// timestamp for it to be considered retained (non-expired) at the given
+// reference time. A message with CreatedAt strictly before this threshold is
+// expired; a message exactly at or after it is retained. The zero threshold
+// means retention is disabled (no message is expired).
+//
+// The threshold is derived from a single, consistent reference time so that
+// all read paths (API listing, single fetch, inventory, sync) and the cleanup
+// path agree on the same cutoff. It is the canonical expression of "a message
+// is expired when now - CreatedAt >= TTL": the boundary is created_at < now -
+// TTL. Using a strict "<" at the boundary means a message whose age exactly
+// equals the TTL is retained for that instant, and becomes expired on the
+// next evaluation — a deliberately conservative choice that avoids deleting
+// a message the instant it reaches the boundary under clock skew.
+func ExpirationThreshold(ttl time.Duration, now time.Time) time.Time {
+	if ttl <= 0 {
+		return time.Time{}
+	}
+	return now.Add(-ttl)
+}
+
+// expiredFilter returns the GORM Where clause that restricts a query to
+// retained (non-expired) messages, or an empty string when retention is
+// disabled (threshold is the zero time). The zero threshold is used as the
+// "disabled" sentinel: when ttl is zero, ExpirationThreshold returns the zero
+// time and this returns "", so callers may append it unconditionally without
+// changing the query. Retained means CreatedAt >= threshold (a message exactly
+// at the cutoff is retained; strictly older is expired).
+func expiredFilter(threshold time.Time) string {
+	if threshold.IsZero() {
+		return ""
+	}
+	return "created_at >= ?"
+}
+
+// ListWithExpiration is like List but excludes expired messages (those with
+// CreatedAt strictly before the given expiration threshold). When the
+// threshold is the zero time (retention disabled), it is identical to List.
+// The total count reflects only retained messages, so the API listing and its
+// "total" cannot diverge on an expired row.
+func (s *Store) ListWithExpiration(limit, offset int, threshold time.Time) ([]Message, int64, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	var total int64
+	query := s.db.Model(&Message{})
+	if f := expiredFilter(threshold); f != "" {
+		query = query.Where(f, threshold)
+	}
+	if err := query.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+
+	listQuery := s.db
+	if f := expiredFilter(threshold); f != "" {
+		listQuery = listQuery.Where(f, threshold)
+	}
+	var msgs []Message
+	if err := listQuery.Order("created_at DESC").Limit(limit).Offset(offset).Find(&msgs).Error; err != nil {
+		return nil, 0, err
+	}
+	return msgs, total, nil
+}
+
+// GetByIDWithExpiration is like GetByID but returns gorm.ErrRecordNotFound for
+// an expired message (one with CreatedAt strictly before the threshold), so an
+// expired message is indistinguishable from an absent one to the API. When the
+// threshold is the zero time (retention disabled), it is identical to GetByID.
+func (s *Store) GetByIDWithExpiration(id string, threshold time.Time) (*Message, error) {
+	query := s.db.Where("id = ?", id)
+	if f := expiredFilter(threshold); f != "" {
+		query = query.Where(f, threshold)
+	}
+	var msg Message
+	if err := query.First(&msg).Error; err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
+// ListIDsAfterWithExpiration is like ListIDsAfter but the keyset inventory
+// scan is restricted to retained messages (those with CreatedAt at or after
+// the threshold). This is the anti-entropy resurrection guard: a peer's
+// inventory (GET /internal/sync/ids) must not advertise IDs of messages it has
+// already expired, otherwise a peer with a shorter retention would fetch and
+// re-insert (resurrect) a message that the source considers dead. When the
+// threshold is the zero time (retention disabled), it is identical to
+// ListIDsAfter.
+func (s *Store) ListIDsAfterWithExpiration(ctx context.Context, after string, limit int, threshold time.Time) (*InventoryPage, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("page limit must be at least 1 (got %d)", limit)
+	}
+
+	query := s.db.WithContext(ctx).Model(&Message{}).Order("id ASC").Limit(limit + 1)
+	if f := expiredFilter(threshold); f != "" {
+		query = query.Where(f, threshold)
+	}
+	if after != "" {
+		query = query.Where("id > ?", after)
+	}
+
+	var ids []string
+	if err := query.Pluck("id", &ids).Error; err != nil {
+		return nil, fmt.Errorf("listing message IDs: %w", err)
+	}
+
+	page := &InventoryPage{IDs: ids}
+	if len(ids) > limit {
+		page.HasMore = true
+		page.IDs = ids[:limit]
+		page.NextCursor = ids[limit-1]
+	} else {
+		page.HasMore = false
+	}
+	return page, nil
+}
+
+// GetMessagesByIDsWithExpiration is like GetMessagesByIDs but, in addition to
+// the "ID not found" error for absent records, it also reports as missing any
+// record that has expired (CreatedAt strictly before the threshold). This is
+// the second anti-entropy resurrection guard (defense in depth): even if an
+// expired ID were advertised in an inventory page, the fetch (POST
+// /internal/sync/messages) would return it as "not found", so the peer would
+// not re-insert it. When the threshold is the zero time (retention disabled),
+// it is identical to GetMessagesByIDs.
+func (s *Store) GetMessagesByIDsWithExpiration(ctx context.Context, ids []string, threshold time.Time) ([]*Message, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	for _, id := range ids {
+		if err := validateCanonicalUUIDv7(id); err != nil {
+			return nil, err
+		}
+	}
+
+	query := s.db.WithContext(ctx).Where("id IN ?", ids)
+	if f := expiredFilter(threshold); f != "" {
+		query = query.Where(f, threshold)
+	}
+	var msgs []Message
+	if err := query.Order("id ASC").Find(&msgs).Error; err != nil {
+		return nil, fmt.Errorf("fetching messages by ID: %w", err)
+	}
+	return splitMissing(msgs, ids)
+}
+
+// deleteBatchSize is the maximum number of rows deleted per batch in
+// DeleteExpired. Bounding the batch size prevents the cleaner from holding
+// the SQLite writer lock for excessively long periods on a database with
+// many expired rows. The default is 1000 rows per batch: a batch of 1000
+// row deletions (each with a small row size) completes quickly, and the
+// remaining expired rows are deleted in subsequent batches within the same
+// sweep. A batch that finds no more eligible rows terminates the sweep.
+const deleteBatchSize = 1000
+
+// DeleteExpired permanently removes messages with CreatedAt strictly before
+// the given expiration threshold, in bounded batches, up to a total-row
+// budget. It returns the number of rows deleted on this call. When the
+// threshold is the zero time (retention disabled), it is a no-op returning 0.
+//
+// Batching: the deletion is performed in batches of deleteBatchSize rows.
+// Each batch is a single bounded DELETE with a LIMIT clause (using
+// SQLite's "DELETE FROM ... WHERE ... LIMIT ?" via a subquery on the
+// primary-key index). This prevents the cleaner from holding the writer lock
+// for excessively long periods and allows concurrent readers and writers to
+// make progress between batches.
+//
+// Total-work budget: the batch loop stops as soon as it has deleted
+// maxTotal rows on this call, even if more eligible rows remain. An
+// unfinished backlog is not lost: it resumes on the next scheduled sweep
+// (the caller re-runs DeleteExpired with a fresh budget). This guarantees a
+// single sweep is bounded in work and cannot run indefinitely in the face of
+// continuous incoming writes.
+//
+// Time budget: if deadline is non-nil, the loop also stops once time.Now()
+// passes it. The deadline is passed via a derived context (ctx) so that both
+// this check and the context check below bound the sweep in wall-clock time,
+// not only in row count.
+//
+// Cancellation: the context is checked before each batch and passed to the
+// database operation. If the context is cancelled (e.g., during shutdown, or
+// the time-budget deadline has passed), the in-flight batch is aborted and the
+// method returns the partial count with no error (a stopped sweep is not a
+// failure; the remaining rows are deleted on the next sweep).
+//
+// Idempotency: re-running on an already-clean database deletes nothing (the
+// first batch finds no eligible rows and returns immediately).
+//
+// maxTotal < 0 means "no total-row budget" (delete all eligible rows). This
+// is a compatibility default; the retention cleaner always supplies a positive
+// budget.
+//
+// The created_at index (created by ensureCreatedAtIndex) makes the
+// "created_at < threshold" predicate efficient (an index range scan rather
+// than a full table scan). The batch's inner query uses the primary-key
+// index (WHERE id IN (SELECT ...)) to bound the deletion.
+func (s *Store) DeleteExpired(ctx context.Context, threshold time.Time, maxTotal int64, deadline *time.Time) (int64, error) {
+	if threshold.IsZero() {
+		return 0, nil
+	}
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return 0, fmt.Errorf("accessing underlying sql.DB: %w", err)
+	}
+	var total int64
+	for {
+		if !ctxOk(ctx) {
+			return total, nil // cancelled: return the partial count
+		}
+		// Time budget: stop once the wall-clock deadline has passed. The
+		// deadline is a strict wall-clock cap on the sweep (it bounds the
+		// sweep in time, not only in row count); it is checked against
+		// time.Now. (The caller does NOT derive a context deadline from it,
+		// so the deadline is a pure wall-clock check that is independent of
+		// the caller's logical clock.)
+		if deadline != nil && time.Now().After(*deadline) {
+			return total, nil
+		}
+		// Total-row budget: stop once the budget for this call is exhausted.
+		// A negative maxTotal means "no budget" (delete all eligible rows).
+		if maxTotal >= 0 && total >= maxTotal {
+			return total, nil
+		}
+		// Bounded batch: delete up to deleteBatchSize rows with
+		// created_at < threshold, capped by the remaining budget. The inner
+		// SELECT uses the created_at index to find the first N eligible IDs
+		// (by creation time); the outer DELETE removes them by primary key.
+		// The batch limit is min(deleteBatchSize, remaining budget) so the
+		// batch never exceeds the total-row budget.
+		batch := int64(deleteBatchSize)
+		if maxTotal >= 0 {
+			rem := maxTotal - total
+			if rem < batch {
+				batch = rem
+			}
+		}
+		// Execute the batch delete in a short-lived transaction using a
+		// PREPARED statement on the raw driver. Using database/sql directly
+		// (rather than GORM's Exec) is essential: GORM's Exec reports the
+		// subquery's row count (1000) for the DELETE ... IN (SELECT ... LIMIT)
+		// form, not the number of rows actually deleted (up to 2000, because
+		// the subquery can return duplicate IDs that resolve to the same
+		// message row). A prepared statement's RowsAffected correctly counts
+		// the deleted rows, so the batch accounting and budget are accurate.
+		tx, terr := sqlDB.BeginTx(ctx, &sql.TxOptions{})
+		if terr != nil {
+			// A context cancellation during begin is a graceful stop; a real
+			// error is returned.
+			if ctxOk(ctx) {
+				return total, fmt.Errorf("beginning delete batch: %w", terr)
+			}
+			return total, nil
+		}
+		deleted, derr := deleteBatchTx(ctx, tx, threshold, batch)
+		if derr != nil {
+			// Roll back the failed batch so its (partial) deletion is never
+			// committed. A context cancellation during the delete is a
+			// graceful stop, not a failure: return the partial count (rows
+			// deleted in batches committed before the interruption) with no
+			// error. The remaining rows are deleted on the next sweep.
+			rollbackFailedBatch(tx)
+			if ctxOk(ctx) {
+				return total, fmt.Errorf("deleting expired messages: %w", derr)
+			}
+			return total, nil
+		}
+		// Commit only after the batch delete executed successfully. Check and
+		// propagate the commit error: a commit that failed (e.g. a SQLite busy
+		// or I/O error) means the batch's deletions were NOT persisted, so it
+		// must not be counted. Roll the failed batch back and stop the sweep
+		// (the caller logs it and resumes on the next sweep).
+		if cerr := tx.Commit(); cerr != nil {
+			rollbackFailedBatch(tx)
+			if ctxOk(ctx) {
+				return total, fmt.Errorf("committing delete batch: %w", cerr)
+			}
+			return total, nil
+		}
+		// Only a successfully committed batch contributes to the count.
+		total += deleted
+		// A batch that deleted fewer rows than the batch limit means all
+		// eligible rows (or the budget) are gone. Terminate.
+		if deleted < batch {
+			return total, nil
+		}
+		// A full batch: continue to the next batch (subject to the budgets
+		// and cancellation checks at the top of the loop).
+	}
+}
+
+// deleteBatchTx executes one bounded batch of expired-message deletions
+// inside the supplied transaction and returns the number of rows actually
+// deleted (from the prepared statement's RowsAffected, which is accurate for
+// the DELETE ... IN (SELECT ...) form, unlike GORM's Exec). The inner SELECT
+// uses the created_at index to find the first `limit` eligible IDs (by
+// creation time); the outer DELETE removes them by primary key.
+func deleteBatchTx(ctx context.Context, tx *sql.Tx, threshold time.Time, limit int64) (int64, error) {
+	stmt, err := tx.PrepareContext(ctx,
+		"DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE created_at < ? ORDER BY created_at ASC, id ASC LIMIT ?)")
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		//nolint:errcheck,gosec/G104 // statement close during a batch; error not observable
+		_ = stmt.Close()
+	}()
+	res, err := stmt.ExecContext(ctx, threshold, limit)
+	if err != nil {
+		return 0, err
+	}
+	deleted, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+// rollbackFailedBatch rolls back a delete batch transaction whose delete or
+// commit failed, so a partial deletion is never committed. The error is not
+// observable (the batch is already being abandoned as failed or cancelled),
+// so it is discarded.
+func rollbackFailedBatch(tx *sql.Tx) {
+	//nolint:errcheck,gosec/G104 // rollback during a failed/cancelled batch; error not observable
+	_ = tx.Rollback()
+}
+
+// ensureCreatedAtIndex creates the index on the messages.created_at column
+// if it does not already exist. The index is named idx_messages_created_at
+// and is a non-unique index (many messages share a creation timestamp).
+// The operation is idempotent: on a database that already has the index,
+// this is a no-op (CREATE INDEX IF NOT EXISTS).
+//
+// The index is required for efficient expiration queries:
+//   - DeleteExpired: "created_at < threshold" (a range scan on the index);
+//   - The expiration filter in List/Get/Inventory: "created_at >= threshold"
+//     (also a range scan on the index).
+//
+// The index cost on an existing database is a one-time O(n) build. This is
+// acceptable because it runs once at startup and significantly speeds up
+// every subsequent expiration query. The index does not change existing
+// data; it only adds a secondary lookup structure.
+func ensureCreatedAtIndex(db *gorm.DB) error {
+	return db.Exec("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages (created_at)").Error
 }
 
 // validateCanonicalUUIDv7 checks that s is a valid canonical UUIDv7 in

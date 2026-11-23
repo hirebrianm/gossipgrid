@@ -820,7 +820,7 @@ func newFiveNodeBase(t *testing.T, ca *testCA, podID string) *fiveNode {
 			SenderPodID: senderPodID,
 		})
 	}
-	peerSrv := peertls.NewPeerServerWithStoreAndCallback(mgr, ":0", podID, "v0.1.0-5n", st, true, onNewMsg)
+	peerSrv := peertls.NewPeerServerWithStoreAndCallback(mgr, ":0", podID, "v0.1.0-5n", st, true, onNewMsg, 0)
 	tlsListener, err := tls.Listen("tcp", "127.0.0.1:0", mgr.TLSConfigForServer())
 	if err != nil {
 		t.Fatalf("%s: tls.Listen: %v", podID, err)

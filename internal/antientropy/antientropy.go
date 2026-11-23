@@ -272,6 +272,13 @@ type Engine struct {
 	localStore LocalStore
 	now        func() time.Time
 
+	// retentionTTL: when non-zero, fetchAndInsert rejects fetched messages
+	// whose creation timestamp is strictly older than the current expiration
+	// threshold (now - TTL), preventing anti-entropy from resurrecting
+	// messages that have expired. A zero TTL (the default) disables the
+	// check and preserves the legacy behavior.
+	retentionTTL time.Duration
+
 	// Bounded worker channel: one slot per eligible peer (bounded by workers).
 	workCh chan PeerTarget
 
@@ -380,6 +387,17 @@ func (e *Engine) SetCommitGuard(guard CommitGuard) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.commitGuard = guard
+}
+
+// SetRetentionTTL configures the message retention TTL for the anti-entropy
+// engine. When non-zero, fetchAndInsert rejects fetched messages whose
+// creation timestamp is strictly older than the current expiration threshold
+// (now - TTL), preventing anti-entropy from resurrecting expired messages.
+// A zero TTL (the default) disables the check. Must be called before Start.
+func (e *Engine) SetRetentionTTL(ttl time.Duration) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.retentionTTL = ttl
 }
 
 // admissionOK returns nil when outbound anti-entropy is currently authorized,
@@ -945,6 +963,32 @@ func (e *Engine) fetchAndInsert(ctx context.Context, target PeerTarget, missing 
 			// matching the existing conflict/insert-error behavior.
 			if err := e.admissionOK(ctx); err != nil {
 				return fmt.Errorf("lifecycle lockout before inserting message %q from peer %s: %w", m.ID, target.PodIdentity, err)
+			}
+
+			// Retention expiration check: when retention is enabled
+			// (retentionTTL > 0), reject messages whose creation timestamp is
+			// strictly older than the current expiration threshold (now - TTL).
+			// This prevents anti-entropy from resurrecting a message that the
+			// local replica has already expired (e.g. after a cleanup sweep).
+			// The threshold is computed from the current clock (e.now, not a
+			// value captured at engine start) so a long-running replica
+			// reflects time progression. A zero retentionTTL (the default)
+			// disables this check.
+			//
+			// Expiration between inventory, fetch, and insert is handled
+			// gracefully: the message is skipped (no insert, no error, no
+			// conflict), so the page is NOT failed and the cursor IS advanced.
+			// This prevents endless anti-entropy retries for a message that
+			// has legitimately expired. The next cycle's inventory will not
+			// advertise the expired ID (the server-side filter excludes it),
+			// so the skip is a one-time no-op.
+			if e.retentionTTL > 0 && msg.CreatedAt.Before(store.ExpirationThreshold(e.retentionTTL, e.now())) {
+				e.logger.Debug("anti-entropy: skipping expired message",
+					slog.String("peer", target.PodIdentity),
+					slog.String("id", m.ID),
+				)
+				e.st.alreadyPresent.Add(1)
+				continue
 			}
 
 			inserted, err := e.localStore.InsertReplicatedMessageReturningInserted(msg)

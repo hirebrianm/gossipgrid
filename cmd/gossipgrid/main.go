@@ -29,6 +29,7 @@ import (
 	"gossipgrid/internal/gossip"
 	"gossipgrid/internal/lifecycle"
 	"gossipgrid/internal/peertls"
+	"gossipgrid/internal/retention"
 	"gossipgrid/internal/server"
 	"gossipgrid/internal/store"
 	"gossipgrid/internal/web"
@@ -99,7 +100,9 @@ func run() (retErr error) {
 
 	// Initialize local message storage before reporting readiness.
 	// Storage must be ready before the HTTP listener starts accepting traffic.
-	st, err := store.New(cfg.DBPath)
+	// NewWithLogger routes non-fatal maintenance init warnings (auto_vacuum,
+	// journal_size_limit) through the configured logger instead of stderr.
+	st, err := store.NewWithLogger(cfg.DBPath, logger)
 	if err != nil {
 		return fmt.Errorf("initializing local storage at %q: %w", cfg.DBPath, err)
 	}
@@ -270,31 +273,43 @@ func run() (retErr error) {
 		// When lifecycle protection is enabled (lifeCtrl != nil), use the
 		// lifecycle-aware constructor which fences all replication
 		// endpoints on the controller's accepted metadata and state.
+		//
+		// Message retention: every inbound replication path (gossip
+		// POST /internal/messages and anti-entropy sync endpoints) must
+		// receive the configured retention TTL. This is true regardless of
+		// whether anti-entropy is enabled: gossip-only replication (gossip
+		// on, anti-entropy off) is an enabled inbound replication path that
+		// must reject expired messages. A zero TTL (retention disabled)
+		// makes every constructor identical to the legacy behavior.
 		if cfg.AntiEntropyEnabled {
+			// Sync endpoints exclude expired messages so anti-entropy does not
+			// resurrect them. The message-exchange endpoint (registered when
+			// peer message exchange is enabled) also rejects expired messages.
 			if onNewMsg != nil {
-				if lifeCtrl != nil {
-					peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, onNewMsg, lifeCtrl)
-				} else {
-					peerSrv = peertls.NewPeerServerWithSync(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, onNewMsg)
-				}
+				peerSrv = peertls.NewPeerServerWithSyncAndRetention(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, onNewMsg, lifeCtrl, cfg.MessageRetentionTTL)
 			} else {
-				if lifeCtrl != nil {
-					peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, nil, lifeCtrl)
-				} else {
-					peerSrv = peertls.NewPeerServerWithSync(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, nil)
-				}
+				peerSrv = peertls.NewPeerServerWithSyncAndRetention(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, true, nil, lifeCtrl, cfg.MessageRetentionTTL)
 			}
 		} else if onNewMsg != nil {
+			// Gossip enabled, anti-entropy disabled: the message-exchange
+			// endpoint (POST /internal/messages) is the inbound replication
+			// path. It must reject expired messages when retention is enabled.
 			if lifeCtrl != nil {
-				peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, false, onNewMsg, lifeCtrl)
+				peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, false, onNewMsg, lifeCtrl, cfg.MessageRetentionTTL)
 			} else {
-				peerSrv = peertls.NewPeerServerWithStoreAndCallback(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, onNewMsg)
+				peerSrv = peertls.NewPeerServerWithStoreAndCallback(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, onNewMsg, cfg.MessageRetentionTTL)
 			}
 		} else {
+			// No gossip or anti-entropy: only the message-exchange endpoint
+			// (if enabled) is registered. Retention still applies to it.
 			if lifeCtrl != nil {
-				peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, false, nil, lifeCtrl)
+				peerSrv = peertls.NewPeerServerWithSyncAndLifecycle(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, false, nil, lifeCtrl, cfg.MessageRetentionTTL)
 			} else {
-				peerSrv = peertls.NewPeerServerWithStore(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled)
+				// Reuse the retention-aware constructor (nil callback, retention
+				// TTL) so that the peer-exchange endpoint rejects expired
+				// inbound messages, matching every other retention-aware
+				// configuration. A zero TTL preserves the legacy behavior.
+				peerSrv = peertls.NewPeerServerWithStoreAndCallback(peerMgr, cfg.PeerAddr, cfg.NodeID, Version, st, cfg.PeerMessageExchangeEnabled, nil, cfg.MessageRetentionTTL)
 			}
 		}
 	}
@@ -353,6 +368,7 @@ func run() (retErr error) {
 		FIPSEnabled:  fipsEnabled,
 		AuthProvider: authProvider,
 		CookieSecure: cfg.AuthCookieSecure,
+		RetentionTTL: cfg.MessageRetentionTTL,
 	}
 	// Bridge discovery.Snapshot into web.DiscoverySnapshot (avoiding an import
 	// cycle and decoupling the web package from discovery's internal types).
@@ -393,6 +409,34 @@ func run() (retErr error) {
 				Enabled:         true,
 			}
 		}
+	}
+
+	// Message retention: when enabled (a non-zero TTL), start
+	// the periodic cleanup worker. It deletes expired messages from the local
+	// SQLite store on a fixed interval. It is independent of peer mTLS, gossip,
+	// and anti-entropy (it can run with any of them off). When retention is
+	// disabled (the default), no cleaner is started and no sweeps occur.
+	if cfg.MessageRetentionTTL > 0 {
+		cleaner := retention.New(retention.Config{
+			TTL:      cfg.MessageRetentionTTL,
+			Interval: cfg.MessageRetentionInterval,
+			// Sweep budgets bound a single sweep in rows and wall-clock time;
+			// 0/unset uses the documented defaults (5000 rows, 10s).
+			MaxSweepRows:     cfg.MessageRetentionMaxSweepRows,
+			MaxSweepDuration: cfg.MessageRetentionMaxSweepDuration,
+		}, st, logger)
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+			defer cancel()
+			cleaner.Stop(shutdownCtx)
+		}()
+		if err := cleaner.Start(ctx); err != nil {
+			return fmt.Errorf("starting retention cleaner: %w", err)
+		}
+		logger.Info("retention cleaner started",
+			slog.Duration("ttl", cfg.MessageRetentionTTL),
+			slog.Duration("interval", cfg.MessageRetentionInterval),
+		)
 	}
 
 	publicHandler := web.NewHandler(webCfg)
@@ -531,6 +575,12 @@ func run() (retErr error) {
 		aEngine.SetInventoryClient(peerClient)
 		aEngine.SetMessageFetcher(peerClient)
 		aEngine.SetLocalStore(st)
+		// Retention: when enabled, the engine rejects fetched messages whose
+		// creation timestamp is older than the current expiration threshold,
+		// preventing anti-entropy from resurrecting expired messages.
+		if cfg.MessageRetentionTTL > 0 {
+			aEngine.SetRetentionTTL(cfg.MessageRetentionTTL)
+		}
 		// Milestone 5A: set the admission check for outbound anti-entropy.
 		if lifeCtrl != nil {
 			admission := lifeCtrl.Admission()
