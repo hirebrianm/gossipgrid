@@ -182,6 +182,40 @@ spec:
               value: {{ .Values.antiEntropy.workers | quote }}
             - name: GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT
               value: {{ .Values.antiEntropy.requestTimeout | quote }}
+            # -- Message retention (opt-in; disabled by default).
+            #
+            # When messageRetention.enabled is true, the retention environment
+            # variables are rendered. When disabled (the default), no retention
+            # env vars are emitted at all — the application sees the variables
+            # as unset and retention is off. The sweep budget fields are
+            # emitted only when non-zero/non-empty (0/unset means the
+            # application's built-in defaults apply).
+            #
+            # A non-empty TTL is REQUIRED when enabled: an empty or "0" TTL
+            # would render the env var as an empty string, and the application
+            # would treat retention as disabled (unset/0 = off) even though
+            # enabled is true — a silent misconfiguration. Helm's fail()
+            # rejects the render at deploy time rather than shipping a
+            # broken pod spec.
+            {{- if .Values.messageRetention.enabled }}
+            {{- if not .Values.messageRetention.ttl }}
+            {{- fail "messageRetention.ttl must be a non-empty Go duration string (e.g. \"168h\") when messageRetention.enabled is true" }}
+            {{- end }}
+            - name: GOSSIPGRID_MESSAGE_RETENTION_TTL
+              value: {{ .Values.messageRetention.ttl | quote }}
+            {{- if .Values.messageRetention.interval }}
+            - name: GOSSIPGRID_MESSAGE_RETENTION_INTERVAL
+              value: {{ .Values.messageRetention.interval | quote }}
+            {{- end }}
+            {{- if ne (.Values.messageRetention.maxSweepRows | float64) 0.0 }}
+            - name: GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_ROWS
+              value: {{ .Values.messageRetention.maxSweepRows | quote }}
+            {{- end }}
+            {{- if .Values.messageRetention.maxSweepDuration }}
+            - name: GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_DURATION
+              value: {{ .Values.messageRetention.maxSweepDuration | quote }}
+            {{- end }}
+            {{- end }}
             # -- Lifecycle (Milestone 5A). Disabled in 7A (see values.yaml).
             - name: GOSSIPGRID_LIFECYCLE_ENABLED
               value: {{ .Values.lifecycle.enabled | quote }}

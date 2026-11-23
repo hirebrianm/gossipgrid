@@ -192,28 +192,110 @@ process arguments, 0600 atomic write), `rotate` (increment the generation; optio
 `GOSSIPGRID_AUTH_CREDENTIAL_FILE` at it; the same code path reads the file. See [security.md](security.md) for
 the exact commands and the local-HTTPS/testing guidance.
 
-**Message retention (not yet deployed).** Message retention is **disabled by default** and is not enabled in the
-current staging deployment. To enable it in staging, set the following in the k8s-gitops Helm values
-(implementation is complete and locally tested; staging enablement is a separate deployment step):
+**Message retention (Helm-exposed; staging enablement prepared).** Message retention is **disabled by
+default** in the Helm chart (`messageRetention.enabled: false`). The chart exposes the existing application
+environment variables through a `messageRetention` values section. No ConfigMap or Secret is created; the
+settings are non-sensitive and are rendered directly as environment variables in the StatefulSet pod spec.
 
-| Env var | Recommended staging value | Notes |
-| --- | --- | --- |
-| `GOSSIPGRID_MESSAGE_RETENTION_TTL` | `168h` | Retain messages for 7 days (168 hours). All 5 replicas must use the same value. Uses Go's standard `time.ParseDuration` syntax (no `d` suffix) |
-| `GOSSIPGRID_MESSAGE_RETENTION_INTERVAL` | `1h` | Sweep hourly. Default; no need to override |
+| Helm value | Default | Env var rendered | Notes |
+| --- | --- | --- | --- |
+| `messageRetention.enabled` | `false` | (none when false) | When `true`, the retention env vars below are emitted |
+| `messageRetention.ttl` | `""` | `GOSSIPGRID_MESSAGE_RETENTION_TTL` | Go duration string (e.g. `168h`). Must be positive when enabled (min 1m) |
+| `messageRetention.interval` | `""` (app default 1h) | `GOSSIPGRID_MESSAGE_RETENTION_INTERVAL` | Sweep period; 1s–24h. Omit to use the application default |
+| `messageRetention.maxSweepRows` | `0` (app default 5000) | `GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_ROWS` | Rows per sweep; 0 = app default. Emitted only when > 0 |
+| `messageRetention.maxSweepDuration` | `""` (app default 10s) | `GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_DURATION` | Wall-clock cap per sweep; 0 = app default. Emitted only when non-empty |
 
-Retention excludes expired messages from the API, gossip, and anti-entropy, and periodically deletes them from
-each replica's local SQLite database. See [architecture.md](architecture.md#message-retention-opt-in) for the
-full semantics and operational limitations (clock skew, no tombstones, per-replica TTL).
+**Staging 7-day policy.** The staging values file (`values-staging.yaml`) enables retention with `ttl: "168h"`
+and `interval: "1h"`, leaving the sweep budgets at application defaults (5000 rows / 10s). The GitOps
+Application's `valuesObject` carries the same `messageRetention` block so Argo CD applies it to all five
+replicas.
 
-**SQLite storage maintenance (not yet deployed).** When retention is enabled, the cleaner also performs
-bounded SQLite maintenance after each sweep: incremental page reclamation
-(`PRAGMA incremental_vacuum(100)`) and a PASSIVE WAL checkpoint, with
-`journal_size_limit` set to 64 MiB. New databases are created with
-`auto_vacuum=INCREMENTAL`; existing databases are not silently converted (a one-time `VACUUM`
-is required to enable incremental reclamation — see
-[architecture.md](architecture.md#sqlite-storage-maintenance) for details). No additional
-environment variables are needed for maintenance; it is driven by the same retention
-`TTL` and `INTERVAL` settings.
+**Rolling update behaviour.** Enabling retention adds new environment variables to the StatefulSet pod spec.
+Kubernetes detects the spec change and performs a StatefulSet rolling update: each pod is terminated and
+replaced. Because `/data` uses `emptyDir`, each replacement pod starts with a fresh (empty) SQLite database.
+The pod recovers its messages through anti-entropy from its peers. Note: the current readiness probe does
+**not** gate on initial anti-entropy completion (a known limitation, tracked separately); a freshly-started
+pod is Ready as soon as its listeners are up, before its message store is fully reconciled.
+
+**Verification (on `ansible.lan`).** After the Argo CD sync completes:
+
+```bash
+# Argo CD application state (expect Synced/Healthy).
+argocd app get gossipgrid --server https://argocd.k8s.lan:443 --insecure --grpc-web
+
+# Five healthy StatefulSet replicas.
+kubectl -n gossipgrid get statefulset gossipgrid
+kubectl -n gossipgrid get pods -l app.kubernetes.io/component=peer
+
+# Exact published image digest unchanged.
+kubectl -n gossipgrid get pods -l app.kubernetes.io/component=peer -o jsonpath='{.items[*].spec.containers[0].image}'
+
+# Retention environment variables configured on the pod spec.
+# GossipGrid runs in a `scratch` container with no shell utilities, so
+# `kubectl exec -- env` and `kubectl exec -- curl` cannot be used. Inspect
+# the configured environment variables via JSONPath on the pod spec instead.
+kubectl -n gossipgrid get pod gossipgrid-0 -o jsonpath='{.spec.containers[0].env[?(@.name=="GOSSIPGRID_MESSAGE_RETENTION_TTL")].value}'
+echo
+kubectl -n gossipgrid get pod gossipgrid-0 -o jsonpath='{.spec.containers[0].env[?(@.name=="GOSSIPGRID_MESSAGE_RETENTION_INTERVAL")].value}'
+echo
+
+# Successful cleaner startup (expect an initial sweep log line shortly after start).
+kubectl -n gossipgrid logs gossipgrid-0 | grep -i 'retention'
+
+# SQLite maintenance logs without unexpected failures (expect DEBUG-level
+# maintenance cycle lines, no WARN/ERROR for retention).
+kubectl -n gossipgrid logs gossipgrid-0 | grep -iE 'retention.*(fail|error)' || echo "No retention failures"
+
+# Message creation and replication still functioning (authenticated request).
+# The scratch container has no shell or curl; use the existing authenticated
+# browser interface at https://gossipgrid.k8s.lan to create a test message
+# (body: "retention-verify") and confirm it appears in the message list.
+# The browser UI displays which replica responded, illustrating load
+# balancing and replication lag.
+
+# No unusual restarts (RESTARTS column should be low/stable).
+kubectl -n gossipgrid get pods -l app.kubernetes.io/component=peer
+```
+
+**Testing the 7-day TTL.** A seven-day TTL cannot be fully expiration-tested immediately with newly created
+messages. The existing unit and integration tests validate the expiration logic (threshold computation,
+`DeleteExpired` batching, maintenance). A destructive end-to-end test (create a message, wait for
+expiration, verify deletion) requires a very short TTL (e.g. 1m) in an isolated single-replica environment —
+**never** the five-replica staging deployment.
+
+**Disabling retention through GitOps.** Because `values-staging.yaml` sets `messageRetention.enabled: true`
+with `ttl: "168h"`, simply removing a GitOps override does **not** disable retention — the staging values
+file still applies the enabled policy. To disable retention, **explicitly set** `messageRetention.enabled:
+false` in the GitOps Application's `helm.values` (or in a `valuesObject` override) to override the staging
+value. For example, in the Argo CD Application manifest:
+
+```yaml
+spec:
+  source:
+    helm:
+      releaseName: gossipgrid
+      valueFiles:
+        - values-staging.yaml
+      values: |
+        messageRetention:
+          enabled: false
+```
+
+The explicit `enabled: false` in the GitOps Application's `values` field takes precedence over the
+`values-staging.yaml` value (Helm applies `--set`-equivalent `values` after `valueFiles`). Argo CD will
+reconcile the StatefulSet, removing the retention env vars and triggering another rolling update. After
+the update, no cleaner runs and messages are retained indefinitely (the application default when the TTL
+variable is unset). Do not simply remove the override — that would leave the staging `values-staging.yaml`
+value in effect and retention would remain enabled.
+
+**SQLite maintenance observability and limitations.** When retention is enabled, each sweep runs bounded
+maintenance: `PRAGMA incremental_vacuum(100)` (reclaims up to 100 freelist pages) and
+`PRAGMA wal_checkpoint(PASSIVE)` (non-blocking checkpoint). `journal_size_limit` is set to 64 MiB.
+New databases are created with `auto_vacuum=INCREMENTAL`; existing databases (created before this feature)
+are not silently converted. Observability is via structured log lines at INFO (deletions) and DEBUG
+(maintenance stats: pages reclaimed, freelist counts, database/WAL sizes, checkpoint status). A failed
+checkpoint or reclamation is logged as a WARNING but does not stop the cleaner (retried on the next sweep).
+The `TotalDeleted()` and `TotalPagesReclaimed()` counters are available for diagnostics.
 
 ## Container and CI/CD
 

@@ -239,6 +239,32 @@ antiEntropy:
   workers: 2
   requestTimeout: 5s
 
+# -- Message retention (opt-in; disabled by default).
+#
+# When enabled, messages older than `ttl` are excluded from API listings,
+# gossip fanout, and anti-entropy, and are physically removed from the local
+# SQLite store by a periodic cleaner. The cleaner also performs bounded
+# SQLite maintenance (incremental page reclamation and PASSIVE WAL checkpoint)
+# after each sweep. All replicas must use the same TTL for consistent
+# behaviour. The sweep budget fields default to the application's built-in
+# values (5000 rows / 10s) when left empty; set them only to override.
+messageRetention:
+  enabled: false
+  # Retention period (Go duration string, e.g. "168h" for 7 days).
+  # Must be a valid positive duration when enabled (minimum 1m per app
+  # validation). Unset or "0" disables retention.
+  ttl: ""
+  # Period between cleaner sweeps (Go duration string; default "1h" when
+  # enabled and unset). Must be between 1s and 24h.
+  interval: ""
+  # Maximum rows a single sweep may delete (0/unset = application default
+  # 5000). The backlog resumes on the next sweep.
+  maxSweepRows: 0
+  # Maximum wall-clock time a single sweep's delete phase may take
+  # (0/unset = application default 10s). The backlog resumes on the next
+  # sweep.
+  maxSweepDuration: ""
+
 # -- Lifecycle (Milestone 5A).
 #
 # Milestone 7A runs with lifecycle enforcement DISABLED (the default) because

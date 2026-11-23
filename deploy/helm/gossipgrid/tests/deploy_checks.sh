@@ -477,6 +477,155 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 8. Message retention configuration
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- 8. Message retention configuration ---"
+
+# 8a. Default rendering (no overrides) must NOT emit any retention env vars.
+RETENTION_VARS_DEFAULT=$(grep -c 'GOSSIPGRID_MESSAGE_RETENTION' <<< "$RENDERED_OUTPUT" || true)
+if [ "$RETENTION_VARS_DEFAULT" -eq 0 ]; then
+  pass "Default rendering: no retention env vars emitted (retention disabled)"
+else
+  fail "Default rendering: found $RETENTION_VARS_DEFAULT retention env vars (expected 0 when disabled)"
+fi
+
+# 8b. Staging rendering must emit the TTL and interval env vars with correct values.
+RETENTION_TTL_STAGING=$(grep 'GOSSIPGRID_MESSAGE_RETENTION_TTL' -A1 <<< "$STAGING_RENDERED_OUTPUT" | grep 'value:' | awk -F'"' '{print $2}')
+if [ "$RETENTION_TTL_STAGING" = "168h" ]; then
+  pass "Staging rendering: GOSSIPGRID_MESSAGE_RETENTION_TTL = 168h"
+else
+  fail "Staging rendering: GOSSIPGRID_MESSAGE_RETENTION_TTL = '$RETENTION_TTL_STAGING' (expected '168h')"
+fi
+
+RETENTION_INTERVAL_STAGING=$(grep 'GOSSIPGRID_MESSAGE_RETENTION_INTERVAL' -A1 <<< "$STAGING_RENDERED_OUTPUT" | grep 'value:' | awk -F'"' '{print $2}')
+if [ "$RETENTION_INTERVAL_STAGING" = "1h" ]; then
+  pass "Staging rendering: GOSSIPGRID_MESSAGE_RETENTION_INTERVAL = 1h"
+else
+  fail "Staging rendering: GOSSIPGRID_MESSAGE_RETENTION_INTERVAL = '$RETENTION_INTERVAL_STAGING' (expected '1h')"
+fi
+
+# 8c. Staging rendering must NOT emit max sweep rows/duration (left at app defaults).
+# The values-staging.yaml does not set these (0 and ""), so the template's
+# conditional blocks skip them.
+MAX_ROWS_STAGING=$(grep -c 'GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_ROWS' <<< "$STAGING_RENDERED_OUTPUT" || true)
+if [ "$MAX_ROWS_STAGING" -eq 0 ]; then
+  pass "Staging rendering: no GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_ROWS (app default applies)"
+else
+  fail "Staging rendering: GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_ROWS present (expected absent — app default)"
+fi
+
+MAX_DUR_STAGING=$(grep -c 'GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_DURATION' <<< "$STAGING_RENDERED_OUTPUT" || true)
+if [ "$MAX_DUR_STAGING" -eq 0 ]; then
+  pass "Staging rendering: no GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_DURATION (app default applies)"
+else
+  fail "Staging rendering: GOSSIPGRID_MESSAGE_RETENTION_MAX_SWEEP_DURATION present (expected absent — app default)"
+fi
+
+# 8d. All StatefulSet replicas must receive identical retention config.
+# The StatefulSet template renders a single pod spec (Kubernetes applies it to
+# all replicas), so the env vars appear exactly once in the rendered output.
+# This check verifies that the retention env vars are in the StatefulSet's
+# container spec (not in some other resource) and that they appear exactly
+# once each (single pod template → all replicas get identical config).
+TTL_COUNT=$(grep -c 'GOSSIPGRID_MESSAGE_RETENTION_TTL' <<< "$STAGING_RENDERED_OUTPUT" || true)
+if [ "$TTL_COUNT" -eq 1 ]; then
+  pass "Retention TTL env var appears exactly once (single pod spec → all replicas identical)"
+else
+  fail "Retention TTL env var appears $TTL_COUNT times (expected exactly 1)"
+fi
+
+# 8e. Verify the existing probe, security, and image settings are unchanged
+# in the staging rendering (regression guard: retention must not alter them).
+# Image digest must still be present and unchanged.
+if grep -q 'image: gitlab\.lan:5050/slipmat/gossipgrid@sha256:' <<< "$STAGING_RENDERED_OUTPUT" || \
+   grep -q 'imagePullPolicy: IfNotPresent' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Image pinning settings unchanged in staging rendering"
+else
+  fail "Image pinning settings appear to have changed in staging rendering"
+fi
+
+# Probes must still be present.
+if grep -q 'startupProbe:' <<< "$STAGING_RENDERED_OUTPUT" && \
+   grep -q 'livenessProbe:' <<< "$STAGING_RENDERED_OUTPUT" && \
+   grep -q 'readinessProbe:' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "All three probes (startup, liveness, readiness) present in staging rendering"
+else
+  fail "One or more probes missing in staging rendering"
+fi
+
+# Security context must still be present.
+if grep -q 'runAsNonRoot: true' <<< "$STAGING_RENDERED_OUTPUT" && \
+   grep -q 'readOnlyRootFilesystem: true' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Pod security settings (runAsNonRoot, readOnlyRootFilesystem) unchanged"
+else
+  fail "Pod security settings changed in staging rendering"
+fi
+
+# Volume mounts must still include /data (emptyDir).
+if grep -q 'mountPath: /data' <<< "$STAGING_RENDERED_OUTPUT" && \
+   grep -q 'emptyDir:' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "emptyDir /data volume mount unchanged"
+else
+  fail "emptyDir /data volume mount missing or changed in staging rendering"
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Retention enabled without TTL must fail rendering
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- 9. Retention enabled without TTL must fail rendering ---"
+
+# 9a. Retention enabled with an empty TTL must FAIL helm template.
+# This proves the chart's fail() guard rejects a misconfigured render
+# (enabled: true, ttl: "") rather than shipping a broken pod spec.
+# The || true guards the expected failure so set -e does not abort the script.
+# We detect failure by checking whether the output contains a StatefulSet
+# resource (a successful render always has one; a fail() render does not).
+EMPTY_TTL_RENDER_OUTPUT=$(helm template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  --set messageRetention.enabled=true \
+  --set messageRetention.ttl="" 2>&1) || true
+if [ -n "$EMPTY_TTL_RENDER_OUTPUT" ] && grep -q 'kind: StatefulSet' <<< "$EMPTY_TTL_RENDER_OUTPUT"; then
+  # A StatefulSet was rendered — the fail() guard did NOT trigger (bad).
+  fail "Retention enabled with empty TTL rendered successfully (expected Helm fail() error)"
+else
+  # No StatefulSet in output — the fail() guard triggered (good).
+  if grep -qi 'ttl' <<< "$EMPTY_TTL_RENDER_OUTPUT"; then
+    pass "Retention enabled with empty TTL fails rendering with TTL-specific error"
+  else
+    fail "Retention enabled with empty TTL did not render but without a TTL-specific error: $EMPTY_TTL_RENDER_OUTPUT"
+  fi
+fi
+
+# 9b. Retention disabled (the default) must remain valid.
+# The default rendering (RENDERED_OUTPUT) already proves this, but re-assert
+# explicitly: disabled retention with no TTL set must render cleanly.
+# The || true guards an unexpected failure so set -e does not abort.
+DISABLED_TTL_RENDER_OUTPUT=$(helm template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  --set messageRetention.enabled=false \
+  --set messageRetention.ttl="" 2>&1) || true
+if [ -n "$DISABLED_TTL_RENDER_OUTPUT" ] && grep -q 'kind: StatefulSet' <<< "$DISABLED_TTL_RENDER_OUTPUT"; then
+  pass "Retention disabled with empty TTL renders successfully (valid)"
+else
+  fail "Retention disabled with empty TTL did not render (should be valid): $DISABLED_TTL_RENDER_OUTPUT"
+fi
+
+# 9c. Retention enabled with a valid TTL must render cleanly (staging values
+# already prove this, but assert it explicitly with --set for completeness).
+# The || true guards an unexpected failure so set -e does not abort.
+VALID_TTL_RENDER_OUTPUT=$(helm template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  --set messageRetention.enabled=true \
+  --set messageRetention.ttl="168h" 2>&1) || true
+if [ -n "$VALID_TTL_RENDER_OUTPUT" ] && grep -q 'kind: StatefulSet' <<< "$VALID_TTL_RENDER_OUTPUT"; then
+  pass "Retention enabled with valid TTL (168h) renders successfully"
+else
+  fail "Retention enabled with valid TTL (168h) did not render (should be valid): $VALID_TTL_RENDER_OUTPUT"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

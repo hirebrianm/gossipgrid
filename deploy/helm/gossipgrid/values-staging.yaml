@@ -83,6 +83,17 @@ networkPolicy:
   # 0.0.0.0/0 — that defeats the purpose of the NetworkPolicy.
   additionalIngressCIDRs: []
 
+# -- Message retention (7-day policy).
+#
+# Enabled in staging: messages are retained for 7 days (168h) and swept
+# hourly. The sweep budget fields are left at the application defaults
+# (5000 rows / 10s) — no override needed. All 5 replicas receive identical
+# values (single values file applied to all pods via Argo CD).
+messageRetention:
+  enabled: true
+  ttl: "168h"
+  interval: "1h"
+
 # -- Lifecycle (Milestone 7A: disabled).
 lifecycle:
   enabled: false
