@@ -1,0 +1,108 @@
+# Genesis grant Job (Milestone 5B, Stage 1A) — operator-managed manifest.
+#
+# This Job performs the explicit, operator-authorized genesis grant: it creates
+# the authoritative cluster-metadata ConfigMap (gossipgrid-cluster-metadata)
+# exactly once, establishing the first cluster identity. It runs as the
+# genesis ServiceAccount (the only identity with the create permission).
+#
+# CRITICAL: this manifest is NOT a Helm chart template and NOT a Helm hook.
+# It carries NO "helm.sh/hook" annotations, so it is never created by Argo CD
+# reconciliation or by a deployment. The operator applies it EXPLICITLY
+# (kubectl apply -f deploy/genesis/job.yaml, after verifying the preconditions
+# in docs/genesis-runbook.md) and it runs exactly once.
+#
+# The Job's container runs the `gossipgrid genesis` subcommand (a one-shot,
+# operator-invoked grant; see internal/lifecycle/genesis). It performs a
+# fail-closed preflight (the Kubernetes API must be readable and the ConfigMap
+# must be absent or a valid pending grant) and then a single create. An
+# ambiguous failure may occur after the ConfigMap was created (e.g., the API
+# server creates the object but times out before returning the response); the
+# grant never generates a replacement identity, but the operator must inspect
+# the authoritative ConfigMap metadata before retrying.
+#
+# The Job uses backoffLimit 0 (no automatic retries) and restartPolicy Never:
+# a failure is surfaced to the operator, who verifies the state and re-applies
+# the Job if appropriate (an idempotent, safe retry). The Job is not privileged
+# (no privileged: true, no privilege escalation).
+#
+# PREREQUISITES (verified by the operator, see docs/genesis-runbook.md):
+#   1. The genesis RBAC has been rendered (genesis.enabled=true in an
+#      override values file; Argo CD has reconciled the ServiceAccount,
+#      Role, and RoleBinding).
+#   2. The cluster is FRESH and EMPTY: the ConfigMap is absent (no prior
+#      epoch, no recoverable data). The existing 7A staging deployment is
+#      data-bearing and must NOT be treated as a fresh cluster.
+#   3. The gossipgrid image (with the `genesis` subcommand) is available.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gossipgrid-genesis
+  namespace: gossipgrid
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/component: genesis
+spec:
+  # No automatic retries: a failure is surfaced to the operator. The grant is
+  # idempotent (a retry against an existing valid pending grant reports
+  # "already granted" and creates nothing), so the operator may re-apply the
+  # Job safely.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gossipgrid
+        app.kubernetes.io/component: genesis
+    spec:
+      # The Job runs exactly once and does not restart on failure.
+      restartPolicy: Never
+      # The genesis ServiceAccount (the only identity with create permission
+      # on ConfigMaps in this namespace). Distinct from the application
+      # ServiceAccount (gossipgrid), which is read-only.
+      serviceAccountName: gossipgrid-genesis
+      # No automatic execution: this Job has no hook annotations and is
+      # applied only by an explicit operator action.
+      containers:
+        - name: genesis
+          image: registry.gitlab.example.internal/gossipgrid:dev
+          imagePullPolicy: IfNotPresent
+          # The `genesis` subcommand: the operator-authorized grant. The
+          # namespace is the Job's namespace (the ConfigMap is created in the
+          # Job's namespace; the operator must apply the Job in the
+          # application namespace).
+          command:
+            - /gossipgrid
+            - genesis
+            - --namespace
+            - gossipgrid
+            - --configmap
+            - gossipgrid-cluster-metadata
+          # Fail-closed preflight and single create; the command exits 0 on
+          # success (a fresh grant or an idempotent "already granted") and
+          # nonzero on any failure (initialized, corrupted, ambiguous,
+          # permission-denied, or API unavailable).
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+            # The grant is a control-plane operation (it reads and creates a
+            # ConfigMap); it needs no writable filesystem. Read-only root
+            # filesystem is enforced (matching the application pods).
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      # The Job needs no volumes (the grant is a pure API operation; no
+      # SQLite, no certificates, no credential files). No emptyDir, no
+      # projected Secret.
+      # The Job does not need to share the node with the application pods;
+      # it runs briefly and exits. No affinity or tolerations.

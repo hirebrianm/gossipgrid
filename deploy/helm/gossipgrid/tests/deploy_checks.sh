@@ -12,6 +12,13 @@
 #   5. Secret rotation without subPath (trust bundle + credentials).
 #   6. No unintended public peer exposure (NetworkPolicy).
 #   7. NetworkPolicy ingress restrictions (no 0.0.0.0/0).
+#   8. No unintended public peer exposure (NetworkPolicy).
+#   9. Deployment manifest schema (StatefulSet, Service, NetworkPolicy).
+#   10. Image and tag consistency between manifest and values.
+#   11. Genesis grant RBAC (Milestone 5B, Stage 1A): the genesis RBAC is
+#      disabled by default; when enabled it grants create on configmaps and
+#      get on the named ConfigMap only (no update/patch/delete, no
+#      ClusterRole, the app ServiceAccount is not a subject).
 #
 # Usage: bash deploy/helm/gossipgrid/tests/deploy_checks.sh
 # Requires: helm (for rendering), grep, awk, sed. Read-only: no files modified.
@@ -741,6 +748,232 @@ if grep -q 'GOSSIPGRID_PEER_TLS_ENABLED' <<< "$STAGING_RENDERED_OUTPUT"; then
   pass "Staging rendering: peer TLS env vars unchanged"
 else
   fail "Staging rendering: peer TLS env vars missing or changed"
+fi
+
+# ---------------------------------------------------------------------------
+# 11. Genesis grant RBAC (Milestone 5B, Stage 1A)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- 11. Genesis grant RBAC ---"
+
+# 11a. DEFAULT rendering (genesis.enabled: false) must NOT emit any genesis
+# RBAC resources (ServiceAccount, Role, RoleBinding). The grant Job must never
+# be created by the existing deployment configuration.
+GEN_SA_DEFAULT=$(grep -c 'kind: ServiceAccount$' <<< "$RENDERED_OUTPUT" || true)
+# The default rendering has exactly 1 ServiceAccount (the application SA,
+# gossipgrid). A second ServiceAccount (the genesis one) would indicate the
+# genesis RBAC leaked into the default rendering.
+if [ "$GEN_SA_DEFAULT" -eq 1 ]; then
+  pass "Default rendering: exactly 1 ServiceAccount (application SA only; genesis RBAC not rendered)"
+else
+  fail "Default rendering: found $GEN_SA_DEFAULT ServiceAccounts (expected exactly 1; genesis RBAC must be disabled by default)"
+fi
+# No genesis Role or RoleBinding in the default rendering.
+if grep -q 'kind: Role$' <<< "$RENDERED_OUTPUT" || grep -q 'kind: RoleBinding$' <<< "$RENDERED_OUTPUT"; then
+  fail "Default rendering: a Role or RoleBinding was rendered (genesis RBAC must be disabled by default)"
+else
+  pass "Default rendering: no Role or RoleBinding (genesis RBAC not rendered)"
+fi
+# The default rendering must NOT contain the genesis ServiceAccount name.
+if grep -q 'gossipgrid-genesis' <<< "$RENDERED_OUTPUT"; then
+  fail "Default rendering: the genesis ServiceAccount name 'gossipgrid-genesis' appears (genesis RBAC must be disabled by default)"
+else
+  pass "Default rendering: no 'gossipgrid-genesis' identity (genesis RBAC disabled)"
+fi
+
+# 11b. ENABLED rendering (genesis.enabled: true) must emit the genesis
+# ServiceAccount, Role, and RoleBinding.
+GENESIS_RENDERED_OUTPUT=$(helm template "$RELEASE" "$CHART_DIR" --namespace "$NAMESPACE" --set genesis.enabled=true 2>&1)
+if [ $? -ne 0 ]; then
+  echo "FATAL: helm template with genesis.enabled=true failed:"
+  echo "$GENESIS_RENDERED_OUTPUT"
+  exit 1
+fi
+# The genesis ServiceAccount must be present.
+if grep -q 'name: gossipgrid-genesis' <<< "$GENESIS_RENDERED_OUTPUT" && \
+   grep -q 'kind: ServiceAccount$' <<< "$GENESIS_RENDERED_OUTPUT"; then
+  pass "Enabled rendering: genesis ServiceAccount (gossipgrid-genesis) rendered"
+else
+  fail "Enabled rendering: genesis ServiceAccount not rendered"
+fi
+# The Role and RoleBinding must be present.
+if grep -q 'kind: Role$' <<< "$GENESIS_RENDERED_OUTPUT" && \
+   grep -q 'kind: RoleBinding$' <<< "$GENESIS_RENDERED_OUTPUT"; then
+  pass "Enabled rendering: genesis Role and RoleBinding rendered"
+else
+  fail "Enabled rendering: genesis Role or RoleBinding not rendered"
+fi
+
+# 11c. RBAC PERMISSIONS: the Role must grant create on configmaps and get on
+# the NAMED ConfigMap (resourceNames). It must NOT grant update, patch, or
+# delete (the grant performs only a create).
+# Extract the Role rules (between "kind: Role" and the next "---" or
+# "kind: RoleBinding").
+ROLE_SECTION=$(awk '
+  /^kind: Role$/ {inrole=1}
+  inrole && /^---/ {inrole=0}
+  inrole {print}
+' <<< "$GENESIS_RENDERED_OUTPUT")
+# create on configmaps must be present.
+if grep -q 'resources: \[\"configmaps\"\]' <<< "$ROLE_SECTION" && \
+   grep -q 'verbs: \[\"create\"\]' <<< "$ROLE_SECTION"; then
+  pass "Enabled rendering: Role grants create on configmaps"
+else
+  fail "Enabled rendering: Role does not grant create on configmaps"
+fi
+# get on the NAMED ConfigMap (resourceNames) must be present.
+if grep -q 'resourceNames: \[\"gossipgrid-cluster-metadata\"\]' <<< "$ROLE_SECTION" && \
+   grep -q 'verbs: \[\"get\"\]' <<< "$ROLE_SECTION"; then
+  pass "Enabled rendering: Role grants get on the named ConfigMap (resourceNames)"
+else
+  fail "Enabled rendering: Role does not grant get on the named ConfigMap (resourceNames)"
+fi
+# update, patch, and delete must NOT be present.
+for BAD_VERB in 'update' 'patch' 'delete'; do
+  if grep -q "\"$BAD_VERB\"" <<< "$ROLE_SECTION"; then
+    fail "Enabled rendering: Role grants the forbidden verb '$BAD_VERB' (the grant performs only create)"
+  else
+    pass "Enabled rendering: Role does not grant the forbidden verb '$BAD_VERB'"
+  fi
+done
+
+# 11d. NO ClusterRole, no cluster-scoped binding. The RBAC must be
+# namespaced only.
+if grep -q 'kind: ClusterRole' <<< "$GENESIS_RENDERED_OUTPUT" || \
+   grep -q 'kind: ClusterRoleBinding' <<< "$GENESIS_RENDERED_OUTPUT"; then
+  fail "Enabled rendering: a ClusterRole or ClusterRoleBinding was rendered (the genesis RBAC must be namespaced only)"
+else
+  pass "Enabled rendering: no ClusterRole or ClusterRoleBinding (namespaced only)"
+fi
+
+# 11e. The RoleBinding must bind the genesis ServiceAccount (not the
+# application ServiceAccount). The subjects must reference
+# gossipgrid-genesis.
+RB_SECTION=$(awk '
+  /^kind: RoleBinding$/ {inrb=1}
+  inrb {print}
+' <<< "$GENESIS_RENDERED_OUTPUT")
+if grep -q 'name: gossipgrid-genesis' <<< "$RB_SECTION" && \
+   grep -q 'kind: ServiceAccount' <<< "$RB_SECTION"; then
+  pass "Enabled rendering: RoleBinding binds the genesis ServiceAccount"
+else
+  fail "Enabled rendering: RoleBinding does not bind the genesis ServiceAccount"
+fi
+
+# 11f. The application ServiceAccount (gossipgrid) must NOT be a subject of
+# the genesis RoleBinding (the app pods must not inherit create permission).
+# Only the subjects: block matters (the RoleBinding's own metadata.name is
+# gossipgrid-genesis, not gossipgrid).
+SUBJECTS_BLOCK=$(awk '
+  /^subjects:/ {insubj=1; next}
+  insubj && /^---/ {insubj=0}
+  insubj && /^[^ ]/ && !/^  / {insubj=0}
+  insubj {print}
+' <<< "$RB_SECTION")
+if grep -qE 'name: gossipgrid[[:space:]]*$' <<< "$SUBJECTS_BLOCK"; then
+  fail "Enabled rendering: the application ServiceAccount (gossipgrid) is a subject of the genesis RoleBinding (must be separate)"
+else
+  pass "Enabled rendering: the application ServiceAccount is NOT a subject of the genesis RoleBinding (separate identity)"
+fi
+
+# 11g. The Job manifest (deploy/genesis/job.yaml) must be operator-managed:
+# it must NOT carry a Helm hook annotation (it is not a Helm hook and is not
+# created by Argo CD reconciliation). The Job must reference the genesis
+# ServiceAccount and the genesis subcommand.
+#
+# NOTE: the job.yaml file contains "helm.sh/hook" in a COMMENT (explaining it
+# is NOT a Helm hook). The check must match only actual annotation keys
+# (a YAML key line "helm.sh/hook: value"), not comment text.
+JOB_MANIFEST="deploy/genesis/job.yaml"
+if [ -f "$REPO_ROOT/$JOB_MANIFEST" ]; then
+  # Match "helm.sh/hook:" as a YAML annotation key (not a comment). The
+  # pattern requires the key to be followed by a colon, which only actual
+  # annotation lines have; comment lines have the string without a trailing
+  # colon in the annotation context.
+  if grep -qE '^[[:space:]]*helm\.sh/hook:' "$REPO_ROOT/$JOB_MANIFEST"; then
+    fail "Job manifest carries a helm.sh/hook annotation (the Job must be operator-managed, not a Helm hook)"
+  else
+    pass "Job manifest has no helm.sh/hook annotation (operator-managed, not a Helm hook)"
+  fi
+  if grep -q 'serviceAccountName: gossipgrid-genesis' "$REPO_ROOT/$JOB_MANIFEST"; then
+    pass "Job manifest references the genesis ServiceAccount (gossipgrid-genesis)"
+  else
+    fail "Job manifest does not reference the genesis ServiceAccount"
+  fi
+  # The command list in the Job spec must include "genesis" as the
+  # subcommand (the line "- genesis" in the command array).
+  if grep -qE '^[[:space:]]*-[[:space:]]*genesis[[:space:]]*$' "$REPO_ROOT/$JOB_MANIFEST"; then
+    pass 'Job manifest runs the "genesis" subcommand'
+  else
+    fail 'Job manifest does not run the "genesis" subcommand'
+  fi
+  if grep -q 'backoffLimit: 0' "$REPO_ROOT/$JOB_MANIFEST"; then
+    pass "Job manifest has backoffLimit: 0 (no automatic retries; failures are surfaced to the operator)"
+  else
+    fail "Job manifest does not have backoffLimit: 0 (automatic retries could mask a failure)"
+  fi
+
+  # 11g-structural: Parse the Job YAML and validate its structure. This
+  # check goes beyond text presence: it verifies that restartPolicy is
+  # under spec.template.spec (not the Job-level spec), that the
+  # executable path is /gossipgrid (matching the Dockerfile), that
+  # securityContext has the required fields, and that fsGroup is absent
+  # from the container securityContext (a pod-level field, and
+  # unnecessary when no volumes are mounted).
+  JOB_YAML_STRUCTURAL=$(python3 -c "
+import yaml, sys
+with open('$REPO_ROOT/$JOB_MANIFEST') as f:
+    job = yaml.safe_load(f)
+assert job['kind'] == 'Job', 'kind must be Job'
+assert job['apiVersion'] == 'batch/v1', 'apiVersion must be batch/v1'
+spec = job['spec']
+assert spec.get('backoffLimit') == 0, 'backoffLimit must be 0'
+# restartPolicy must NOT be at the Job spec level (it belongs on the pod spec).
+assert 'restartPolicy' not in spec, 'restartPolicy must not be at Job spec level (it belongs under spec.template.spec)'
+pod_spec = spec['template']['spec']
+# restartPolicy must be under spec.template.spec and set to Never.
+assert pod_spec.get('restartPolicy') == 'Never', 'restartPolicy must be Never under spec.template.spec'
+# serviceAccountName must be gossipgrid-genesis.
+assert pod_spec.get('serviceAccountName') == 'gossipgrid-genesis', 'serviceAccountName must be gossipgrid-genesis'
+container = pod_spec['containers'][0]
+# The executable must be /gossipgrid (the Dockerfile builds the binary at /gossipgrid).
+assert container['command'][0] == '/gossipgrid', 'command[0] must be /gossipgrid (got %s)' % container['command'][0]
+assert container['command'][1] == 'genesis', 'command[1] must be genesis'
+# The command must pass --namespace and --configmap.
+assert '--namespace' in container['command'], 'command must include --namespace'
+assert '--configmap' in container['command'], 'command must include --configmap'
+assert 'gossipgrid-cluster-metadata' in container['command'], 'command must include gossipgrid-cluster-metadata'
+# Security context: container-level.
+sc = container.get('securityContext', {})
+assert sc.get('runAsNonRoot') == True, 'securityContext.runAsNonRoot must be true'
+assert sc.get('runAsUser') == 65534, 'securityContext.runAsUser must be 65534'
+assert sc.get('runAsGroup') == 65534, 'securityContext.runAsGroup must be 65534'
+assert sc.get('allowPrivilegeEscalation') == False, 'securityContext.allowPrivilegeEscalation must be false'
+assert sc.get('readOnlyRootFilesystem') == True, 'securityContext.readOnlyRootFilesystem must be true'
+assert sc.get('seccompProfile', {}).get('type') == 'RuntimeDefault', 'securityContext.seccompProfile.type must be RuntimeDefault'
+caps = sc.get('capabilities', {})
+assert 'ALL' in caps.get('drop', []), 'securityContext.capabilities.drop must include ALL'
+# fsGroup is a pod-level securityContext field. The Job has no volumes,
+# so it is unnecessary and must not appear in the container securityContext.
+assert 'fsGroup' not in sc, 'fsGroup must not be in container securityContext (it is a pod-level field; the Job has no volumes)'
+print('OK')
+" 2>&1)
+  if [ $? -eq 0 ] && [ "$JOB_YAML_STRUCTURAL" = "OK" ]; then
+    pass "Job manifest YAML structure validated (executable path, restartPolicy placement, securityContext, no fsGroup)"
+  else
+    fail "Job manifest YAML structure invalid: $JOB_YAML_STRUCTURAL"
+  fi
+else
+  fail "Job manifest $JOB_MANIFEST not found"
+fi
+
+# 11h. The genesis subcommand must be dispatched in main.go (the genesis
+# subcommand is a one-shot, operator-authorized grant; it is not a server
+# subcommand).
+if grep -q 'os.Args\[1\] == "genesis"' "$REPO_ROOT/cmd/gossipgrid/main.go"; then
+  pass 'main.go dispatches the "genesis" subcommand (one-shot, operator-authorized)'
+else
+  fail 'main.go does not dispatch the "genesis" subcommand'
 fi
 
 # ---------------------------------------------------------------------------

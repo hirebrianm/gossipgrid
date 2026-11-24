@@ -228,6 +228,13 @@ func ensureAPIUnavailableMarker(err error) error {
 // metadata document.
 const metadataKey = "metadata"
 
+// MetadataKey is the exported name of the ConfigMap data key that holds the
+// JSON metadata document. It is the same value as the unexported metadataKey
+// and exists so that the genesis grant (a separate package that writes the
+// document) and other writers can reference the key without redefining it.
+// The value is "metadata".
+const MetadataKey = "metadata"
+
 // supportedSchemaVersion is the schema version this Provider understands.
 const supportedSchemaVersion = 1
 

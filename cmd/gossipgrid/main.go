@@ -64,6 +64,21 @@ func main() {
 		}
 		return
 	}
+	// Milestone 5B (Stage 1A): the `genesis` subcommand is a one-shot,
+	// operator-authorized grant that creates the authoritative
+	// cluster-metadata ConfigMap. It is dispatched before run() because it
+	// has no server dependencies. It is NEVER run automatically: it is
+	// invoked explicitly by the operator (the genesis Job, or kubectl run)
+	// after the operator has verified the preconditions (a fresh, empty
+	// cluster). Any other first argument is ignored (the server has no
+	// subcommands besides credential and genesis).
+	if len(os.Args) >= 2 && os.Args[1] == "genesis" {
+		if err := runGenesis(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "genesis:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("gossipgrid stopped", "error", err)
 		os.Exit(1)

@@ -409,6 +409,51 @@ serviceAccount:
   name: gossipgrid
   annotations: {}
 
+# -- Genesis grant (Milestone 5B, Stage 1A).
+#
+# The genesis grant is the explicit, operator-authorized creation of the
+# authoritative cluster-metadata ConfigMap (gossipgrid-cluster-metadata). It is
+# performed by a SEPARATE, operator-triggered Job with a dedicated
+# ServiceAccount, Role, and RoleBinding — NOT by the application pods (the
+# application ServiceAccount is read-only and has no create permission) and
+# NOT by a Helm hook or Argo CD reconciliation (there is no automatic
+# execution).
+#
+# The RBAC (ServiceAccount + Role + RoleBinding) is DISABLED by default
+# (enabled: false): the grant Job must never be created by the existing
+# deployment configuration. To prepare a cluster for a grant, an operator
+# sets genesis.enabled to true (via an override values file, not the 7A
+# staging values) and lets Argo CD reconcile the RBAC, then explicitly
+# launches the grant Job (see docs/genesis-runbook.md). The Job is always
+# disabled (the Job is an operator-managed manifest, not a chart template).
+#
+# RBAC permissions (namespaced; no ClusterRole, no privileged container):
+#   - create on configmaps in the application namespace (Kubernetes CANNOT
+#     restrict top-level create by resourceNames; the namespace scope is the
+#     bound).
+#   - get on the NAMED ConfigMap gossipgrid-cluster-metadata (resourceNames
+#     IS honored for get, so this is correctly scoped to that one object).
+#   - NO update, patch, delete, or other permissions.
+#
+# The normal application ServiceAccount (serviceAccount.name) must NOT inherit
+# genesis privileges: it has no Role/RoleBinding in the default configuration,
+# and the genesis ServiceAccount is a separate, distinct identity.
+genesis:
+  enabled: false
+  # The ServiceAccount name for the genesis grant Job. Distinct from
+  # serviceAccount.name (the application SA) so the app pods never inherit
+  # the create permission.
+  serviceAccountName: gossipgrid-genesis
+  # The name of the authoritative cluster-metadata ConfigMap the grant
+  # creates (a single, cluster-wide record; created exactly once, never
+  # overwritten). Must match the application's metadata provider
+  # (k8smetadata) name.
+  configMapName: gossipgrid-cluster-metadata
+  # The Role and RoleBinding names (namespaced, distinct from the application
+  # identity).
+  roleName: gossipgrid-genesis
+  roleBindingName: gossipgrid-genesis
+
 # -- Additional labels/annotations applied to all GossipGrid resources.
 podLabels: {}
 podAnnotations: {}

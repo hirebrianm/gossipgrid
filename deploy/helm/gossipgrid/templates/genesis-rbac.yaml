@@ -1,0 +1,93 @@
+# Genesis grant RBAC (Milestone 5B, Stage 1A).
+#
+# A SEPARATE, namespaced ServiceAccount, Role, and RoleBinding for the
+# operator-triggered genesis grant Job. The grant creates the authoritative
+# cluster-metadata ConfigMap (gossipgrid-cluster-metadata) exactly once; the
+# Job is the only identity with the create permission.
+#
+# Security properties (enforced here):
+#   - Namespaced only: NO ClusterRole, NO cluster-scoped bindings. The
+#     create permission is bounded to the application namespace.
+#   - create on configmaps (in the namespace): Kubernetes CANNOT restrict
+#     top-level create by resourceNames (resourceNames applies only to
+#     get/list/watch/update/patch of existing objects). The namespace scope
+#     is the bound — the Job cannot create ConfigMaps in other namespaces.
+#   - get on the NAMED ConfigMap only (resourceNames IS honored for get, so
+#     this is correctly scoped to gossipgrid-cluster-metadata). The Job uses
+#     get to re-check preconditions idempotently.
+#   - NO update, patch, delete, or other permissions. The grant performs only
+#     a create (the one-time token is written into the created object, not
+#     patched afterward).
+#   - The Job's container is non-privileged (no privileged: true, no
+#     privilege escalation; the same securityContext as the application
+#     pods).
+#
+# This RBAC is DISABLED by default (genesis.enabled: false). It is rendered
+# only when an operator explicitly enables it (via an override values file,
+# NOT the 7A staging values) to prepare a cluster for a grant. The grant Job
+# itself is an operator-managed manifest (deploy/genesis/job.yaml), NOT a
+# chart template and NOT a Helm hook: it is never created by Argo CD
+# reconciliation or by the deployment, and it is never run automatically.
+#
+# The application ServiceAccount (serviceAccount.name) is a SEPARATE identity
+# and does NOT inherit these privileges: it has no Role/RoleBinding in the
+# default configuration.
+{{- if .Values.genesis.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.genesis.serviceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: genesis
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.genesis.roleName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: genesis
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+rules:
+  # create on configmaps in this namespace. Kubernetes cannot restrict
+  # top-level create by resourceNames; the namespace scope is the bound.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  # get on the NAMED ConfigMap only (resourceNames is honored for get).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ .Values.genesis.configMapName | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.genesis.roleBindingName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: genesis
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.genesis.roleName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.genesis.serviceAccountName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
