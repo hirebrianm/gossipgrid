@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"gossipgrid/internal/lifecycle"
+	"gossipgrid/internal/readiness"
 	"gossipgrid/internal/store"
 )
 
@@ -56,7 +57,7 @@ func NewWithStoreAndCallback(node Node, s *store.Store, onMessage MessageCallbac
 // existing Milestone 4 behavior is preserved: /readyz always returns 200
 // and POST /api/messages is always accepted.
 func NewWithStoreAndCallbackAndLifecycle(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller) http.Handler {
-	return newMux(node, s, onMessage, ctrl, 0, time.Now)
+	return newMux(node, s, onMessage, ctrl, 0, nil, time.Now)
 }
 
 // NewWithStoreAndCallbackAndRetention is like NewWithStoreAndCallbackAnd
@@ -66,12 +67,30 @@ func NewWithStoreAndCallbackAndLifecycle(node Node, s *store.Store, onMessage Me
 // zero (the default), retention is disabled and the behavior is identical to
 // NewWithStoreAndCallbackAndLifecycle.
 func NewWithStoreAndCallbackAndRetention(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller, ttl time.Duration) http.Handler {
-	return newMux(node, s, onMessage, ctrl, ttl, time.Now)
+	return NewWithStoreAndCallbackAndRetentionAndInitialSync(node, s, onMessage, ctrl, ttl, nil)
+}
+
+// NewWithStoreAndCallbackAndRetentionAndInitialSync is like
+// NewWithStoreAndCallbackAndRetention but additionally accepts an optional
+// initial-sync barrier tracker (Milestone 7A enhancement, synchronization-
+// aware Kubernetes readiness). When the tracker is non-nil (the barrier is
+// enabled), /readyz returns HTTP 503 until the replica has completed its
+// initial anti-entropy synchronization against all expected remote peers,
+// and only then returns 200 (subject to any existing lifecycle
+// authorization). When the tracker is nil (the default), the behavior is
+// identical to NewWithStoreAndCallbackAndRetention.
+//
+// The readiness handler reads only concurrency-safe in-memory state from the
+// tracker; it performs no network requests or SQLite inventory scans.
+// /healthz semantics are preserved unchanged (always 200).
+func NewWithStoreAndCallbackAndRetentionAndInitialSync(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller, ttl time.Duration, tracker readiness.TrackerProvider) http.Handler {
+	return newMux(node, s, onMessage, ctrl, ttl, tracker, time.Now)
 }
 
 // newMux builds the public message-API mux with an optional lifecycle
-// controller and an optional message retention TTL.
-func newMux(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller, ttl time.Duration, now func() time.Time) http.Handler {
+// controller, an optional message retention TTL, and an optional initial-sync
+// barrier tracker.
+func newMux(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycle.Controller, ttl time.Duration, tracker readiness.TrackerProvider, now func() time.Time) http.Handler {
 	mux := http.NewServeMux()
 	// "GET /{$}" matches the root path exactly ({$} = end-of-path), so
 	// unrecognized paths fall through to 404 rather than serving the root page.
@@ -80,14 +99,17 @@ func newMux(node Node, s *store.Store, onMessage MessageCallback, ctrl *lifecycl
 	mux.HandleFunc("GET /{$}", rootHandler(node))
 	mux.HandleFunc("GET /healthz", healthHandler)
 
-	// Readiness: when a lifecycle controller is provided, use the
-	// lifecycle-aware ready handler; otherwise, use the legacy handler
-	// (always 200).
-	if ctrl != nil && ctrl.Admission().Enabled() {
-		mux.HandleFunc("GET /readyz", lifecycleReadyHandler(ctrl))
-	} else {
-		mux.HandleFunc("GET /readyz", readyHandler)
-	}
+	// Readiness: the readiness decision is the logical combination of the
+	// existing lifecycle authorization (when lifecycle protection is
+	// enabled) and the initial-sync barrier (when enabled). This is a single
+	// handler, not two independent handlers that can disagree:
+	//   - both conditions must hold for 200;
+	//   - if either condition fails, 503 is returned with a reason naming
+	//     the failing condition (initial_sync_pending takes precedence over
+	//     a lifecycle reason when the barrier is still pending, because the
+	//     barrier is the startup gate; a lifecycle failure is reported when
+	//     the barrier is complete but lifecycle authorization is not).
+	mux.HandleFunc("GET /readyz", combinedReadyHandler(ctrl, tracker))
 
 	if s != nil {
 		mh := newMessageHandler(s)
@@ -115,47 +137,82 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// readyHandler reports that the node has completed initialization and may
-// participate in the cluster. For this milestone the node is ready once it has
-// started; later milestones gate this on sync/DB/TLS readiness.
-func readyHandler(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, readyResponse{
-		Service: "gossipgrid",
-		Ready:   true,
-	})
-}
-
-// lifecycleReadyHandler reports readiness based on the lifecycle
-// controller's single consistent authorization decision. It returns HTTP 200
-// only when the replica is authorized (ready state plus a fresh, valid,
-// matching authoritative observation plus a matching durable database binding,
-// no lockout, not stopped); HTTP 503 otherwise. It includes a structured
-// response with readiness, state, and reason.
+// combinedReadyHandler reports readiness as the logical combination of the
+// existing lifecycle authorization (when lifecycle protection is enabled) and
+// the initial-sync barrier (when enabled). It is a single handler, not two
+// independent handlers that can disagree.
 //
-// Using the same authorization decision as the public and private handlers
-// guarantees that a replica reported "ready" by /readyz is one that the
-// handlers would actually authorize to serve: the two cannot diverge (e.g. a
-// stale metadata observation or a missing binding that makes the state READY
-// but the authorization fail closed).
+// Decision (fail-closed):
+//   - 200 only when BOTH hold: the lifecycle authorizes readiness (or
+//     lifecycle protection is disabled, in which case it is vacuously true)
+//     AND the initial-sync barrier is complete (or disabled, in which case it
+//     is vacuously true).
+//   - 503 otherwise, with a reason naming the failing condition.
 //
-// It does NOT hold a lifecycle mutex while performing network operations
-// (there are none in this handler). It does NOT synchronously probe every
-// peer on every readiness request.
-func lifecycleReadyHandler(ctrl *lifecycle.Controller) http.HandlerFunc {
+// Reason precedence: when the initial-sync barrier is enabled and still
+// pending, the reason is "initial_sync_pending" (the barrier is the startup
+// gate; the pod is NotReady regardless of lifecycle state). When the barrier
+// is complete (or disabled) but lifecycle authorization is not, the reason is
+// the lifecycle authorization reason. This ordering keeps the startup gate
+// visible to the operator while still surfacing lifecycle failures after
+// synchronization completes.
+//
+// The handler reads only concurrency-safe in-memory state (one tracker Status
+// call, one controller Authorization snapshot). It performs no network
+// requests and no SQLite inventory scans. It does not hold a lifecycle mutex
+// across network operations (there are none).
+func combinedReadyHandler(ctrl *lifecycle.Controller, tracker readiness.TrackerProvider) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
-		snap := ctrl.Authorization()
-		ready := snap.Authorized()
+		// Initial-sync barrier status. A nil tracker means the barrier is
+		// disabled: the barrier imposes no constraint (treated as complete).
+		// Guard against BOTH a nil interface (an untyped nil passed to the
+		// interface parameter) and a nil *InitialSyncTracker boxed into the
+		// interface (the typed-nil case main.go produces when the barrier is
+		// off). Both represent the disabled state.
+		var isStatus readiness.Status
+		if tracker == nil {
+			isStatus = readiness.Status{Complete: true, State: "disabled"}
+		} else {
+			isStatus = tracker.Status()
+		}
+		// Lifecycle authorization (nil controller = disabled = authorized).
+		var lState, lReason string
+		lifecycleAuthorized := true
+		if ctrl != nil && ctrl.Admission().Enabled() {
+			snap := ctrl.Authorization()
+			lifecycleAuthorized = snap.Authorized()
+			lState = snap.State.String()
+			lReason = snap.Reason
+		}
 
+		ready := lifecycleAuthorized && isStatus.Complete
 		status := http.StatusServiceUnavailable
 		if ready {
 			status = http.StatusOK
 		}
 
-		writeJSON(w, status, lifecycleReadyResponse{
-			Service: "gossipgrid",
-			Ready:   ready,
-			State:   snap.State.String(),
-			Reason:  snap.Reason,
+		// Determine the reason: the failing condition. The barrier takes
+		// precedence while pending (it is the startup gate); a lifecycle
+		// failure is reported when the barrier is complete but the
+		// lifecycle is not.
+		reason := ""
+		if !ready {
+			if !isStatus.Complete {
+				reason = "initial_sync_pending"
+			} else if !lifecycleAuthorized {
+				reason = lReason
+			}
+		}
+
+		writeJSON(w, status, combinedReadyResponse{
+			Service:              "gossipgrid",
+			Ready:                ready,
+			State:                lState,
+			Reason:               reason,
+			InitialSyncComplete:  isStatus.Complete,
+			InitialSyncCompleted: isStatus.Completed,
+			InitialSyncExpected:  isStatus.Expected,
+			InitialSyncMissing:   isStatus.MissingPeers,
 		})
 	}
 }
@@ -182,16 +239,23 @@ type healthResponse struct {
 	Status  string `json:"status"`
 }
 
-type readyResponse struct {
-	Service string `json:"service"`
-	Ready   bool   `json:"ready"`
-}
-
-type lifecycleReadyResponse struct {
-	Service string `json:"service"`
-	Ready   bool   `json:"ready"`
-	State   string `json:"state"`
-	Reason  string `json:"reason,omitempty"`
+// combinedReadyResponse is the /readyz response. It carries the readiness
+// decision plus, when the initial-sync barrier is enabled, concise, safe
+// progress information (completed vs expected peer passes and the set of
+// peers still outstanding). It never exposes credentials, private keys, or
+// message contents. The State field is populated only when lifecycle
+// protection is enabled; the InitialSync* fields are populated only when the
+// barrier is enabled (a nil tracker renders them as the disabled/complete
+// view, which is correct: the barrier imposes no constraint).
+type combinedReadyResponse struct {
+	Service              string   `json:"service"`
+	Ready                bool     `json:"ready"`
+	State                string   `json:"state,omitempty"`
+	Reason               string   `json:"reason,omitempty"`
+	InitialSyncComplete  bool     `json:"initial_sync_complete"`
+	InitialSyncCompleted int      `json:"initial_sync_completed"`
+	InitialSyncExpected  int      `json:"initial_sync_expected"`
+	InitialSyncMissing   []string `json:"initial_sync_missing,omitempty"`
 }
 
 var rootTmpl = template.Must(template.New("root").Parse(`<!doctype html>

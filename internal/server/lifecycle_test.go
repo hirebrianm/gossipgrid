@@ -135,7 +135,7 @@ func TestReadinessEnabledUnready(t *testing.T) {
 		t.Errorf("STARTING: expected 503, got %d", w.Code)
 	}
 
-	var resp lifecycleReadyResponse
+	var resp combinedReadyResponse
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decoding response: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestReadinessEnabledReady(t *testing.T) {
 		t.Errorf("READY: expected 200, got %d", w.Code)
 	}
 
-	var resp lifecycleReadyResponse
+	var resp combinedReadyResponse
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decoding response: %v", err)
 	}

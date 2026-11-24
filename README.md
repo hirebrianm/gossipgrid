@@ -70,6 +70,7 @@ deliberate part of the testbed design.
 | Lifecycle state machine (7 states, concurrency-safe, opt-in) | ✅ |
 | Durable SQLite epoch binding (local_metadata singleton row) | ✅ |
 | Readiness gating (503 when unready, 200 for READY/DEGRADED) | ✅ |
+| Initial anti-entropy sync readiness barrier (opt-in; 503 until initial sync complete, one-shot, no timeout) | ✅ |
 | Epoch fencing (request headers + response envelope, 409 on mismatch, permanent) | ✅ |
 | Single-snapshot fail-closed admission (reads, writes, replication; per-send re-check) | ✅ |
 | Outbound epoch provider (current authorization, not stale) | ✅ |
@@ -306,6 +307,7 @@ make build FIPS_MODULE=off   # non-FIPS development build
 | `GOSSIPGRID_ANTI_ENTROPY_MAX_PAGES_PER_PEER` | `4` | Maximum inventory pages per peer per cycle (range 1–64) |
 | `GOSSIPGRID_ANTI_ENTROPY_WORKERS` | `2` | Concurrent synchronization workers (range 1–16) |
 | `GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT` | `5s` | Per-request timeout for sync HTTP calls (range 1ms–60s) |
+| `GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED` | `false` | Synchronization-aware Kubernetes readiness (Milestone 7A enhancement). When `true`, a new replica stays NotReady (503 from `/readyz`, reason `initial_sync_pending`) until it completes its initial anti-entropy synchronization — a successful, complete full inventory pass against every expected remote peer in the configured StatefulSet membership. One-shot (a transient peer outage after Ready does not re-open it), no timeout (never auto-Ready). Requires `GOSSIPGRID_ANTI_ENTROPY_ENABLED=true` (enabling the barrier without anti-entropy fails configuration validation). Enabled in the staging values file; disabled by default |
 | `GOSSIPGRID_LIFECYCLE_ENABLED` | `false` | Enable lifecycle state machine, epoch fencing, and fail-closed admission (Milestone 5A). Requires peer mTLS |
 | `GOSSIPGRID_AUTH_ENABLED` | `true` | Enable browser password authentication. **Enabled by default** (Milestone 6). Set to `false` only in a controlled environment; with it disabled all API endpoints are unauthenticated |
 | `GOSSIPGRID_AUTH_INSECURE_DEV_MODE` | `false` | Insecure, **local-development-only** opt-out of authentication. When `true`, all API endpoints are unauthenticated. Never set this in a production or network-reachable deployment |

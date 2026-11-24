@@ -309,6 +309,14 @@ type Engine struct {
 	// decision and the in-memory commit. A nil guard (lifecycle protection
 	// disabled) executes the commit directly under e.mu.
 	commitGuard CommitGuard
+
+	// initialSyncTracker is the opt-in initial anti-entropy synchronization
+	// barrier tracker (Milestone 7A enhancement). When set, syncPeer records a
+	// verified full inventory pass to it immediately after the full-sweep
+	// accounting (commitCursor nil + CompletedPasses increment). A nil tracker
+	// (the default) disables the barrier; no call is made. The tracker is
+	// set before Start (via SetInitialSyncTracker) and is not mutated after.
+	initialSyncTracker *InitialSyncTracker
 }
 
 // New creates an Engine with the given configuration and dependencies.
@@ -387,6 +395,18 @@ func (e *Engine) SetCommitGuard(guard CommitGuard) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.commitGuard = guard
+}
+
+// SetInitialSyncTracker configures the opt-in initial anti-entropy
+// synchronization barrier tracker (Milestone 7A enhancement). When set,
+// syncPeer records a verified full inventory pass to the tracker immediately
+// after the full-sweep accounting. A nil tracker (the default) disables the
+// barrier; no call is made and the engine's behavior is unchanged. The
+// tracker must be set before Start.
+func (e *Engine) SetInitialSyncTracker(t *InitialSyncTracker) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.initialSyncTracker = t
 }
 
 // SetRetentionTTL configures the message retention TTL for the anti-entropy
@@ -877,6 +897,23 @@ func (e *Engine) syncPeer(ctx context.Context, target PeerTarget) {
 		if !page.HasMore {
 			e.st.completedPasses.Add(1)
 			e.recordPeerProgress(key, "", "")
+			// Milestone 7A enhancement: publish the verified full pass to
+			// the opt-in initial-sync barrier tracker (when enabled). This
+			// is the single point where a completed sweep (has_more=false,
+			// no unresolved conflict or error) is recorded for the barrier.
+			// The tracker only records peers in the configured expected
+			// membership and is one-shot (a transient outage after the
+			// barrier is satisfied does not re-open it).
+			e.mu.Lock()
+			tracker := e.initialSyncTracker
+			e.mu.Unlock()
+			if tracker != nil {
+				if tracker.RecordComplete(key) {
+					e.logger.Info("initial anti-entropy synchronization barrier complete",
+						slog.String("peer", key),
+					)
+				}
+			}
 			return
 		}
 

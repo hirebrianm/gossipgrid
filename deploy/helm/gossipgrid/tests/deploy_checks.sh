@@ -626,6 +626,124 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 10. Initial anti-entropy synchronization barrier (Milestone 7A enhancement)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- 10. Initial sync barrier: enabled/disabled rendering + deadlock prevention ---"
+
+# 10a. Default rendering (initialSync disabled, the chart default) must NOT
+# emit the initial-sync env var (backward compatibility: the existing
+# readiness behavior is preserved).
+IS_VAR_DEFAULT=$(grep -c 'GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED' <<< "$RENDERED_OUTPUT" || true)
+if [ "$IS_VAR_DEFAULT" -eq 0 ]; then
+  pass "Default rendering: no initial-sync env var emitted (barrier disabled, backward compatible)"
+else
+  fail "Default rendering: found $IS_VAR_DEFAULT initial-sync env vars (expected 0 when disabled)"
+fi
+
+# 10b. Staging rendering (initialSync enabled) must emit the env var with
+# value "true".
+IS_VAR_STAGING=$(grep 'GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED' -A1 <<< "$STAGING_RENDERED_OUTPUT" | grep 'value:' | awk -F'"' '{print $2}')
+if [ "$IS_VAR_STAGING" = "true" ]; then
+  pass "Staging rendering: GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED = true"
+else
+  fail "Staging rendering: GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED = '$IS_VAR_STAGING' (expected 'true')"
+fi
+
+# 10c. The env var must appear exactly once in the staging rendering (single
+# pod spec -> all replicas receive identical config).
+IS_COUNT_STAGING=$(grep -c 'GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED' <<< "$STAGING_RENDERED_OUTPUT" || true)
+if [ "$IS_COUNT_STAGING" -eq 1 ]; then
+  pass "Initial-sync env var appears exactly once in staging (single pod spec -> all replicas identical)"
+else
+  fail "Initial-sync env var appears $IS_COUNT_STAGING times in staging (expected exactly 1)"
+fi
+
+# 10d. Incompatible configuration (initialSync enabled, antiEntropy disabled)
+# must FAIL rendering: the barrier is driven by the anti-entropy engine's
+# completed-pass accounting, so without anti-entropy the pod would remain
+# NotReady indefinitely. The chart's fail() guard rejects the render.
+# The || true guards the expected failure so set -e does not abort.
+INCOMPATIBLE_RENDER_OUTPUT=$(helm template "$RELEASE" "$CHART_DIR" \
+  --namespace "$NAMESPACE" \
+  --set initialSync.enabled=true \
+  --set antiEntropy.enabled=false 2>&1) || true
+if [ -n "$INCOMPATIBLE_RENDER_OUTPUT" ] && grep -q 'kind: StatefulSet' <<< "$INCOMPATIBLE_RENDER_OUTPUT"; then
+  fail "initialSync.enabled with antiEntropy.enabled=false rendered successfully (expected Helm fail() error)"
+else
+  if grep -qi 'antiEntropy' <<< "$INCOMPATIBLE_RENDER_OUTPUT"; then
+    pass "initialSync enabled with antiEntropy disabled fails rendering with a specific error"
+  else
+    fail "initialSync enabled with antiEntropy disabled did not render but without a specific error: $INCOMPATIBLE_RENDER_OUTPUT"
+  fi
+fi
+
+# 10e. DEADLOCK PREVENTION: the headless peer Service must retain
+# publishNotReadyAddresses: true in BOTH the default and the staging
+# rendering. This is CRITICAL for bootstrap: without it, a NotReady pod
+# (initial-sync pending) would not have a DNS record, and a new pod could not
+# discover its peers until a peer became Ready — a bootstrap deadlock.
+# The initial-sync barrier makes pods NotReady during startup, so this flag
+# must be preserved.
+if grep -q 'publishNotReadyAddresses: true' <<< "$RENDERED_OUTPUT"; then
+  pass "Default rendering: headless Service retains publishNotReadyAddresses: true (bootstrap safe)"
+else
+  fail "Default rendering: publishNotReadyAddresses: true missing from headless Service (bootstrap deadlock risk)"
+fi
+if grep -q 'publishNotReadyAddresses: true' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Staging rendering: headless Service retains publishNotReadyAddresses: true (bootstrap safe with barrier on)"
+else
+  fail "Staging rendering: publishNotReadyAddresses: true missing from headless Service (bootstrap deadlock risk with barrier on)"
+fi
+
+# 10f. DEADLOCK PREVENTION: the readiness probe must still target /readyz and
+# the liveness probe must still target /healthz in the staging rendering
+# (the barrier changes /readyz semantics but the probe endpoints and the
+# liveness/readiness separation are preserved). An unavailable peer must not
+# trigger a liveness restart.
+if grep -q 'readinessProbe:' <<< "$STAGING_RENDERED_OUTPUT" && \
+   grep -q 'path: /readyz' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Staging rendering: readiness probe still targets /readyz"
+else
+  fail "Staging rendering: readiness probe /readyz target missing"
+fi
+if grep -q 'livenessProbe:' <<< "$STAGING_RENDERED_OUTPUT" && \
+   grep -q 'path: /healthz' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Staging rendering: liveness probe still targets /healthz (no restart storm on peer outage)"
+else
+  fail "Staging rendering: liveness probe /healthz target missing"
+fi
+
+# 10g. The podManagementPolicy must remain Parallel in the staging rendering
+# (simultaneous initial pod startup avoids bootstrap deadlock; the barrier
+# does not change the pod management policy).
+if grep -q 'podManagementPolicy: Parallel' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Staging rendering: podManagementPolicy remains Parallel (simultaneous startup avoids deadlock)"
+else
+  fail "Staging rendering: podManagementPolicy is not Parallel (simultaneous startup required to avoid deadlock)"
+fi
+
+# 10h. The existing 5 replicas, emptyDir /data, and peer TLS must be
+# unchanged in the staging rendering (the barrier must not alter the
+# workload shape).
+if grep -q 'replicas: 5' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Staging rendering: replicas remain 5"
+else
+  fail "Staging rendering: replicas is not 5"
+fi
+if grep -q 'mountPath: /data' <<< "$STAGING_RENDERED_OUTPUT" && \
+   grep -q 'emptyDir:' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Staging rendering: emptyDir /data (ephemeral storage) unchanged"
+else
+  fail "Staging rendering: emptyDir /data changed"
+fi
+if grep -q 'GOSSIPGRID_PEER_TLS_ENABLED' <<< "$STAGING_RENDERED_OUTPUT"; then
+  pass "Staging rendering: peer TLS env vars unchanged"
+else
+  fail "Staging rendering: peer TLS env vars missing or changed"
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

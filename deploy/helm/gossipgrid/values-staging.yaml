@@ -94,6 +94,21 @@ messageRetention:
   ttl: "168h"
   interval: "1h"
 
+# -- Initial anti-entropy synchronization barrier (Milestone 7A enhancement).
+#
+# Enabled in staging: a replacement replica remains NotReady until it
+# completes its initial anti-entropy sync against all 4 surviving peers.
+# During a rolling update, Kubernetes waits for each replacement to finish
+# this recovery before marking it Ready, reducing the risk of message loss
+# from an incompletely recovered predecessor.
+#
+# This is a best-effort rollout barrier, not an atomic cluster snapshot:
+# messages written to a peer after its last full sweep will not be in the
+# replacement's local store until the next anti-entropy cycle. A simultaneous
+# loss of every replica can still lose messages (ephemeral emptyDir storage).
+initialSync:
+  enabled: true
+
 # -- Lifecycle (Milestone 7A: disabled).
 lifecycle:
   enabled: false

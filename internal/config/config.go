@@ -78,6 +78,15 @@ const (
 	// all existing Milestone 4 behavior is preserved.
 	EnvLifecycleEnabled = "GOSSIPGRID_LIFECYCLE_ENABLED"
 
+	// Initial anti-entropy synchronization barrier (Milestone 7A
+	// enhancement, synchronization-aware Kubernetes readiness). When enabled,
+	// a new replica remains NotReady (HTTP 503 from /readyz) until it has
+	// completed its initial anti-entropy synchronization against all expected
+	// remote peers in the configured StatefulSet membership. It requires
+	// anti-entropy to be enabled (validated). When disabled (the default),
+	// the existing readiness behavior is preserved exactly.
+	EnvInitialSyncBarrierEnabled = "GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED"
+
 	// Browser authentication and credential management (Milestone 6). When
 	// AuthCredentialFile is set, the public API and the browser UI are
 	// protected by single-administrator password authentication using a
@@ -185,6 +194,14 @@ type Config struct {
 	// peer identity configuration). When false (default), all existing
 	// behavior is preserved and no epoch protection is claimed.
 	LifecycleEnabled bool
+
+	// InitialSyncBarrierEnabled (Milestone 7A enhancement). When true, the
+	// initial anti-entropy synchronization barrier is active: a new replica
+	// remains NotReady until it completes its initial anti-entropy
+	// synchronization against all expected remote peers. Requires
+	// AntiEntropyEnabled (validated). When false (the default), the existing
+	// readiness behavior is preserved exactly.
+	InitialSyncBarrierEnabled bool
 
 	// Browser authentication (Milestone 6). AuthEnabled is true by default:
 	// the public message API and the web UI are protected by
@@ -428,6 +445,21 @@ func load(lookup envFunc) (*Config, error) {
 		cfg.LifecycleEnabled = b
 	}
 	if err := validateLifecycleConfig(cfg); err != nil {
+		errs = append(errs, err)
+	}
+
+	// Initial anti-entropy synchronization barrier (Milestone 7A
+	// enhancement). Default disabled: when unset, the existing readiness
+	// behavior is preserved. When enabled, it requires anti-entropy to be
+	// enabled (validated by validateInitialSyncBarrierConfig).
+	if v, ok := lookup(EnvInitialSyncBarrierEnabled); ok {
+		b, perr := parseBoolEnv(v, EnvInitialSyncBarrierEnabled)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.InitialSyncBarrierEnabled = b
+	}
+	if err := validateInitialSyncBarrierConfig(cfg); err != nil {
 		errs = append(errs, err)
 	}
 
@@ -966,6 +998,26 @@ func validateLifecycleConfig(cfg *Config) error {
 	// authenticated peer identity).
 	if !cfg.PeerTLSEnabled {
 		return fmt.Errorf("%s: lifecycle protection requires peer mTLS to be enabled (%s=true)", EnvLifecycleEnabled, EnvPeerTLSEnabled)
+	}
+	return nil
+}
+
+// validateInitialSyncBarrierConfig checks the initial anti-entropy
+// synchronization barrier flag (Milestone 7A enhancement). When the barrier is
+// disabled (the default), no additional validation is performed and the
+// existing readiness behavior is preserved. When enabled, the barrier
+// requires anti-entropy to be enabled: the barrier is driven by the
+// anti-entropy engine's completed-pass accounting, so without anti-entropy
+// there is no synchronization to gate readiness on, and enabling the barrier
+// would leave the pod NotReady indefinitely (a permanent 503) — a
+// misconfiguration the operator must fix at load time rather than discover
+// at deploy time.
+func validateInitialSyncBarrierConfig(cfg *Config) error {
+	if !cfg.InitialSyncBarrierEnabled {
+		return nil
+	}
+	if !cfg.AntiEntropyEnabled {
+		return fmt.Errorf("%s: the initial sync barrier requires anti-entropy to be enabled (%s=true); without anti-entropy there is no synchronization to gate readiness on, and the pod would remain NotReady indefinitely", EnvInitialSyncBarrierEnabled, EnvAntiEntropyEnabled)
 	}
 	return nil
 }

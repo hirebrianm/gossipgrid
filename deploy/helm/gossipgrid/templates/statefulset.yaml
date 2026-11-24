@@ -182,6 +182,21 @@ spec:
               value: {{ .Values.antiEntropy.workers | quote }}
             - name: GOSSIPGRID_ANTI_ENTROPY_REQUEST_TIMEOUT
               value: {{ .Values.antiEntropy.requestTimeout | quote }}
+            # -- Initial anti-entropy synchronization barrier (Milestone 7A
+            #    enhancement, synchronization-aware readiness). When
+            #    initialSync.enabled is true, the pod remains NotReady until
+            #    it completes its initial anti-entropy sync against all
+            #    expected remote peers. When disabled (the default), no env
+            #    var is emitted and the existing readiness behavior is
+            #    preserved. The application validates that antiEntropy.enabled
+            #    is true when this is enabled (fail-closed at load time).
+            {{- if .Values.initialSync.enabled }}
+            {{- if not .Values.antiEntropy.enabled }}
+            {{- fail "initialSync.enabled requires antiEntropy.enabled=true (the barrier is driven by the anti-entropy engine's completed-pass accounting)" }}
+            {{- end }}
+            - name: GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED
+              value: "true"
+            {{- end }}
             # -- Message retention (opt-in; disabled by default).
             #
             # When messageRetention.enabled is true, the retention environment

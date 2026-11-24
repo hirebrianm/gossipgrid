@@ -94,8 +94,11 @@ the replacement-pod initialization and stale-epoch rejection flow is in
 ## Failure-safe probes
 
 - **Liveness:** server/event loop is alive. Peer outage must not trigger restart storms.
-- **Readiness:** local storage usable, required TLS material available, and initial synchronization complete for this
-  epoch. DNS peer Service still exposes unready peers, but web Service does not.
+- **Readiness:** local storage usable, required TLS material available, and (when the **initial-sync barrier** is
+  enabled) the replica's initial anti-entropy synchronization against all expected peers is complete. `/readyz`
+  returns 200 only when **both** the lifecycle authorizes readiness (or lifecycle is disabled) **and** the initial
+  sync barrier is complete (or disabled); 503 otherwise, with `reason: "initial_sync_pending"` while the barrier is
+  pending. DNS peer Service still exposes unready peers, but web Service does not.
 - **Startup:** accommodates time for CSI issuance and the initial snapshot without premature liveness restarts.
 - During a total-loss lockout no ready web endpoints may exist; diagnostics available via direct pod port-forward and
   logs/events.
@@ -115,6 +118,165 @@ load balancing and replication lag. Session affinity is intentionally not requir
 `gossipgrid-<ordinal>.gossipgrid-headless.<namespace>.svc.<cluster-domain>` identifies each StatefulSet pod.
 Never assume `cluster.local` if the cluster DNS domain differs. Headless DNS serves discovery; actual source
 validity is established by the private status API and mutual TLS, not by DNS results alone.
+
+## Synchronization-aware Kubernetes readiness
+
+A replacement GossipGrid pod starts with an **empty** SQLite database (`emptyDir`). It recovers its messages
+through anti-entropy from its peers. Without any gate, the pod becomes Ready as soon as its listeners are up —
+**before** its message store is fully reconciled. A StatefulSet rolling update can therefore mark a replacement
+Ready while it is still mid-recovery, increasing the risk that a later failure loses messages that were never
+fully replicated.
+
+The **initial anti-entropy synchronization barrier** (Milestone 7A enhancement) closes that gap with an opt-in
+readiness gate: a new replica stays **NotReady** until it completes its **initial** anti-entropy
+synchronization against **all** expected remote peers in the configured StatefulSet membership.
+
+**Configuration.**
+
+| Helm value | Env var | Default | Staging |
+| --- | --- | --- | --- |
+| `initialSync.enabled` | `GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED` | `false` | `true` |
+
+The barrier **requires** `antiEntropy.enabled=true`. Enabling the barrier without anti-entropy is rejected at
+application load time (there would be no synchronization to gate on, and the pod would remain NotReady
+indefinitely); the Helm template also fails rendering on that incompatible combination.
+
+**How a completed sync is established.** The barrier reuses the existing per-peer cursor and completion
+semantics of the anti-entropy engine. A pass for a peer counts as **complete** only when the engine observes a
+**successful, complete full inventory pass** for that peer: the pagination reaches `has_more=false` with no
+unresolved conflict and no error, and the full-sweep cursor is committed. The barrier's
+`RecordComplete` is called from the engine's `syncPeer` at exactly that accounting point.
+
+- A **successful empty inventory** (the peer responds with zero message IDs, `has_more=false` on the first
+  page) **does** count as a complete pass.
+- A **partial sweep** (`has_more` still true, the per-cycle page budget exhausted) does **not** count. The
+  cursor resumes on the next cycle; the pass is recorded only when the sweep eventually completes.
+- A **failed page**, a **stale DNS snapshot**, or **merely discovering** a peer does **not** count.
+- A peer **outside the configured expected membership** (e.g. a stale record from a scaled-down cluster)
+  does **not** count. The barrier is defined by the configured StatefulSet membership
+  (`statefulset-name-<i>` for `i` in `0..replicas-1`), **not** by the current DNS record count.
+- Readiness is **not** gated on replicating a fixed number of messages; it is gated on the **completion of the
+  inventory pass** for each expected peer (the message fetch/insert happens within that same pass).
+
+**Bounded, no auto-Ready.** The barrier is bounded: it waits for a full pass per peer, and large inventories
+may complete over multiple anti-entropy cycles (the per-cycle page budget is finite, so a single cycle need not
+sweep the whole inventory). The barrier has **no timeout** and **never** auto-marks a pod Ready because a
+deadline elapsed — a pod stuck in initial sync stays NotReady until the barrier is genuinely satisfied or the
+operator intervenes.
+
+**One-shot (no readiness cascade).** Once the barrier is satisfied for this process start, it is complete and
+stays complete. A transient peer outage **after** the pod is Ready does **not** re-open the barrier. The
+barrier gates **initial** synchronization only; ordinary ongoing anti-entropy continues to run independently
+and does not affect readiness.
+
+**Readiness is a single logical combination.** `/readyz` returns 200 **only** when **both** hold:
+(1) the lifecycle authorizes readiness (vacuously true when lifecycle enforcement is disabled, as in 7A), and
+(2) the initial-sync barrier is complete (vacuously true when the barrier is disabled). This is a **single
+handler** computing a logical combination — not two independent readiness handlers that can disagree. The
+barrier **never** overrides a metadata/epoch/lockout/recovery/stopped lifecycle failure: a RECOVERY_REQUIRED or
+stopped pod stays 503 even if the barrier is complete, and the reported reason is the lifecycle reason, not
+`initial_sync_pending`. While the barrier is pending, the reason is `initial_sync_pending`.
+
+**`/readyz` response.** While pending, `/readyz` returns 503 with `ready: false`, `reason:
+"initial_sync_pending"`, and progress: `initial_sync_completed` (number of expected peers with a verified full
+pass), `initial_sync_expected` (total expected remote peers), and `initial_sync_missing` (the peers still
+outstanding). It never exposes credentials, private keys, or message contents. The readiness handler reads only
+concurrency-safe in-memory state (one tracker status read, one lifecycle authorization snapshot) — **no
+synchronous network requests or SQLite inventory scans**. `/healthz` semantics are preserved unchanged (always
+200, liveness only). The web diagnostics endpoint (`GET /api/diagnostics`) also reports the barrier state.
+
+**Bootstrap deadlock prevention.** The barrier must never depend on a peer being **Ready** to make progress.
+It depends only on a **successful inventory response**, which a NotReady peer with its **peer listener up**
+still serves. Concretely:
+
+- An unready replica still **resolves peer identities** (discovery runs independently of readiness).
+- An unready replica still **accepts mTLS peer connections** and serves the `/internal/sync/ids` and
+  `/internal/sync/messages` endpoints (the private peer listener is **not** gated on readiness).
+- The headless peer Service keeps **`publishNotReadyAddresses: true`**, so the DNS records for unready peers
+  exist and can be dialed. This is what makes the first round of exchanges possible during a simultaneous
+  startup: every replica, even while NotReady, is reachable over the peer port.
+- A **single-replica** deployment (or an empty expected membership) has no remote peers, so the barrier is
+  vacuously satisfied and the pod becomes Ready on its own.
+
+This is verified by the integration test
+`TestIntegrationInitialSyncFiveReplicasSimultaneousStartupNoDeadlock` (all 5 replicas start simultaneously with
+empty databases and all become Ready without a deadlock) and
+`TestIntegrationInitialSyncReplacementRecoversBeforeReady` (an empty replacement recovers all messages and
+becomes Ready only after the barrier completes).
+
+**Diagnosing a pod stuck in initial sync.**
+
+```bash
+# Port-forward to the pod and inspect /readyz (the scratch container has no curl;
+# the JSONPath below shows the configured env vars; for live /readyz, use
+# `kubectl port-forward` + a client, or the web diagnostics endpoint).
+kubectl -n gossipgrid port-forward pod/gossipgrid-4 18080:8080
+# then: http://localhost:18080/readyz
+# while pending: {"ready":false,"reason":"initial_sync_pending","initial_sync_completed":2,
+#                 "initial_sync_expected":4,"initial_sync_missing":["gossipgrid-1","gossipgrid-3"]}
+```
+
+The `initial_sync_missing` list names the peers the replica has not yet completed a full pass for. Common causes:
+a peer that is genuinely down (its inventory fetch keeps failing — the barrier waits indefinitely, by design),
+a peer with a very large inventory (the pass is still in progress, completing over multiple cycles), or a
+network/TLS problem preventing the inventory exchange. Because the barrier has no timeout, a pod whose expected
+peer never becomes reachable will remain NotReady; the operator must either restore the peer or temporarily
+disable the barrier (set `initialSync.enabled: false`) and re-sync.
+
+**Relationship to readiness, anti-entropy, and lifecycle.** The barrier is a *startup gate* on top of the
+existing anti-entropy engine and lifecycle authorization. It does not change anti-entropy's protocol, cursors,
+or scheduling; it only *observes* the engine's completed-pass accounting and *consumes* it as a readiness
+input. It does not change lifecycle state; it is one of the two conditions the readiness handler combines. When
+lifecycle enforcement is enabled (Milestone 7B/5B), the barrier and lifecycle are both consulted; when lifecycle
+is disabled (7A), only the barrier gates readiness.
+
+**How to disable it.** Set `initialSync.enabled: false` (the default in `values.yaml`) or remove
+`GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED` from the pod spec. With it disabled, `/readyz` returns 200 once the
+listeners are up (the original 7A behavior) and the barrier imposes no constraint. This is a **per-deployment**
+choice; all five replicas receive identical values from a single values file, so the barrier is either on or
+off for the whole cluster.
+
+**GitOps override (required to enable or disable in our deployment).** An Argo CD Application that uses only
+`helm.valuesObject` (with no `helm.valueFiles`) does **not** automatically apply `values-staging.yaml` — the
+staging values file is referenced in this repository's example Application via `helm.valueFiles`, but the actual
+staging Application in the `k8s-gitops` repository may use only `helm.valuesObject`. If the staging Application
+uses only `helm.valuesObject`, the barrier is **not** enabled by default (the `values.yaml` default
+`initialSync.enabled: false` applies). To enable the barrier in our deployment, add an explicit GitOps override
+in the Application's `helm.values` (or `helm.valuesObject`):
+
+```yaml
+spec:
+  source:
+    helm:
+      values: |
+        initialSync:
+          enabled: true
+```
+
+Conversely, to disable the barrier in a deployment where `values-staging.yaml` is loaded (either via
+`helm.valueFiles` in the Application or as part of the chart's default values), set an explicit
+`initialSync.enabled: false` override at the same location where the staging values are applied:
+
+```yaml
+spec:
+  source:
+    helm:
+      values: |
+        initialSync:
+          enabled: false
+```
+
+Do not rely on removing the override to disable the barrier: if `values-staging.yaml` is in effect (loaded via
+`valueFiles`), removing the override leaves the staging value (`initialSync.enabled: true`) in force.
+
+> **Status:** the barrier is **implemented and locally tested** (unit + 5-node integration test, see
+> [development-plan.md](development-plan.md)). It is **enabled in the staging values file**
+> (`values-staging.yaml`), but that file is only applied to the running deployment when the Argo CD Application
+> references it (via `helm.valueFiles`); an Application using only `helm.valuesObject` does not apply it
+> automatically, so the barrier in our deployment requires an explicit `initialSync.enabled: true` GitOps
+> override. The barrier has **not yet been deployed and verified in the staging cluster** — the published image
+> digest is unchanged. A simultaneous loss of every replica can still lose messages (ephemeral `emptyDir`
+> storage); the barrier is a best-effort rollout barrier, not an atomic-snapshot guarantee.
 
 ## Browser credential provisioning (Milestone 6, deployed and verified in 7A)
 
@@ -213,9 +375,28 @@ replicas.
 **Rolling update behaviour.** Enabling retention adds new environment variables to the StatefulSet pod spec.
 Kubernetes detects the spec change and performs a StatefulSet rolling update: each pod is terminated and
 replaced. Because `/data` uses `emptyDir`, each replacement pod starts with a fresh (empty) SQLite database.
-The pod recovers its messages through anti-entropy from its peers. Note: the current readiness probe does
-**not** gate on initial anti-entropy completion (a known limitation, tracked separately); a freshly-started
-pod is Ready as soon as its listeners are up, before its message store is fully reconciled.
+The pod recovers its messages through anti-entropy from its peers.
+
+**Initial anti-entropy synchronization barrier (Milestone 7A enhancement).**
+The 7A chart addresses the recovery-latency concern above with an **opt-in initial-sync readiness barrier**
+(enabled in `values-staging.yaml`, disabled by default in `values.yaml`). When enabled
+(`GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED=true`), a replacement pod remains **NotReady** (HTTP 503 from
+`/readyz`) until it has completed its **initial** anti-entropy synchronization against **all** expected remote
+peers in the configured StatefulSet membership. Kubernetes therefore waits for each replacement to finish this
+recovery before marking it Ready, reducing the risk of message loss from an incompletely recovered predecessor
+during a rolling update. The barrier is **one-shot** and **in-memory**: it begins pending on every process start
+and is satisfied when a successful, complete full inventory pass has been observed for every expected remote
+peer (an empty inventory that responds successfully counts as a complete pass; a partial sweep, a failed page,
+or a peer that is still merely being discovered does **not** count). Once satisfied, a transient peer outage
+does **not** re-open it (no readiness cascade). The barrier imposes **no timeout** — a pod is never auto-marked
+Ready because a deadline elapsed. See [Synchronization-aware Kubernetes readiness](#synchronization-aware-kubernetes-readiness)
+below for the full semantics, what it guarantees and does not, and how to disable it.
+
+> **What it is and is not.** The completed pass is a **useful rollout barrier**, not a **mathematically atomic
+> cluster snapshot**: messages written to a peer after that peer's last full sweep is observed will not be in the
+> replacement's local store until the next anti-entropy cycle runs. This remains a **best-effort, ephemeral-storage
+> architecture** (`emptyDir`): a simultaneous loss of every replica can still lose messages. The barrier improves
+> the *probability* of recovery during a rolling update; it does not provide a recovery guarantee.
 
 **Verification (on `ansible.lan`).** After the Argo CD sync completes:
 

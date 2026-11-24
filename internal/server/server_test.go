@@ -39,7 +39,7 @@ func TestReadyz(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
 	}
-	var body readyResponse
+	var body combinedReadyResponse
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}

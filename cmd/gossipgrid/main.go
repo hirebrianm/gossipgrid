@@ -354,21 +354,43 @@ func run() (retErr error) {
 		authProvider = auth.NewProvider(credReloader)
 	}
 
+	// Milestone 7A enhancement: the opt-in initial anti-entropy
+	// synchronization barrier. When enabled (GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED=true,
+	// validated to require anti-entropy), a new replica remains NotReady
+	// (HTTP 503 from /readyz) until it has completed its initial anti-entropy
+	// synchronization against all expected remote peers in the configured
+	// StatefulSet membership. The expected identities are derived from the
+	// configured StatefulSet name and replica count (the authoritative
+	// membership, independent of the current DNS view) — the same source the
+	// discovery manager uses. The local replica identity (cfg.NodeID) is
+	// excluded. A nil tracker (the default, barrier disabled) imposes no
+	// constraint on readiness and preserves the existing behavior exactly.
+	var initialSyncTracker *antientropy.InitialSyncTracker
+	if cfg.InitialSyncBarrierEnabled {
+		expected := expectedReplicaIdentities(cfg.StatefulSetName, cfg.ExpectedReplicas)
+		initialSyncTracker = antientropy.NewInitialSyncTracker(expected, cfg.NodeID)
+		logger.Info("initial anti-entropy synchronization barrier enabled",
+			slog.Int("expected_remote_peers", initialSyncTracker.Status().Expected),
+			slog.String("local", cfg.NodeID),
+		)
+	}
+
 	// Build the web handler. It internally builds the public mux (reusing
 	// server.NewWithStoreAndCallbackAndLifecycle for the message API routes)
 	// and wraps it with authentication and CSRF when authProvider is non-nil.
 	// The peer mTLS listener is independent and unchanged.
 	webCfg := web.Config{
-		Node:         server.Node{ID: cfg.NodeID},
-		Store:        st,
-		OnMessage:    onMessage,
-		Lifecycle:    lifeCtrl,
-		Version:      Version,
-		FIPSModule:   fipsModule,
-		FIPSEnabled:  fipsEnabled,
-		AuthProvider: authProvider,
-		CookieSecure: cfg.AuthCookieSecure,
-		RetentionTTL: cfg.MessageRetentionTTL,
+		Node:               server.Node{ID: cfg.NodeID},
+		Store:              st,
+		OnMessage:          onMessage,
+		Lifecycle:          lifeCtrl,
+		Version:            Version,
+		FIPSModule:         fipsModule,
+		FIPSEnabled:        fipsEnabled,
+		AuthProvider:       authProvider,
+		CookieSecure:       cfg.AuthCookieSecure,
+		RetentionTTL:       cfg.MessageRetentionTTL,
+		InitialSyncTracker: initialSyncTracker,
 	}
 	// Bridge discovery.Snapshot into web.DiscoverySnapshot (avoiding an import
 	// cycle and decoupling the web package from discovery's internal types).
@@ -575,6 +597,11 @@ func run() (retErr error) {
 		aEngine.SetInventoryClient(peerClient)
 		aEngine.SetMessageFetcher(peerClient)
 		aEngine.SetLocalStore(st)
+		// Milestone 7A enhancement: wire the initial-sync barrier tracker
+		// into the anti-entropy engine (when enabled). The engine records a
+		// verified full inventory pass to the tracker immediately after the
+		// full-sweep accounting. A nil tracker (the default) is a no-op.
+		aEngine.SetInitialSyncTracker(initialSyncTracker)
 		// Retention: when enabled, the engine rejects fetched messages whose
 		// creation timestamp is older than the current expiration threshold,
 		// preventing anti-entropy from resurrecting expired messages.
@@ -758,6 +785,29 @@ func levelFromName(name string) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// expectedReplicaIdentities derives the configured StatefulSet ordinal
+// identities (e.g. "gossipgrid-0", "gossipgrid-1", ...) from the StatefulSet
+// name and replica count. It is the authoritative cluster membership,
+// independent of the current DNS view: a successful DNS lookup that
+// temporarily omits a pod does NOT remove that identity from this list.
+// This is the same source the discovery manager uses (discovery.
+// expectedIdentities). The replica count is parsed from the configured
+// ExpectedReplicas string (already validated as a positive integer at load
+// time); an unparseable value yields an empty list (the barrier then has no
+// expected remote peers — a misconfiguration caught by config validation,
+// not here).
+func expectedReplicaIdentities(statefulSetName, replicas string) []string {
+	n, err := strconv.Atoi(replicas)
+	if err != nil || n < 1 {
+		return nil
+	}
+	ids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		ids = append(ids, fmt.Sprintf("%s-%d", statefulSetName, i))
+	}
+	return ids
 }
 
 // buildDiscoveryConfig converts the validated environment configuration into

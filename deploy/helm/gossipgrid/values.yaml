@@ -239,6 +239,34 @@ antiEntropy:
   workers: 2
   requestTimeout: 5s
 
+# -- Initial anti-entropy synchronization barrier (Milestone 7A enhancement).
+#
+# Synchronization-aware Kubernetes readiness. When enabled, a new replica
+# remains NotReady (HTTP 503 from /readyz) until it has completed its initial
+# anti-entropy synchronization against all expected remote peers in the
+# configured StatefulSet membership. During a rolling update, Kubernetes
+# waits for each replacement replica to finish this initial recovery before
+# marking it Ready, reducing the risk of message loss from an incompletely
+# recovered predecessor.
+#
+# Disabled by default for backward compatibility: when disabled, /readyz
+# returns 200 once the listeners are up (the existing 7A behavior), and the
+# readiness probe is unaffected.
+#
+# Requires antiEntropy.enabled: true (validated by the application at load
+# time; without anti-entropy there is no synchronization to gate readiness
+# on, and the pod would remain NotReady indefinitely).
+#
+# What this guarantees: a replacement replica has retrieved the surviving
+# peers' message inventory (and fetched the missing records) before becoming
+# Ready. What it does NOT guarantee: a mathematically atomic cluster snapshot
+# (messages written to a peer after its last full sweep will not be in the
+# replacement's local store until the next anti-entropy cycle). This remains
+# a best-effort, ephemeral-storage architecture: a simultaneous loss of every
+# replica can still lose messages.
+initialSync:
+  enabled: false
+
 # -- Message retention (opt-in; disabled by default).
 #
 # When enabled, messages older than `ttl` are excluded from API listings,

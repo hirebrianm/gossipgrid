@@ -172,10 +172,16 @@ by the `gossipgrid credential` CLI.
 - **Gossip and anti-entropy convergence tests** in-cluster.
 - **Live password-rotation demonstration** without pod restarts (eventual, not instantaneous: VSO and Secret
   propagation are asynchronous, and the rotation window is measured in staging).
+- **Initial anti-entropy synchronization barrier (7A enhancement, opt-in).** `GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED`
+  (Helm `initialSync.enabled`) holds a replacement pod in NotReady until it completes its initial anti-entropy
+  synchronization against all expected peers in the configured StatefulSet membership. Disabled by default; enabled
+  in the staging values file. A completed pass is a useful rollout barrier, not an atomic cluster snapshot. See
+  [kubernetes-deployment.md](kubernetes-deployment.md#synchronization-aware-kubernetes-readiness).
 - **What 7A validates.** Existing gossip, anti-entropy, peer discovery, peer mTLS, web authentication, and
   live password rotation. Pod replacement in 7A is re-reconciled by anti-entropy (a best-effort test); it is
   **not** validated as authoritative initial snapshot synchronization, safe genesis, or lifecycle readiness
-  gating — those guarantees belong to 5B and 7B.
+  gating — those guarantees belong to 5B and 7B. The initial-sync barrier improves the *probability* of recovery
+  during a rolling update but is **not** an authoritative-snapshot guarantee.
 - **Lifecycle enforcement remains disabled** in 7A because the required 5B implementation is incomplete. This
   means the staging phase has **reduced safety guarantees**: a pod replacement loses its local SQLite data and
   is re-reconciled by anti-entropy (best effort, not an authoritative-snapshot guarantee), but there is no
@@ -426,6 +432,22 @@ to one pod confirms a local write, **not replication durability**. Per-message s
 Readiness means the replica is initialized and can participate, not that every replica has identical messages right
 now. A temporary peer outage degrades convergence but does not automatically fail the readiness probe of an otherwise
 healthy initialized pod.
+
+**Initial anti-entropy synchronization barrier (Milestone 7A enhancement, opt-in).** In a StatefulSet with ephemeral
+`emptyDir` storage, a replacement pod starts empty and recovers via anti-entropy. An opt-in readiness barrier
+(`GOSSIPGRID_INITIAL_SYNC_BARRIER_ENABLED=true`, enabled in the staging values file) holds the replacement pod in
+NotReady until it has completed its **initial** anti-entropy synchronization — a successful, complete full inventory
+pass against **every** expected remote peer in the configured StatefulSet membership. A completed pass is a useful
+rollout barrier (the replacement has retrieved the surviving peers' inventory and fetched the missing records before
+becoming Ready), but it is **not** a mathematically atomic cluster snapshot: messages written after a peer's last full
+sweep are not in the replacement's store until the next anti-entropy cycle. The barrier is one-shot (a transient peer
+outage after Ready does not re-open it), has no timeout (a pod is never auto-marked Ready), and is a single logical
+combination with lifecycle authorization in `/readyz` (200 only when both hold; the barrier never overrides a
+metadata/epoch/lockout/recovery/stopped failure). An unready pod still serves its peer listener and inventory
+endpoints (and the headless peer Service keeps `publishNotReadyAddresses: true`), so a simultaneous startup of all
+replicas does not deadlock. See
+[kubernetes-deployment.md](kubernetes-deployment.md#synchronization-aware-kubernetes-readiness) for the full
+semantics, configuration, and diagnostics.
 
 Metrics (later): gossip attempts/failures, convergence lag, sync state, peer count, SQLite failures, cert expiry, reset
 incidents. Logs use Go `slog` with trace/correlation IDs where useful.
