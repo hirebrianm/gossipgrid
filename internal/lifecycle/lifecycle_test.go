@@ -288,6 +288,238 @@ func TestMetadataValidation(t *testing.T) {
 	}
 }
 
+func TestMetadataSchemaV1CoherentStates(t *testing.T) {
+	// The four coherent schema-v1 state combinations (each must pass
+	// Validate with no error).
+	cases := []struct {
+		name string
+		meta ClusterMetadata
+	}{
+		{
+			// Genesis authorized but not yet finalized: Initialized=false,
+			// GenesisAuthorized=true, GenesisConsumer="".
+			name: "genesis authorized, not yet finalized",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e1",
+				Generation:        1,
+				Initialized:       false,
+				GenesisAuthorized: true,
+				GenesisConsumer:   "",
+				DataLossProtected: false,
+			},
+		},
+		{
+			// Initialized, protected cluster: Initialized=true,
+			// GenesisAuthorized=false, GenesisConsumer nonempty,
+			// DataLossProtected=true.
+			name: "initialized, protected cluster",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e1",
+				Generation:        1,
+				Initialized:       true,
+				GenesisAuthorized: false,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: true,
+			},
+		},
+		{
+			// Reset incident metadata: the same as "initialized, protected
+			// cluster" plus a lastReset incident whose epochId matches the
+			// current epochId (a reset establishes the current epoch).
+			name: "reset incident metadata",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e2",
+				Generation:        2,
+				Initialized:       true,
+				GenesisAuthorized: false,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: true,
+				LastReset: &ResetIncident{
+					EpochID:      "e2",
+					Cause:        "operator",
+					Acknowledged: false,
+					Timestamp:    "2026-11-23T00:00:00Z",
+				},
+			},
+		},
+	}
+	for _, tc := range cases {
+		if err := tc.meta.Validate(); err != nil {
+			t.Errorf("%s: unexpected error: %v", tc.name, err)
+		}
+	}
+}
+
+func TestMetadataSchemaV1ContradictoryStates(t *testing.T) {
+	// Contradictory combinations (each must fail Validate).
+	cases := []struct {
+		name string
+		meta ClusterMetadata
+	}{
+		{
+			// Simultaneously armed data-loss protection and active genesis
+			// authorization: the protection flag is armed only in the same CAS
+			// that consumes the authorization, so the two can never both be true.
+			name: "dataLossProtected + genesisAuthorized",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e1",
+				Generation:        1,
+				Initialized:       true,
+				GenesisAuthorized: true,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: true,
+			},
+		},
+		{
+			// Consumer recorded while the authorization is still active: the
+			// consumer is set on consumption, which also flips GenesisAuthorized
+			// to false.
+			name: "genesisConsumer + genesisAuthorized",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e1",
+				Generation:        1,
+				Initialized:       true,
+				GenesisAuthorized: true,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: false,
+			},
+		},
+		{
+			// Consumer recorded while Initialized is still false: the consumer
+			// is set on consumption, which also flips Initialized to true.
+			name: "genesisConsumer + !initialized",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e1",
+				Generation:        1,
+				Initialized:       false,
+				GenesisAuthorized: false,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: false,
+			},
+		},
+		{
+			// Initialized and GenesisAuthorized both true: an initialized
+			// cluster has consumed the authorization, which sets
+			// GenesisAuthorized=false.
+			name: "initialized + genesisAuthorized",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e1",
+				Generation:        1,
+				Initialized:       true,
+				GenesisAuthorized: true,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: false,
+			},
+		},
+		{
+			// lastReset present with an epochId that does not match the current
+			// epochId: a reset establishes the current epoch; a mismatched
+			// incident is incoherent.
+			name: "lastReset epoch mismatch",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e2",
+				Generation:        2,
+				Initialized:       true,
+				GenesisAuthorized: false,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: true,
+				LastReset: &ResetIncident{
+					EpochID:      "other-epoch",
+					Cause:        "operator",
+					Acknowledged: false,
+					Timestamp:    "2026-11-23T00:00:00Z",
+				},
+			},
+		},
+		{
+			// lastReset present while the cluster is not protected: a 5C reset
+			// records the consumer and arms the protection in the same CAS; a
+			// reset incident on a non-protected cluster is incoherent.
+			name: "lastReset on non-protected cluster",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e2",
+				Generation:        2,
+				Initialized:       true,
+				GenesisAuthorized: false,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: false,
+				LastReset: &ResetIncident{
+					EpochID:      "e2",
+					Cause:        "operator",
+					Acknowledged: false,
+					Timestamp:    "2026-11-23T00:00:00Z",
+				},
+			},
+		},
+		{
+			// Consumer recorded while DataLossProtected is still false: the
+			// operator's finalization CAS sets both the consumer and the
+			// protection flag atomically, so an initialized-but-unprotected
+			// consumed-genesis state is incoherent.
+			name: "genesisConsumer + !dataLossProtected",
+			meta: ClusterMetadata{
+				ClusterID:         "c1",
+				EpochID:           "e1",
+				Generation:        1,
+				Initialized:       true,
+				GenesisAuthorized: false,
+				GenesisConsumer:   "gossipgrid-0",
+				DataLossProtected: false,
+			},
+		},
+	}
+	for _, tc := range cases {
+		if err := tc.meta.Validate(); err == nil {
+			t.Errorf("%s: expected validation error, got nil", tc.name)
+		}
+	}
+}
+
+// TestMetadata5ACompatibility verifies that the 5A fixtures (which do not
+// populate the new genesis fields) still pass Validate: the new state
+// combination rules only apply when the new fields are actually populated.
+func TestMetadata5ACompatibility(t *testing.T) {
+	cases := []struct {
+		name string
+		meta ClusterMetadata
+	}{
+		{"5A: initialized only", ClusterMetadata{ClusterID: "c1", EpochID: "e1", Generation: 1, Initialized: true}},
+		{"5A: not initialized", ClusterMetadata{ClusterID: "c1", EpochID: "e1", Generation: 1}},
+		{"5A: all zero genesis fields", ClusterMetadata{
+			ClusterID:         "c1",
+			EpochID:           "e1",
+			Generation:        1,
+			Initialized:       true,
+			GenesisAuthorized: false,
+			GenesisConsumer:   "",
+			DataLossProtected: false,
+		}},
+		{"5A: initialized, unprotected, empty consumer", ClusterMetadata{
+			ClusterID:         "c1",
+			EpochID:           "e1",
+			Generation:        1,
+			Initialized:       true,
+			GenesisAuthorized: false,
+			GenesisConsumer:   "",
+			DataLossProtected: false,
+		}},
+	}
+	for _, tc := range cases {
+		if err := tc.meta.Validate(); err != nil {
+			t.Errorf("%s: unexpected error: %v", tc.name, err)
+		}
+	}
+}
+
 func TestMetadataMatchesBinding(t *testing.T) {
 	meta := ClusterMetadata{ClusterID: "c1", EpochID: "e1", Generation: 1}
 	binding := DatabaseBinding{ClusterID: "c1", EpochID: "e1", Generation: 1}

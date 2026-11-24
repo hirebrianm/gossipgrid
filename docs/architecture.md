@@ -62,24 +62,82 @@ reconciliation work, but automated delivery and promotion are not complete.
 
 ### Milestone 5B — Authoritative metadata and initial synchronization (designed, not implemented)
 
-- **Kubernetes ConfigMap-backed authoritative metadata.** A narrowly scoped ConfigMap holds the globally unique
-  cluster ID, the unpredictable epoch ID (plus a display generation number), the `Initialized` flag, the
-  `EverAcceptedMessages` flag, and the last reset incident with acknowledgment state. The ConfigMap is **metadata
-  only** — it never stores message bodies.
-- **Atomic transitions.** All metadata transitions use the Kubernetes `resourceVersion` compare-and-swap; a
-  failed CAS means the update is lost and the caller retries or fails closed. Restricted RBAC (get + update on the
-  named ConfigMap only) prevents competing reset attempts.
-- **Safe genesis.** A fresh cluster with no prior epoch is initialized by an explicit, control-plane-coordinated
-  action (not inferred from "no peers answered"). One eligible pod is designated seed, becomes ready with an empty
-  message set, and others synchronize from it. Empty SQLite state alone is never sufficient to claim genesis.
-- **Initial snapshot transfer.** A `SYNCING` replica pulls a bounded, keyset-paginated baseline from an eligible
-  source and transitions to `READY` when the baseline is installed and initial catch-up succeeds.
-- **Snapshot-source eligibility.** A peer is eligible to supply a snapshot only when it is in `READY` or `DEGRADED`
-  state and its epoch matches the caller's. `SYNCING` replicas are **never** eligible as bootstrap data sources.
-- **Fail-closed when authority is unavailable.** If the ConfigMap is absent, unwatchable, or returns a stale
-  revision, the replica stays in `DISCOVERING` or transitions to `RECOVERY_REQUIRED`; it does not invent an epoch.
+> **Corrected (2026-11-23).** The original 5B/5C plan contained several unsafe assumptions. The corrected
+> design — one-time genesis authorization, corrected Kubernetes RBAC (no `resourceNames` on `create`),
+> narrowly scoped bootstrap admission, the transient-vs-catastrophic failure model, the
+> `EverAcceptedMessages` durable marker, the 7A→7B migration, and the read-only Stage 0 provider — is
+> documented in [lifecycle-metadata-and-genesis.md](lifecycle-metadata-and-genesis.md), which supersedes
+> the original text below where the two disagree. Summary of the corrections:
+
+- **Authoritative metadata is a versioned document, not just flags.** A strictly versioned JSON
+  document (schema version 1) in the named ConfigMap `gossipgrid-cluster-metadata` carries
+  `clusterId`, `epochId`, `generation`, `initialized`, a one-time `genesisAuthorized` flag (with a
+  `genesisConsumer`), `everAcceptedMessages`, and the last reset incident. The `ClusterMetadata.Revision`
+  is populated from the Kubernetes `resourceVersion`.
+- **Genesis is one-time, not inferred, and the ordering is corrected.** `GENESIS` requires
+  the explicit one-time `genesisAuthorized` authorization in authoritative metadata **and**
+  `initialized=false` **and** an empty, unbound local database **and** the canonical seed
+  `gossipgrid-0`. The seed **binds** under the authorization and **stays in `GENESIS`**
+  while `initialized=false` (the 5A `SetReady` gate rejects promotion while the
+  authoritative metadata reports `Initialized=false`, so the seed cannot reach `READY` in
+  this state). The authorization is **consumed** (set to `false`) by the operator's
+  **finalization Job** — *not* by the seed (the application ServiceAccount is read-only and
+  cannot `update` the ConfigMap) — in the same atomic CAS that sets `initialized=true`,
+  records `genesisConsumer`, and arms `dataLossProtected=true`. Only after observing the
+  finalized metadata does the seed transition to `READY` and open public writes. A
+  replacement pod after data loss cannot re-enter genesis. Empty SQLite state alone is
+  **never** sufficient.
+- **Kubernetes RBAC is corrected.** The genesis Job (operator-triggered, **not** a Helm hook) grants
+  `create` on `configmaps` **in the namespace** (a top-level `create` **cannot** be restricted by
+  `resourceNames`). The running application ServiceAccount is **read-only**: `get` on the named
+  ConfigMap only. The `EverAcceptedMessages` write path (if added later) requires `update` on the named
+  object, which RBAC **cannot** restrict to a single JSON field — a significant trust expansion, so the
+  preferred design writes it from a dedicated Job and keeps the app pods read-only.
+- **Bootstrap admission is narrowly scoped, not a general relaxation.** A dedicated
+  `CheckBootstrapFetch` authorizes **only** an epoch-bound `SYNCING` replica to **fetch** a baseline
+  from an eligible `READY` source via the inventory/fetch endpoints. It does not authorize public
+  writes, gossip, wrong-epoch replication, or a `SYNCING` source. mTLS and epoch fencing are preserved.
+- **A metadata outage is not a data-loss incident.** A transient API/peer unavailability marks authority
+  `invalid` (fail-closed, 503) but does **not** enter `RECOVERY_REQUIRED` and records no loss incident.
+  `RECOVERY_REQUIRED` is entered **only** on a proven binding/metadata mismatch (a lockout, not data
+  loss). The epoch is never silently reset. Confirmed catastrophic loss is handled by 5C, not 5B.
+- **Initial snapshot transfer and eligibility are unchanged in intent.** A `SYNCING` replica pulls a
+  bounded, keyset-paginated baseline from an eligible `READY`/`DEGRADED` source (matching epoch, valid
+  lifecycle envelope) and transitions to `READY`. `SYNCING` replicas are never eligible as bootstrap
+  sources. The existing anti-entropy transport and the initial-sync readiness barrier are reused — no
+  second synchronization engine.
+- **Fail-closed when authority is unavailable.** If the ConfigMap is absent or the API is unavailable,
+  the replica stays in its current state with authority `invalid` (503) and does not invent an epoch.
+- **7A→7B migration (design, corrected 2026-11-23).** The existing 7A cluster (lifecycle
+  disabled, with messages, **no** authoritative epoch binding in the control plane) is
+  migrated by a **controlled, operator-orchestrated export/import**: (a) quiesce writes;
+  (b) export the **union** of all 7A peers' message sets to a **temporary** durable
+  location (a `Secret`, a temporary `PersistentVolume`, or an object store); (c) provision
+  the authoritative ConfigMap with a **new** 7B `ClusterID` + `EpochID` (7A has no binding
+  to carry forward; the operator establishes the 7B identity explicitly) and
+  `Initialized=true` / `dataLossProtected=true`; (d) deploy the 7B pods with **`emptyDir`**
+  (the intentionally ephemeral architecture is preserved) and a **different**
+  StatefulSet/Service/DNS name from the 7A deployment (to avoid collisions during the
+  coexistence window); (e) explicitly bind each 7B pod to the authoritative epoch; (f)
+  import the exported messages via an **authorized import procedure** (a dedicated,
+  tightly-scoped Job that writes directly to the SQLite store, **not** via the public
+  API — the 7B pods' lifecycle admission would block a `SYNCING` or unbound pod's public
+  writes); (g) verify the 7B cluster (all pods `READY`, message count matches the exported
+  union, lifecycle envelope present); (h) drain the 7A pods **only after** the 7B cluster
+  is verified. The 7A environment remains intact until 7B is verified. Recovery through
+  authorized surviving peers (the 5C path) is unchanged. Details in
+  [lifecycle-metadata-and-genesis.md](lifecycle-metadata-and-genesis.md#6-migration-from-the-current-staging-7a--7b).
+- **Stage 0 (implemented, inactive).** A read-only `lifecycle.MetadataSource` provider for the ConfigMap
+  is implemented in `internal/lifecycle/k8smetadata` with an injectable client and full unit tests. It is
+  **not** wired into the running application in Stage 0 (lifecycle remains disabled); the heavy
+  `client-go` dependency is deferred to 7B.
 
 ### Milestone 5C — Controlled recovery (designed, not implemented)
+
+> **Corrected (2026-11-23).** The boundary between a transient metadata outage and a confirmed
+> catastrophic loss is defined in [lifecycle-metadata-and-genesis.md](lifecycle-metadata-and-genesis.md#4-transient-versus-catastrophic-metadata-failure):
+> 5B only **fails closed** (no reset) on a transient outage or an unbound/mismatched replica; 5C is the
+> **only** milestone that performs an operator-authorized epoch reset, and only on **confirmed** total loss.
 
 - **Explicit operator authorization.** A `RECOVERY_REQUIRED` replica returns to `READY` only after an explicit
   operator action (a dedicated endpoint or a controlled job with tightly scoped RBAC). There is **no automatic
@@ -509,10 +567,12 @@ Resolved (2026-11-21, M5A committed as `v0.1.0-alpha.5`):
 
 Still open, to be resolved as their milestones are implemented:
 
-- **M5B — Genesis and reset contract.** The exact control-plane-coordinated first-install genesis protocol and
-  reset authorization/locking contract, including scale-down and lost-metadata behavior. The Kubernetes
-  `resourceVersion` compare-and-swap and restricted RBAC design is documented; the implementation is deferred to
-  5B/5C.
+- **M5B — Genesis and reset contract (corrected, 2026-11-23).** The one-time genesis authorization, the
+  corrected RBAC (no `resourceNames` on `create`), the narrowly scoped bootstrap admission, the
+  transient-vs-catastrophic failure model, the `EverAcceptedMessages` durable marker, and the 7A→7B
+  migration are documented in [lifecycle-metadata-and-genesis.md](lifecycle-metadata-and-genesis.md).
+  The `resourceVersion` compare-and-swap is designed; the metadata write paths (genesis finalization,
+  `EverAcceptedMessages`) and 5C reset authorization are deferred to 5B/5C.
 - **M5C — Recovery procedure details.** The exact operator recovery/reset mechanism (endpoint vs. controlled job),
   the RBAC scope, and the incident audit format.
 - **M6 (resolved and deployed in M7A).** The PBKDF2-HMAC-SHA-256 iteration count, signed session cookie

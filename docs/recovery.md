@@ -235,9 +235,15 @@ testbed intentionally provides.
 
 **Milestone 5A limitations (by design; 5B and 5C add the missing pieces):**
 
+- **Corrected failure-model boundary (2026-11-23).** A transient metadata/peer unavailability marks authority
+  `invalid` and fails closed (503) but does **not** enter `RECOVERY_REQUIRED` and records **no** data-loss
+  incident. `RECOVERY_REQUIRED` is entered **only** on a proven local-binding/metadata mismatch (a lockout, not
+  a data-loss event), and a matching epoch restored later returns the replica to `DISCOVERING` automatically.
+  The epoch is never silently reset. Confirmed catastrophic loss is handled **only** by 5C. See
+  [lifecycle-metadata-and-genesis.md](lifecycle-metadata-and-genesis.md#4-transient-versus-catastrophic-metadata-failure).
 - No production Kubernetes metadata provider: the controller uses a no-op source that always reports metadata
   unavailable. In production, replicas with lifecycle enabled will stay unready until the 5B provider is deployed.
-  *(5B adds the ConfigMap-backed provider.)*
+  *(5B adds the ConfigMap-backed provider — implemented read-only and inactive in Stage 0.)*
 - No automatic genesis: a fresh replica with no binding cannot automatically initialize an empty epoch.
   *(5B adds control-plane-coordinated genesis.)*
 - No automatic epoch reset: a `RECOVERY_REQUIRED` replica cannot automatically return to `READY`; operator
