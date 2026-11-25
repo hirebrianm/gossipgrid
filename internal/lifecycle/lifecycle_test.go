@@ -249,8 +249,20 @@ func TestStateIsBootstrapSourceEligible(t *testing.T) {
 	if !READY.IsBootstrapSourceEligible() {
 		t.Error("READY: expected bootstrap source eligible")
 	}
-	if DEGRADED.IsBootstrapSourceEligible() {
-		t.Error("DEGRADED: expected NOT bootstrap source eligible")
+	// DEGRADED retains valid local authority (previously READY) and is eligible
+	// as a bootstrap source per the documented snapshot-source policy
+	// (READY or DEGRADED, matching epoch).
+	if !DEGRADED.IsBootstrapSourceEligible() {
+		t.Error("DEGRADED: expected bootstrap source eligible (retains valid local authority)")
+	}
+	if STARTING.IsBootstrapSourceEligible() {
+		t.Error("STARTING: expected NOT bootstrap source eligible")
+	}
+	if DISCOVERING.IsBootstrapSourceEligible() {
+		t.Error("DISCOVERING: expected NOT bootstrap source eligible")
+	}
+	if GENESIS.IsBootstrapSourceEligible() {
+		t.Error("GENESIS: expected NOT bootstrap source eligible")
 	}
 	if SYNCING.IsBootstrapSourceEligible() {
 		t.Error("SYNCING: expected NOT bootstrap source eligible")

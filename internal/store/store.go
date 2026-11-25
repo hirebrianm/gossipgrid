@@ -368,6 +368,205 @@ func (s *Store) InsertReplicatedMessageReturningInserted(msg *Message) (bool, er
 	return false, ErrDuplicateIDConflict
 }
 
+// BootstrapInsertResult is the structured outcome of a bounded, transactional
+// batch install of replicated messages (Milestone 5B, Stage 2, Issue 5 and
+// Issue 6). It distinguishes per-record dispositions so the caller can build
+// a BootstrapPageResult and report accurate counts. The record sets are
+// mutually exclusive and exhaustive per input message ID.
+type BootstrapInsertResult struct {
+	// Inserted is the set of IDs whose new rows were created by this
+	// transaction (the install succeeded for those records).
+	Inserted []string
+	// AlreadyPresent is the set of IDs that were already present locally with
+	// identical content (idempotent no-op; the transaction preserved them).
+	AlreadyPresent []string
+	// Conflict is the set of IDs whose fetched content conflicted with a
+	// different local row (ErrDuplicateIDConflict; the local row was preserved).
+	// When Conflict is non-empty, the caller MUST treat the page as failed
+	// (an unresolved conflict), and the transaction is rolled back (no
+	// records in this batch are persisted).
+	Conflict []string
+	// Expired is the set of IDs whose fetched record was expired on the
+	// requester side at the install boundary (CreatedAt strictly before the
+	// expiration threshold) and was skipped without being stored. The page is
+	// NOT failed by an expired record (this is a legitimate, expected
+	// retention outcome); the ID is simply not installed.
+	Expired []string
+	// Error is set when a non-conflict, non-expired failure occurred (a
+	// validation error, a context cancellation, or a database error). When
+	// set, the transaction is rolled back and no records in this batch are
+	// persisted.
+	Error error
+}
+
+// InsertReplicatedMessagesBounded installs a bounded batch of replicated
+// messages in a single, context-aware SQLite transaction (Milestone 5B,
+// Stage 2). It is the "narrowly bounded transactional commit boundary" for
+// bootstrap baseline installation:
+//
+//   - The transaction is bounded: it inserts at most len(msgs) rows in a
+//     single BEGIN…COMMIT, and the work is capped by the caller's batch size
+//     (the engine splits the missing IDs into FetchBatchSize batches, so a
+//     single transaction never exceeds the configured batch).
+//   - The transaction is context-aware: the context is checked before the
+//     BEGIN and passed to every statement; a cancellation or the store's
+//     SQLite busy-timeout (5s, set at open) aborts the transaction and rolls
+//     it back (a graceful stop, not a partial commit).
+//   - The transaction is atomic per batch: either every non-conflict,
+//     non-expired record in the batch is committed, or none are (rollback on
+//     a conflict or an error). This preserves the "already-committed valid
+//     data is preserved" invariant across batches (each prior batch's commit
+//     is independent and durable).
+//
+// Retention evaluation boundary (single-transaction correction):
+// the expiration threshold is supplied by the caller as a callback
+// (expirationThreshold). The callback is invoked INSIDE the transaction,
+// after a no-op DML statement (DELETE FROM messages WHERE 0=1) that acquires
+// the SQLite write lock on the store's single connection. Because the
+// connection pool is limited to 1 connection and SQLite has a single writer,
+// the transaction blocks (up to the 5s busy-timeout) if another writer
+// holds the write lock, and the callback is not evaluated until the
+// transaction holds write access. This eliminates the separate
+// probe-write transaction and the window between its commit and the
+// install transaction's BEGIN in which another operation could interleave.
+// A nil callback disables retention filtering (all records are installable).
+//
+// Per-record semantics:
+//
+//   - new valid record: row created (Inserted);
+//   - identical duplicate: idempotent no-op (AlreadyPresent);
+//   - duplicate with conflicting content: Conflict (transaction rolled back,
+//     local row preserved);
+//   - expired (CreatedAt < threshold): Expired (skipped, not stored).
+//
+// The method is the linearization point for the batch: it is called from
+// within the bootstrap commit guard (which holds the controller's
+// authorization read lock), so the authorization is revalidated at the same
+// lock that this transaction commits under. A context cancellation during
+// the transaction (while waiting for a connection, waiting for the write
+// lock, or during the insert) aborts without a partial commit.
+func (s *Store) InsertReplicatedMessagesBounded(ctx context.Context, msgs []*Message, expirationThreshold func() time.Time) (BootstrapInsertResult, error) {
+	var res BootstrapInsertResult
+	if len(msgs) == 0 {
+		return res, nil
+	}
+
+	// Step 1: validate all messages (rejects invalid input before any
+	// database access; a validation error is a batch failure).
+	for _, m := range msgs {
+		if err := validateMessage(m); err != nil {
+			return res, fmt.Errorf("validating bootstrap message %q: %w", m.ID, err)
+		}
+	}
+
+	// Step 2: check context cancellation before the BEGIN.
+	if !ctxOk(ctx) {
+		return res, ctx.Err()
+	}
+
+	// Step 3: begin ONE SQLite transaction using the existing GORM database
+	// and caller context. The single-connection pool means this blocks if
+	// another operation holds the connection (connection-pool contention).
+	tx := s.db.WithContext(ctx).Begin()
+	if tx.Error != nil {
+		if ctxOk(ctx) {
+			return res, fmt.Errorf("beginning bootstrap insert transaction: %w", tx.Error)
+		}
+		return res, ctx.Err()
+	}
+
+	// Step 4: deferred rollback protection.
+	committed := false
+	defer func() {
+		if !committed {
+			//nolint:errcheck // rollback during a failed/cancelled batch; error not observable
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Step 5: if retention is enabled, acquire write access within this
+	// SAME transaction. The no-op DML statement (DELETE matches zero rows)
+	// acquires the SQLite write lock: it blocks if another writer holds the
+	// lock (up to the 5s busy-timeout). A context cancellation while waiting
+	// for the write lock aborts the transaction.
+	if expirationThreshold != nil {
+		if err := tx.Exec("DELETE FROM messages WHERE 0=1").Error; err != nil {
+			if ctxOk(ctx) {
+				return res, fmt.Errorf("acquiring SQLite write access in bootstrap insert transaction: %w", err)
+			}
+			return res, ctx.Err()
+		}
+	}
+
+	// Step 6: check context cancellation after acquiring write access.
+	if !ctxOk(ctx) {
+		return res, ctx.Err()
+	}
+
+	// Step 7: invoke the expiration-threshold callback while the transaction
+	// holds write access. The threshold reflects the time spent waiting for
+	// both the connection and the write lock, eliminating the interleave
+	// window of the separate probe-write approach.
+	var threshold time.Time
+	if expirationThreshold != nil {
+		threshold = expirationThreshold()
+	}
+
+	// Step 8: classify expired records and insert retained records using
+	// the SAME transaction. An expired record (CreatedAt < threshold) is
+	// skipped (not stored); it is NOT a batch failure.
+	var inserted, alreadyPresent []string
+	for _, m := range msgs {
+		if !threshold.IsZero() && m.CreatedAt.Before(threshold) {
+			res.Expired = append(res.Expired, m.ID)
+			continue
+		}
+		// Step 9: idempotent insert with immutable-content conflict checking.
+		res2 := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "id"}},
+			DoNothing: true,
+		}).Create(m)
+		if res2.Error != nil {
+			if ctxOk(ctx) {
+				return res, fmt.Errorf("inserting bootstrap message %q: %w", m.ID, res2.Error)
+			}
+			return res, ctx.Err()
+		}
+		if res2.RowsAffected == 1 {
+			inserted = append(inserted, m.ID)
+			continue
+		}
+		var existing Message
+		if err := tx.Where("id = ?", m.ID).First(&existing).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return res, fmt.Errorf("fetching existing bootstrap message %q: %w", m.ID, err)
+			}
+			return res, fmt.Errorf("fetching existing bootstrap message %q: %w", m.ID, err)
+		}
+		if existing.Body == m.Body && existing.Origin == m.Origin && existing.CreatedAt.Equal(m.CreatedAt) {
+			alreadyPresent = append(alreadyPresent, m.ID)
+			continue
+		}
+		// Immutable content conflict: the local row is preserved. The batch
+		// is failed (the transaction is rolled back — no records in this
+		// batch are persisted).
+		res.Conflict = append(res.Conflict, m.ID)
+		return res, nil
+	}
+
+	// Step 10: commit the transaction.
+	if err := tx.Commit().Error; err != nil {
+		return res, fmt.Errorf("committing bootstrap insert transaction: %w", err)
+	}
+	committed = true
+
+	// Step 11: publish committed insertion accounting only after successful
+	// COMMIT.
+	res.Inserted = inserted
+	res.AlreadyPresent = alreadyPresent
+	return res, nil
+}
+
 // GetByID retrieves a single message by its ID.
 // Returns gorm.ErrRecordNotFound if the message does not exist.
 func (s *Store) GetByID(id string) (*Message, error) {

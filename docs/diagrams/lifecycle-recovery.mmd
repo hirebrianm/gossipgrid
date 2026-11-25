@@ -8,7 +8,7 @@ stateDiagram-v2
   DISCOVERING --> RECOVERY_REQUIRED: known cluster, no safe sync source
   GENESIS --> READY: authorized epoch established
   GENESIS --> RECOVERY_REQUIRED: authorization lost
-  SYNCING --> READY: snapshot ingested + initial catch-up (5B)
+  SYNCING --> READY: snapshot ingested + initial catch-up (5B Stage 3)
   SYNCING --> DISCOVERING: source unavailable
   SYNCING --> RECOVERY_REQUIRED: authority lost
   READY --> DEGRADED: peer partition / sync failure

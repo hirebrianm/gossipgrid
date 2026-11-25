@@ -60,3 +60,28 @@ func (s *nthBarrierStore) InsertReplicatedMessageReturningInserted(msg *store.Me
 
 	return s.inner.InsertReplicatedMessageReturningInserted(msg)
 }
+
+// InsertReplicatedMessagesBounded implements the LocalStore interface for the
+// barrier test. It blocks on the Nth call (the first batch's transactional
+// install) so the test can change the controller's state in the window between
+// the admission check and the commit, then delegates to the inner store.
+func (s *nthBarrierStore) InsertReplicatedMessagesBounded(ctx context.Context, msgs []*store.Message, expirationThreshold func() time.Time) (store.BootstrapInsertResult, error) {
+	s.mu.Lock()
+	s.count++
+	shouldBlock := s.count == s.blockNth
+	s.mu.Unlock()
+
+	if shouldBlock {
+		s.once.Do(func() {
+			close(s.enteredCh)
+		})
+		select {
+		case <-s.blockCh:
+		case <-time.After(30 * time.Second):
+			var res store.BootstrapInsertResult
+			return res, errors.New("barrier timeout (safety net)")
+		}
+	}
+
+	return s.inner.InsertReplicatedMessagesBounded(ctx, msgs, expirationThreshold)
+}

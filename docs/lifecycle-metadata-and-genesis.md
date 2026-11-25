@@ -6,9 +6,14 @@ here. This document is the authoritative statement for the metadata authority, t
 genesis contract, the Kubernetes RBAC, the bootstrap replication admission, the
 transient-versus-catastrophic failure model, the `EverAcceptedMessages` durable marker, the
 7A→7B migration, and how lifecycle promotion composes with the existing initial-sync
-readiness barrier. The Stage 0 implementation (a read-only Kubernetes ConfigMap
-`MetadataSource` provider) is implemented in `internal/lifecycle/k8smetadata` and described
-in [Stage 0 — read-only ConfigMap metadata provider](#stage-0--read-only-configmap-metadata-provider).
+readiness barrier. Milestone 5B is **partially implemented**: Stage 0 (read-only Kubernetes
+ConfigMap `MetadataSource` provider) is implemented in `internal/lifecycle/k8smetadata`
+(see [Stage 0 — read-only ConfigMap metadata provider](#stage-0--read-only-configmap-metadata-provider));
+Stage 2 (bootstrap replication admission, `FetchBootstrapBaseline` transport-and-commit mechanism)
+is implemented and locally tested but **not yet committed** — it is under independent architecture
+review (see [Bootstrap replication admission](#3-bootstrap-replication-admission)).
+Stage 3 (source discovery/selection, sweep scheduling, automatic `READY` promotion) is designed
+but not implemented.
 
 This document supersedes the `Milestone 5B` and `Milestone 5C` sections of
 [architecture.md](architecture.md) where the two disagree.
@@ -360,8 +365,14 @@ same authenticated peer transport). **Epoch fencing is preserved** (the request 
 epoch context headers; the source rejects a 409 on mismatch). Bootstrap therefore adds a
 narrow, read-only authorization on top of the existing fencing, not a bypass.
 
-This is a **design** (5B). Stage 0 does not implement the check; it is a design commitment
-that the existing `Admission` guard gains a dedicated bootstrap method in 5B.
+This is a **design commitment** that has been **implemented** in Stage 2 (2026-11-24): the
+`lifecycle.Admission` guard has dedicated `CheckBootstrapFetch` (requester-side) and
+`CheckBootstrapSourceInbound` (serving-side) methods, the `X-GossipGrid-Request-Purpose` header
+routes the serving-side check, and `CommitUnderBootstrapAuthorization` revalidates the
+dedicated bootstrap authorization at the local write boundary. The implementation is wired
+into production (`cmd/gossipgrid/main.go`) but is **only active** when lifecycle protection
+is enabled. See [gossip-and-bootstrap.md](gossip-and-bootstrap.md#milestone-5b-stage-2--bootstrap-replication-admission-implemented-2026-11-24-under-independent-review)
+for the full admission contract and the 5 contention-boundary tests.
 
 ---
 

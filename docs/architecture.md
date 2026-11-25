@@ -45,22 +45,28 @@ replicas are running and ready with zero restarts, peer mTLS and DNS discovery w
 through an existing shared Cilium Gateway is confirmed, Vault-managed credentials are loaded, and the immutable
 image is deployed from a private GitLab registry via Argo CD. The **remaining acceptance tests** (cross-replica
 convergence, recovery after pod replacement, live password rotation, fault tolerance) are pending in the
-[staging runbook](../deploy/STAGING-RUNBOOK.md). Milestones 5B, 5C, 7B, and 9 are **designed but not
-implemented**. Milestone 8 is **partially implemented**: immutable image publishing and Argo CD digest-pinned
-reconciliation work, but automated delivery and promotion are not complete.
+[staging runbook](../deploy/STAGING-RUNBOOK.md). Milestone 5B is **partially implemented**: Stages 0 (read-only
+Kubernetes metadata provider), 1A (Kubernetes genesis grant), and 1B (operator-authorized genesis finalization)
+are implemented and locally tested; Stage 2 (bootstrap replication admission, bounded insert, pinned-epoch
+transport validation) is implemented and locally tested but **under independent architecture review, not yet
+committed or cluster-verified**; Stage 3 (orchestration, automatic `READY` promotion) is designed but not
+implemented. Milestones 5C, 6B, 7B, and 9 are **designed but not implemented**. Milestone 8 is **partially
+implemented**: immutable image publishing and Argo CD digest-pinned reconciliation work, but automated delivery
+and promotion are not complete.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | 5A | Lifecycle state machine, epoch fencing, fail-closed admission, durable binding | ✅ Implemented and locally tested |
-| 5B | Kubernetes metadata authority, initial snapshot transfer, automatic genesis, snapshot-source eligibility | 🔜 Designed but not implemented |
+| 5B | Kubernetes metadata authority, bootstrap replication admission (Stage 2), initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility (Stage 3) | 🔜 Stages 0, 1A, 1B implemented and locally tested; Stage 2 (bootstrap admission, bounded insert, pinned-epoch transport) implemented and locally tested, **under independent review, not yet committed or cluster-verified**; Stage 3 (orchestration) designed but not implemented |
 | 5C | Operator recovery/reset authorization, catastrophic data-loss handling, epoch transitions, incident audit | 🔜 Designed but not implemented |
 | 6 | Web UI, single-administrator password authentication, credential reload (local; in-cluster Vault → VSO → mounted Secret is M7A) | ✅ Implemented and locally tested; in-cluster delivery deployed and verified in M7A |
+| 6B | Cluster visualization: authenticated diagnostics, interactive SVG topology, native telemetry, replication/lifecycle visualization (4 feature stages) | 🔜 Designed; no implementation started. See [cluster-visualization.md](cluster-visualization.md) |
 | 7A | Kubernetes staging: StatefulSet, `emptyDir` SQLite, peer + web Services, shared Cilium Gateway, cert-manager, VSO, Helm, Argo CD | ✅ Deployed and smoke-tested; full acceptance tests pending |
 | 7B | Lifecycle-aware staging: enable lifecycle enforcement, in-cluster recovery and partition tests | 🔜 Designed but not implemented |
 | 8 | GitOps delivery automation: immutable images, digest-based Argo CD reconciliation, automated promotion | 🔜 Partial: immutable image + Argo CD work; automation incomplete |
 | 9 | Resilience/security lab: fault injection, reset authorization, metrics, FIPS profile | 🔜 Designed but not implemented |
 
-### Milestone 5B — Authoritative metadata and initial synchronization (designed, not implemented)
+### Milestone 5B — Authoritative metadata and initial synchronization (partial)
 
 > **Corrected (2026-11-23).** The original 5B/5C plan contained several unsafe assumptions. The corrected
 > design — one-time genesis authorization, corrected Kubernetes RBAC (no `resourceNames` on `create`),
@@ -131,6 +137,19 @@ reconciliation work, but automated delivery and promotion are not complete.
   is implemented in `internal/lifecycle/k8smetadata` with an injectable client and full unit tests. It is
   **not** wired into the running application in Stage 0 (lifecycle remains disabled); the heavy
   `client-go` dependency is deferred to 7B.
+- **Stage 2 (implemented 2026-11-24, inactive in the default build).** The bootstrap replication
+  admission mechanism is implemented: `CheckBootstrapFetch` (requester-side, narrowly scoped to an
+  epoch-bound `SYNCING` replica), `CheckBootstrapSourceInbound` (serving-side, requires `READY`/`DEGRADED`
+  and full authorization), the `X-GossipGrid-Request-Purpose` header (untrusted metadata that only selects
+  the serving-side check), `CommitUnderBootstrapAuthorization` (revalidates the dedicated bootstrap
+  authorization at the local write boundary under the `c.mu RLock → m.mu RLock` lock order), and
+  `FetchBootstrapBaseline` (the transport-and-commit mechanism for a joining `SYNCING` replica). The
+  mechanism is wired into the production code path (`cmd/gossipgrid/main.go`) but is **only active** when
+  lifecycle protection is enabled (`GOSSIPGRID_LIFECYCLE_ENABLED=true`); the default Helm build has
+  lifecycle disabled, so the bootstrap admission is a passthrough (legacy behavior preserved). Stage 3
+  (source discovery/selection, sweep scheduling, automatic `READY` promotion) is **not yet implemented**.
+  See [gossip-and-bootstrap.md](gossip-and-bootstrap.md#milestone-5b-stage-2--bootstrap-replication-admission-implemented-2026-11-24)
+  for the full admission contract.
 
 ### Milestone 5C — Controlled recovery (designed, not implemented)
 
@@ -338,7 +357,7 @@ flowchart TB
     end
     KSEC -. mounted credential file .-> APP
 
-    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B/5C planned)"]
+    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B: Stages 0, 1A, 1B implemented; Stage 2 under independent review; Stage 3 pending; M5C planned)"]
       direction LR
       CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
       RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]

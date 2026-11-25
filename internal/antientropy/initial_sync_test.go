@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"gossipgrid/internal/lifecycle"
 	"gossipgrid/internal/peertls"
 )
 
@@ -773,4 +774,12 @@ func (c *perPeerInventoryClient) FetchInventoryPage(_ context.Context, _, expect
 		resp.NextCursor = page[len(page)-1]
 	}
 	return resp, nil
+}
+
+// FetchBootstrapInventoryPage is the bootstrap-fetch variant of
+// FetchInventoryPage (Milestone 5B, Stage 2). The test fake serves the same
+// data; the request-purpose header is untrusted and does not change the
+// serving-side decision in the fake.
+func (c *perPeerInventoryClient) FetchBootstrapInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int, _ *lifecycle.RequestContext) (*peertls.InventoryPageResponse, error) {
+	return c.FetchInventoryPage(ctx, dialAddr, expectedIdentity, after, limit)
 }

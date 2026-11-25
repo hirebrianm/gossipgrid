@@ -1653,6 +1653,99 @@ func (s AuthorizationSnapshot) authorized() bool {
 	return true
 }
 
+// bootstrapAuthorized reports the dedicated bootstrap baseline fetch
+// authorization decision (Milestone 5B, Stage 2). An operation may be admitted
+// as a bootstrap fetch only when ALL of the following hold:
+//
+//   - the lifecycle state is exactly SYNCING (the only state in which a
+//     replica obtains its initial baseline; a ready state would use the
+//     ordinary authorization, a recovery or genesis state is not fetching a
+//     baseline);
+//   - the controller has not been stopped;
+//   - the authoritative metadata is present;
+//   - the authoritative metadata is initialized (Initialized=true: the
+//     cluster has a baseline to fetch);
+//   - for a genesis-managed lifecycle configuration (a designated
+//     SeedIdentity), the record is COMPLETELY finalized (data-loss protection
+//     armed, one-time authorization consumed, consumer is this seed);
+//   - the authoritative metadata is FRESH (not stale) and valid;
+//   - a local database binding exists;
+//   - the binding's ClusterID and EpochID match the authoritative metadata
+//     (a missing or conflicting binding, or a wrong-epoch observation, fails
+//     closed).
+//
+// This is the narrow, dedicated decision for a joining, epoch-bound SYNCING
+// replica to fetch a baseline. It is intentionally distinct from authorized
+// (which requires a ready state and authorizes public writes and ordinary
+// replication): a SYNCING replica is authorized to FETCH but not to write,
+// gossip, or serve. A temporary metadata loss or a stale observation fails
+// closed: a bootstrap fetch is not permitted on an old or lost observation.
+func (s AuthorizationSnapshot) bootstrapAuthorized() bool {
+	if s.Stopped {
+		return false
+	}
+	if s.State != SYNCING {
+		return false
+	}
+	if s.Metadata == nil {
+		return false
+	}
+	if !s.Metadata.Initialized {
+		return false
+	}
+	if s.genesisManaged() && !s.finalizationComplete() {
+		return false
+	}
+	if s.AuthorityState != "fresh" {
+		return false
+	}
+	if s.Stale {
+		return false
+	}
+	if s.Binding == nil {
+		return false
+	}
+	if !s.Binding.MatchesMetadata(*s.Metadata) {
+		return false
+	}
+	return true
+}
+
+// bootstrapAuthorizationReason returns a stable diagnostic explaining the
+// bootstrap fetch authorization decision (see bootstrapAuthorized).
+func (s AuthorizationSnapshot) bootstrapAuthorizationReason() string {
+	if s.Stopped {
+		return "lifecycle controller stopped"
+	}
+	if s.State != SYNCING {
+		return "bootstrap fetch requires the SYNCING state (state=" + s.State.String() + ")"
+	}
+	if s.Metadata == nil {
+		return "no authoritative metadata observation"
+	}
+	if !s.Metadata.Initialized {
+		return "authoritative metadata reports Initialized=false (no baseline to fetch)"
+	}
+	if s.genesisManaged() && !s.finalizationComplete() {
+		return "authoritative metadata is not a completely finalized record for the designated seed (a joining replica cannot fetch from an unfinalized epoch)"
+	}
+	if s.AuthorityState != "fresh" {
+		return "authoritative metadata not fresh (authority=" + s.AuthorityState + ")"
+	}
+	if s.Stale {
+		return "authoritative metadata observation is stale"
+	}
+	if s.Binding == nil {
+		return "no local database binding (the replica must be bound before fetching a baseline)"
+	}
+	if !s.Binding.MatchesMetadata(*s.Metadata) {
+		return "local binding does not match authoritative epoch (binding=" +
+			s.Binding.ClusterID + "/" + s.Binding.EpochID +
+			" metadata=" + s.Metadata.ClusterID + "/" + s.Metadata.EpochID + ")"
+	}
+	return "bootstrap fetch authorized"
+}
+
 // genesisManaged reports whether this snapshot belongs to a genesis-managed
 // lifecycle configuration (a designated SeedIdentity). When true, ordinary
 // write admission additionally requires the complete finalization invariant
@@ -1878,6 +1971,41 @@ func (c *Controller) Authorized() bool {
 	return c.authorization().authorized()
 }
 
+// BootstrapAuthorizationSnapshot returns a consistent, authorized view of the
+// requester's bootstrap fetch authorization (Milestone 5B, Stage 2, Issue 1
+// and Issue 4). It implements the antientropy.BootstrapAuthorizationSource
+// interface: it reads the controller's single consistent authorization
+// snapshot under its read locks (c.mu RLock → m.mu RLock) and returns the
+// expected RequestContext (the accepted metadata's ClusterID and EpochID) and
+// the DEDICATED bootstrap-authorized decision (bootstrapAuthorized: a bound,
+// epoch-bound SYNCING replica with a fresh, valid, matching observation and a
+// matching durable binding, not stopped).
+//
+// The returned context and the authorized flag come from the SAME locked
+// snapshot, so the engine's pinned expected context and its admission decision
+// are always consistent (no combining decisions from two different snapshots).
+//
+// When the controller is disabled (lifecycle protection off), the method
+// returns a zero context and authorized=true (a passthrough: the engine does
+// not pin or revalidate a context in the disabled path). When the snapshot is
+// not bootstrap-authorized (revocation, state change, stop, stale/invalid
+// observation, binding change, or an empty context), it returns authorized=false
+// with the zero context (the engine fails the page before issuing a request).
+func (c *Controller) BootstrapAuthorizationSnapshot() (RequestContext, bool, error) {
+	if !c.cfg.Enabled {
+		return RequestContext{}, true, nil
+	}
+	snap := c.authorization()
+	if !snap.bootstrapAuthorized() {
+		return RequestContext{}, false, nil
+	}
+	meta := snap.Metadata
+	if meta == nil {
+		return RequestContext{}, false, nil
+	}
+	return RequestContext{ClusterID: meta.ClusterID, EpochID: meta.EpochID}, true, nil
+}
+
 // AuthorityState returns the current authority state ("fresh", "missing",
 // or "invalid").
 func (c *Controller) AuthorityState() string {
@@ -1962,6 +2090,91 @@ func (c *Controller) CommitUnderAuthorization(fn func() error) error {
 	snap := c.authorizationSnapshotLocked()
 	if !snap.authorized() {
 		return errors.New("lifecycle commit rejected: " + snap.authorizationReason())
+	}
+	return fn()
+}
+
+// CommitUnderBootstrapAuthorization executes a short, nonblocking commit
+// callback (installing a fetched bootstrap baseline into the local store)
+// while holding the controller's authorization read lock (c.mu RLock) and the
+// lifecycle state machine's read lock (m.mu RLock). It is the commit-boundary
+// counterpart to CheckBootstrapFetch: a successful bootstrap HTTP request does
+// NOT by itself authorize installing its response; the installation is
+// revalidated at the actual local write boundary.
+//
+// The callback runs only when the bootstrap authorization is STILL valid at
+// commit time: the requester remains a bound, epoch-bound SYNCING replica
+// (fresh, valid, matching authoritative observation plus a matching durable
+// binding, no recovery lockout, not stopped). A revocation — a state change
+// out of SYNCING, an epoch/metadata change, a stale or invalid observation,
+// a binding change, or Stop — that linearizes before the guard enters is
+// observed in the snapshot and the callback is not executed (a rejection
+// error is returned). A revocation after the callback completes is a normal,
+// permitted revocation that cannot be undone retroactively; already-committed
+// valid data and the durable binding are preserved (this method never deletes
+// or resets the store).
+//
+// It is the same lock-order and non-recursive contract as
+// CommitUnderAuthorization (Controller.mu RLock → Machine.mu RLock →
+// callback may take Engine.mu Lock): the callback must NOT re-read any
+// method that acquires Controller.mu or Machine.mu (both RWMutexes are
+// non-reentrant), perform network I/O, or execute a multi-row or blocking
+// SQLite query. The callback performs the idempotent local insert of the
+// fetched baseline records.
+//
+// The predicate is the dedicated bootstrap decision (bootstrapAuthorized),
+// NOT the broad ordinary-replication decision (authorized): a SYNCING replica
+// that was authorized to fetch may install the fetched baseline, but this
+// guard does not authorize public writes, gossip, or acting as a source
+// (those use CommitUnderAuthorization / authorized, which require a ready
+// state). When lifecycle protection is disabled, the callback is executed
+// directly (legacy behavior preserved).
+//
+// The callback returns a non-nil error when the commit is rejected. This
+// method propagates that error. When the bootstrap authorization is not
+// valid, the callback is NOT executed and a rejection error is returned.
+//
+// expected (Milestone 5B, Stage 2, Issue 4) is the RequestContext pinned from
+// the consistent authorized snapshot at the start of the bootstrap page (the
+// cluster and epoch the page's data was fetched under). Under the same RLocks
+// held for the bootstrap-authorized predicate, this method validates expected
+// against the CURRENT snapshot: a non-authorized snapshot (revocation, state
+// change, stop, stale/invalid observation, binding change) rejects the commit,
+// and a cluster/epoch mismatch between expected and the current snapshot's
+// metadata rejects the commit (an old response fetched under epoch A is never
+// installed under newly acquired epoch-B authorization). A zero expected
+// context (lifecycle protection disabled or no pin) is not validated (only the
+// predicate is checked).
+func (c *Controller) CommitUnderBootstrapAuthorization(expected RequestContext, fn func() error) error {
+	if !c.cfg.Enabled {
+		return fn()
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	c.machine.mu.RLock()
+	defer c.machine.mu.RUnlock()
+	snap := c.authorizationSnapshotLocked()
+	if !snap.bootstrapAuthorized() {
+		return errors.New("lifecycle bootstrap commit rejected: " + snap.bootstrapAuthorizationReason())
+	}
+	// Validate the pinned expected context against the CURRENT snapshot's
+	// metadata (Issue 4: no old response installed under newly acquired
+	// authorization). When lifecycle is enabled, the expected context MUST
+	// be complete (both ClusterID and EpochID non-empty): an empty or
+	// incomplete expected context is rejected (fail-closed). The disabled
+	// passthrough (above) handles the no-pin case.
+	if expected.ClusterID == "" || expected.EpochID == "" {
+		return errors.New("lifecycle bootstrap commit rejected: expected context is incomplete (both ClusterID and EpochID are required when lifecycle is enabled)")
+	}
+	meta := snap.Metadata
+	if meta == nil {
+		return errors.New("lifecycle bootstrap commit rejected: no authoritative metadata to validate the expected context against")
+	}
+	if expected.ClusterID != meta.ClusterID {
+		return errors.New("lifecycle bootstrap commit rejected: epoch changed — expected cluster " + expected.ClusterID + " but current snapshot is " + meta.ClusterID)
+	}
+	if expected.EpochID != meta.EpochID {
+		return errors.New("lifecycle bootstrap commit rejected: epoch changed — expected epoch " + expected.EpochID + " but current snapshot is " + meta.EpochID)
 	}
 	return fn()
 }

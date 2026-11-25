@@ -43,7 +43,7 @@ flowchart TB
     end
     KSEC -. mounted credential file .-> APP
 
-    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B/5C planned)"]
+    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B: Stages 0, 1A, 1B implemented; Stage 2 under independent review; Stage 3 pending; M5C planned)"]
       direction LR
       CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
       RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"gossipgrid/internal/lifecycle"
 	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/store"
 )
@@ -58,6 +59,33 @@ func (s *barrierLocalStore) InsertReplicatedMessageReturningInserted(msg *store.
 	return true, nil
 }
 
+// InsertReplicatedMessagesBounded implements the LocalStore interface for the
+// barrier test. It blocks until the test releases blockCh (same as
+// FindMissingIDs), then installs the batch: existing IDs are AlreadyPresent,
+// new IDs are Inserted.
+func (s *barrierLocalStore) InsertReplicatedMessagesBounded(ctx context.Context, msgs []*store.Message, _ func() time.Time) (store.BootstrapInsertResult, error) {
+	// Block until the test releases us, or context is canceled.
+	select {
+	case <-s.blockCh:
+	case <-ctx.Done():
+		var res store.BootstrapInsertResult
+		return res, ctx.Err()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var res store.BootstrapInsertResult
+	for _, m := range msgs {
+		if s.ids[m.ID] {
+			res.AlreadyPresent = append(res.AlreadyPresent, m.ID)
+			continue
+		}
+		s.ids[m.ID] = true
+		s.inserted = append(s.inserted, m.ID)
+		res.Inserted = append(res.Inserted, m.ID)
+	}
+	return res, nil
+}
+
 // blockingMessageFetcher wraps a MessageFetcher and blocks calls after the
 // first N. This allows the test to revoke authorization mid-fetch-sequence.
 type blockingMessageFetcher struct {
@@ -81,6 +109,14 @@ func (f *blockingMessageFetcher) FetchMessages(ctx context.Context, dialAddr, ex
 		}
 	}
 	return f.fetcher.FetchMessages(ctx, dialAddr, expectedIdentity, ids)
+}
+
+// FetchBootstrapMessages is the bootstrap-fetch variant of FetchMessages
+// (Milestone 5B, Stage 2). The test fake blocks the same way; the request
+// purpose header is untrusted and does not change the serving-side decision in
+// the fake.
+func (f *blockingMessageFetcher) FetchBootstrapMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string, _ *lifecycle.RequestContext) ([]peertls.SyncMessageWire, error) {
+	return f.FetchMessages(ctx, dialAddr, expectedIdentity, ids)
 }
 
 // newRevocationTestEngine creates an engine with the given page setup and a

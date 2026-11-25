@@ -2,10 +2,13 @@
 
 **Status:** This document describes the recovery model and the cluster epoch protocol. Milestone 5A
 (2026-11-21, `v0.1.0-alpha.5`) is **implemented and locally tested** (the lifecycle state machine, durable
-epoch binding, epoch fencing, and fail-closed admission). Milestone 5B (Kubernetes metadata provider, initial
-snapshot transfer, automatic genesis) and Milestone 5C (operator recovery/reset authorization, catastrophic
-data-loss handling) are **designed but not implemented**. The recovery protocol described below is the **target
-design** that 5B and 5C will implement.
+epoch binding, epoch fencing, and fail-closed admission). Milestone 5B is **partially implemented**: Stage 0
+(read-only Kubernetes metadata provider) and Stage 2 (bootstrap replication admission, `FetchBootstrapBaseline`
+transport-and-commit) are implemented and locally tested but not yet committed or cluster-verified; Stage 3
+(source discovery/selection, sweep scheduling, automatic `READY` promotion) is designed but not implemented.
+Milestone 5C (operator recovery/reset authorization, catastrophic data-loss handling) is **designed but not
+implemented**. The recovery protocol described below is the **target design** that 5B Stage 3 and 5C will
+implement.
 
 ## Why this matters
 
@@ -14,9 +17,10 @@ self-healing from surviving peers. **No design without durable copies can restor
 Recovery of *availability* is not recovery of *lost data*.
 
 Milestone 5A (implemented 2026-11-21) adds the lifecycle state machine, durable epoch binding, epoch fencing, and
-fail-closed admission that underpin the recovery model described below. The Kubernetes metadata provider (5B),
-initial snapshot transfer (5B), automatic genesis (5B), and operator recovery/reset (5C) are designed but not
-yet implemented.
+fail-closed admission that underpin the recovery model described below. The Kubernetes metadata provider (5B
+Stage 0) is implemented and inactive; the bootstrap replication admission (5B Stage 2) is implemented and
+locally tested but not yet committed; initial snapshot transfer orchestration and operator-controlled one-time
+genesis (5B Stage 3) and operator recovery/reset (5C) are designed but not yet implemented.
 
 ## Lifecycle state machine (Milestone 5A, implemented)
 
@@ -37,7 +41,7 @@ stateDiagram-v2
   DISCOVERING --> RECOVERY_REQUIRED: known cluster, no safe sync source
   GENESIS --> READY: authorized epoch established
   GENESIS --> RECOVERY_REQUIRED: authorization lost
-  SYNCING --> READY: snapshot ingested + initial catch-up (5B)
+  SYNCING --> READY: snapshot ingested + initial catch-up (5B Stage 3)
   SYNCING --> DISCOVERING: source unavailable
   SYNCING --> RECOVERY_REQUIRED: authority lost
   READY --> DEGRADED: peer partition / sync failure
@@ -170,7 +174,7 @@ and [PNG](diagrams/generated/lifecycle-recovery-sequence.png) links are fallback
 ```mermaid
 sequenceDiagram
   participant NEW as Replaced pod gossipgrid-2
-  participant CM as ConfigMap metadata 5B planned
+  participant CM as ConfigMap metadata 5B Stage 0 implemented
   participant SRC as Eligible source
   participant OLD as Stale epoch peer
 
@@ -241,15 +245,134 @@ testbed intentionally provides.
   a data-loss event), and a matching epoch restored later returns the replica to `DISCOVERING` automatically.
   The epoch is never silently reset. Confirmed catastrophic loss is handled **only** by 5C. See
   [lifecycle-metadata-and-genesis.md](lifecycle-metadata-and-genesis.md#4-transient-versus-catastrophic-metadata-failure).
-- No production Kubernetes metadata provider: the controller uses a no-op source that always reports metadata
-  unavailable. In production, replicas with lifecycle enabled will stay unready until the 5B provider is deployed.
-  *(5B adds the ConfigMap-backed provider — implemented read-only and inactive in Stage 0.)*
+- No production Kubernetes metadata provider wired into the running application: the controller uses a no-op
+  source that always reports metadata unavailable. In production, replicas with lifecycle enabled will stay
+  unready until the 5B provider is deployed and lifecycle enforcement is enabled. *(5B Stage 0 implements the
+  read-only ConfigMap-backed provider; it is not active in the default build.)*
 - No automatic genesis: a fresh replica with no binding cannot automatically initialize an empty epoch.
-  *(5B adds control-plane-coordinated genesis.)*
+  *(5B Stage 3+ adds operator-controlled one-time genesis.)*
 - No automatic epoch reset: a `RECOVERY_REQUIRED` replica cannot automatically return to `READY`; operator
   intervention is required. *(5C adds the explicit operator recovery procedure.)*
-- No snapshot transfer: the initial data baseline (the path from `SYNCING` to `READY`) is not yet implemented;
-  `SetReady` is provided for test purposes and future 5B implementation. *(5B adds initial snapshot transfer.)*
+- No snapshot transfer orchestration: the initial data baseline (the path from `SYNCING` to `READY`) is not yet
+  implemented as a scheduled sweep; `SetReady` is provided for test purposes. The transport-and-commit mechanism
+  (`FetchBootstrapBaseline`) is implemented in 5B Stage 2 (under independent review). *(5B Stage 3 adds source
+  discovery, sweep scheduling, and automatic `READY` promotion.)*
 - 5A alone does **not** make GossipGrid safe for catastrophic cluster recovery. It provides the fencing and
-  admission framework; the full recovery protocol requires the 5B metadata provider, snapshot transfer, and
-  the 5C operator recovery procedures.
+  admission framework; the full recovery protocol requires the 5B metadata provider (wired into the running
+  application), snapshot transfer orchestration, and the 5C operator recovery procedures.
+
+## Planned controlled GitOps/Kubernetes rollback experiment (Milestone 9)
+
+> **Status: Planned, not performed.** This section documents a designed rollback experiment for the
+> Milestone 9 resilience/security lab. The test has **not** been executed; it is a specification for a
+> future controlled experiment. Do not read this section as evidence that the test was run.
+
+The experiment validates that a **controlled, operator-orchestrated rollback** of a GossipGrid deployment
+in the staging cluster (from a 7B image with lifecycle enforcement enabled back to a 7A image with
+lifecycle disabled) is safe and reversible, and that the cluster's message state and control-plane
+metadata are not corrupted by the rollback.
+
+### Preconditions
+
+- A 7B staging cluster (lifecycle enforcement enabled, `GOSSIPGRID_LIFECYCLE_ENABLED=true`) with all five
+  replicas `READY`, a known authoritative `ClusterID`/`EpochID` in the ConfigMap
+  `gossipgrid-cluster-metadata`, and a known message count (recorded before the experiment).
+- A 7A image (lifecycle disabled) published to the private GitLab registry and referenced by digest in
+  the k8s-gitops repository (the Argo CD Application can roll back to it).
+- The Argo CD Application in the k8s-gitops repository is in `Healthy`/`Synced` state.
+- No in-flight writes (quiesce the public API for the duration of the experiment).
+
+### Procedure
+
+1. **Record the 7B baseline.** Note the current `ClusterID`, `EpochID`, `generation`, `initialized`,
+   `dataLossProtected`, `everAcceptedMessages` from the ConfigMap. Note the message count from each
+   replica's `GET /api/diagnostics`. Screenshot the Argo CD Application history.
+2. **Roll back the image.** In the k8s-gitops repository, update the Argo CD Application's image digest
+   (or the Helm `values-7b.yaml` image tag) to the 7A image digest. Commit and push. Argo CD reconciles
+   the cluster to the 7A image. The StatefulSet performs a rolling update.
+3. **Observe the 7A transition.** As each 7B pod is replaced by a 7A pod:
+   - The new 7A pod starts with lifecycle disabled (`GOSSIPGRID_LIFECYCLE_ENABLED=false`).
+   - The 7A pod's `GET /internal/status` response has **no** lifecycle envelope headers (lifecycle
+     disabled → `setResponseEpochEnvelope` is not called).
+   - A 7B peer (still `READY`, lifecycle enabled) that attempts to sync from the new 7A pod **rejects**
+     the 7A pod as a synchronization source (the lifecycle-enabled client validates the response envelope;
+     a legacy peer without the envelope is rejected). This is the **expected** M5A behavior: a
+     lifecycle-enabled replica does not ingest data from a peer that does not run the epoch-fencing
+     protocol.
+   - The 7A pod does **not** attempt to read or modify the ConfigMap (the 7A build has no
+     `MetadataSource` wired; the lifecycle controller is not started).
+4. **Verify the 7A cluster is functional.** After all five pods are 7A:
+   - All five replicas are `READY` (lifecycle disabled → no lifecycle state; the readiness probe returns
+     200).
+   - The public API accepts writes (no lifecycle gating).
+   - The message count from `GET /api/diagnostics` on each 7A pod is **zero** (the `emptyDir` was lost
+     during the pod replacement; the 7A image does not import the 7B message set).
+   - The ConfigMap `gossipgrid-cluster-metadata` is **unchanged** (the 7A pods do not read or write it).
+5. **Roll forward to 7B (recovery).** Update the Argo CD Application to the 7B image digest. Argo CD
+   reconciles. Each 7B pod:
+   - Starts with lifecycle enabled, reads the ConfigMap (the authoritative metadata is unchanged from
+     step 1), binds its `local_metadata` to the recorded `ClusterID`/`EpochID`.
+   - Enters `SYNCING` (no local data, the `emptyDir` was lost) and attempts to bootstrap from an eligible
+     peer. **No eligible 7B source exists yet** (all peers are 7A or just-restarted 7B pods with empty
+     `emptyDir`), so the pod stays in `SYNCING` or transitions to `RECOVERY_REQUIRED`.
+   - **This is the expected behavior for this experiment**: the rollback to 7A and the return to 7B does
+     **not** restore the 7B message set (the data was in `emptyDir` and was lost). The cluster is
+     **available** (replicas can accept new writes) but the **pre-rollback message set is lost**. This is
+     the intended, documented behavior of the ephemeral-storage architecture.
+6. **Record the outcome.** Document:
+   - The ConfigMap state (should be unchanged from step 1).
+   - The message count on each 7B pod (expected: zero, or the count of messages written during the 7A
+     window if writes were not fully quiesced).
+   - The Argo CD Application history (rollback + forward).
+   - Any `RECOVERY_REQUIRED` replicas and the operator action required to return them to `READY`
+     (in this case: no data to recover; the operator can authorize a new epoch reset via 5C, or simply
+     accept the empty cluster and continue).
+
+### Expected results (the test is a pass if all of the following hold)
+
+- The rollback to 7A is **safe**: no crash, no corruption of the ConfigMap, no data written to the
+  ConfigMap by the 7A pods.
+- The 7A cluster is **functional**: all replicas ready, public API accepting writes.
+- The lifecycle-enabled 7B peers (during the rolling update) **reject** the 7A pods as synchronization
+  sources (the M5A envelope validation works as designed).
+- The roll-forward to 7B does **not** restore the pre-rollback message set (the `emptyDir` data is
+  lost; this is the documented ephemeral-storage limitation).
+- The ConfigMap is **unchanged** throughout (the 7A pods do not interact with it; the 7B pods read it
+  but do not modify it during the bootstrap attempt).
+- The Argo CD Application is in `Healthy`/`Synced` state after the forward.
+
+### What this experiment does NOT test
+
+- **Catastrophic data-loss recovery** (the 5C operator reset procedure). The experiment demonstrates
+  that the rollback is safe and reversible, but the pre-rollback data is lost (the `emptyDir`
+  architecture). The 5C procedure (operator-authorized epoch reset, incident audit) is a separate
+  experiment in M9.
+- **Bootstrap from surviving 7B peers.** In this experiment, all pods are replaced during the rolling
+  update, so no 7B peer survives to serve a bootstrap baseline. A variant of this experiment (roll
+  back only 2 of 5 pods, leaving 3 7B pods `READY`) would test the bootstrap path: the 2 replaced
+  pods would enter `SYNCING` and bootstrap from the 3 surviving 7B peers. This variant is a
+  **separate** M9 experiment.
+- **The 7A→7B migration procedure** (the operator-orchestrated export/import described in
+  [lifecycle-metadata-and-genesis.md](lifecycle-metadata-and-genesis.md#6-migration-from-the-current-staging-7a--7b)).
+  This rollback experiment is a **simpler** scenario (no export/import, just an image rollback); the
+  full migration is a separate M9 experiment.
+
+### Relationship to Milestone 9
+
+This experiment is one of several planned M9 experiments:
+
+- **Pod loss and recovery** (delete 1 of 5 pods; verify the remaining 4 converge; verify the replaced
+  pod joins via bootstrap or stays unready).
+- **Partition and reconnection** (network-impair one pod; verify the others remain responsive; reconnect
+  and verify convergence).
+- **Full-pod-loss and fail-closed** (delete all 5 pods; verify no replica claims genesis; verify the
+  ConfigMap is intact; perform a 5C operator reset).
+- **GitOps rollback** (this experiment: roll back the image via Argo CD; verify the rollback is safe
+  and the ConfigMap is unchanged).
+- **Live certificate rotation** (rotate the workload CA; verify new connections use the new certs
+  without pod restarts).
+- **Metrics and FIPS profile verification** (collect gossip/anti-entropy metrics; verify the FIPS
+  module is enabled at runtime).
+
+All M9 experiments are **planned, not performed** as of this document. They will be executed when
+Milestone 9 is scheduled and the 7B staging cluster is available.

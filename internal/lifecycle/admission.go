@@ -188,6 +188,193 @@ func (a *Admission) CheckReplicationInbound(ctx context.Context, reqCtx RequestC
 	}
 }
 
+// CheckBootstrapSourceInbound checks whether the serving replica may serve a
+// bootstrap baseline FETCH (serving replica side) for a request that carries
+// the bootstrap request-purpose header: GET /internal/sync/ids and
+// POST /internal/sync/messages. It is the serving-side counterpart to the
+// requesting replica's CheckBootstrapFetch.
+//
+// It is the ONLY path by which an otherwise-unready serving replica would
+// answer the sync endpoints, and it is strictly more restrictive than the
+// ordinary CheckReplicationInbound in state: the serving replica must be in a
+// ready state (READY or DEGRADED) AND fully authorized (a fresh, valid,
+// matching authoritative observation plus a matching durable binding, no
+// recovery lockout, not stopped), AND the request's epoch context must match
+// the local authorized metadata.
+//
+// It does NOT relax any existing rule:
+//
+//   - a serving replica in SYNCING, GENESIS, DISCOVERING, STARTING, or
+//     RECOVERY_REQUIRED is never authorized (IsReady is false), so it is
+//     rejected;
+//   - a wrong-epoch or headerless request is rejected (409) exactly as for
+//     ordinary replication;
+//   - the response envelope (lifecycle/epoch headers) is still required, so
+//     a legacy peer is never accepted as a source by a lifecycle-enabled
+//     requester (enforced client-side via validateResponseEnvelope).
+//
+// The header that selected this check is UNTRUSTED metadata: it only chooses
+// the serving-side policy. The actual authorization is the full
+// snapshot.Authorized() decision, which a non-ready replica cannot pass.
+func (a *Admission) CheckBootstrapSourceInbound(ctx context.Context, reqCtx RequestContext) AdmissionDecision {
+	if !a.enabled {
+		return AdmissionDecision{Allowed: true, Reason: "lifecycle protection disabled"}
+	}
+	snap := a.snapshot()
+	// The serving replica must be fully authorized to serve current-epoch
+	// data at all (ready state + fresh, valid, matching observation +
+	// matching binding, no lockout, not stopped). This is the same
+	// fail-closed decision the ordinary replication check requires; a
+	// non-ready serving replica (including SYNCING) can never pass it.
+	if !snap.authorized() {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "bootstrap source inbound not authorized: " + snap.authorizationReason(),
+			State:   snap.State,
+		}
+	}
+	// The serving replica must be eligible to act as a bootstrap source in
+	// its current state (READY or DEGRADED). authorized() already requires a
+	// ready state, so this is a belt-and-suspenders check that the serving
+	// replica's state is the documented eligible set; it never broadens.
+	if !snap.State.IsBootstrapSourceEligible() {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "replica state " + snap.State.String() + " is not eligible to serve a bootstrap baseline",
+			State:   snap.State,
+		}
+	}
+	// The request's epoch context must match the local authorized metadata.
+	meta := snap.Metadata
+	if reqCtx.ClusterID == "" || reqCtx.EpochID == "" {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "missing epoch context in bootstrap fetch request",
+			State:   snap.State,
+		}
+	}
+	if reqCtx.ClusterID != meta.ClusterID {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "cluster ID mismatch: request=" + reqCtx.ClusterID + " local=" + meta.ClusterID,
+			State:   snap.State,
+		}
+	}
+	if reqCtx.EpochID != meta.EpochID {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "epoch ID mismatch: request=" + reqCtx.EpochID + " local=" + meta.EpochID,
+			State:   snap.State,
+		}
+	}
+	return AdmissionDecision{
+		Allowed: true,
+		Reason:  "bootstrap source authorized and epoch context matches",
+		State:   snap.State,
+	}
+}
+
+// checkBootstrapSourceFromSnapshot evaluates the bootstrap source-serving
+// admission decision from a GIVEN AuthorizationSnapshot (not a fresh
+// snapshot). It is used by the peer server handlers (Milestone 5B, Stage 2,
+// Issue 4) so the admission decision and the response envelope are both
+// derived from the SAME consistent snapshot. The logic is identical to
+// CheckBootstrapSourceInbound, except the snapshot is supplied rather than
+// read from the controller.
+func (a *Admission) CheckBootstrapSourceFromSnapshot(snap AuthorizationSnapshot, reqCtx RequestContext) AdmissionDecision {
+	if !a.enabled {
+		return AdmissionDecision{Allowed: true, Reason: "lifecycle protection disabled"}
+	}
+	if !snap.authorized() {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "bootstrap source inbound not authorized: " + snap.authorizationReason(),
+			State:   snap.State,
+		}
+	}
+	if !snap.State.IsBootstrapSourceEligible() {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "replica state " + snap.State.String() + " is not eligible to serve a bootstrap baseline",
+			State:   snap.State,
+		}
+	}
+	meta := snap.Metadata
+	if reqCtx.ClusterID == "" || reqCtx.EpochID == "" {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "missing epoch context in bootstrap fetch request",
+			State:   snap.State,
+		}
+	}
+	if reqCtx.ClusterID != meta.ClusterID {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "cluster ID mismatch: request=" + reqCtx.ClusterID + " local=" + meta.ClusterID,
+			State:   snap.State,
+		}
+	}
+	if reqCtx.EpochID != meta.EpochID {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "epoch ID mismatch: request=" + reqCtx.EpochID + " local=" + meta.EpochID,
+			State:   snap.State,
+		}
+	}
+	return AdmissionDecision{
+		Allowed: true,
+		Reason:  "bootstrap source authorized and epoch context matches",
+		State:   snap.State,
+	}
+}
+
+// checkReplicationInboundFromSnapshot evaluates the ordinary inbound
+// replication admission decision from a GIVEN AuthorizationSnapshot (not a
+// fresh snapshot). It is used by the peer server handlers (Milestone 5B,
+// Stage 2, Issue 4) so the admission decision and the response envelope are
+// both derived from the SAME consistent snapshot. The logic is identical to
+// CheckReplicationInbound, except the snapshot is supplied rather than read
+// from the controller.
+func (a *Admission) CheckReplicationInboundFromSnapshot(snap AuthorizationSnapshot, reqCtx RequestContext) AdmissionDecision {
+	if !a.enabled {
+		return AdmissionDecision{Allowed: true, Reason: "lifecycle protection disabled"}
+	}
+	if !snap.authorized() {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "inbound replication not authorized: " + snap.authorizationReason(),
+			State:   snap.State,
+		}
+	}
+	meta := snap.Metadata
+	if reqCtx.ClusterID == "" || reqCtx.EpochID == "" {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "missing epoch context in replication request",
+			State:   snap.State,
+		}
+	}
+	if reqCtx.ClusterID != meta.ClusterID {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "cluster ID mismatch: request=" + reqCtx.ClusterID + " local=" + meta.ClusterID,
+			State:   snap.State,
+		}
+	}
+	if reqCtx.EpochID != meta.EpochID {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "epoch ID mismatch: request=" + reqCtx.EpochID + " local=" + meta.EpochID,
+			State:   snap.State,
+		}
+	}
+	return AdmissionDecision{
+		Allowed: true,
+		Reason:  "inbound replication authorized and epoch context matches",
+		State:   snap.State,
+	}
+}
+
 // CheckReplicationOutbound checks whether an outbound replication operation
 // (gossip send, anti-entropy fetch/send) may proceed. It applies the full
 // fail-closed authorization policy via the controller's single consistent
@@ -217,6 +404,92 @@ func (a *Admission) CheckReplicationOutbound(ctx context.Context) AdmissionDecis
 	}
 }
 
+// CheckBootstrapFetch checks whether a bootstrap baseline FETCH (requesting
+// replica side) is permitted: GET /internal/sync/ids and
+// POST /internal/sync/messages. It authorizes ONLY an epoch-bound SYNCING
+// replica to retrieve an initial baseline from an eligible authoritative
+// source. It is a dedicated, narrowly scoped decision; it does NOT reuse the
+// broad ordinary-replication decision (authorized, which requires a ready
+// state) and it does NOT grant any other privilege:
+//
+//   - It does NOT authorize public writes (CheckWrite / authorized still
+//     require a ready state).
+//   - It does NOT authorize ordinary outbound gossip or ordinary inbound
+//     replication writes (CheckReplicationOutbound / CheckWrite still gate
+//     those).
+//   - It does NOT authorize acting as an authoritative bootstrap source
+//     (that is the serving-side CheckBootstrapSourceInbound, gated on the
+//     serving replica being ready).
+//   - It does NOT authorize READY promotion (Stage 3).
+//   - It authorizes only the two sync fetch endpoints; the caller must pass
+//     reqCtx so the epoch context is compared.
+//
+// The replica may fetch a bootstrap baseline only when ALL of the following
+// hold (the bootstrap admission policy; see bootstrapAuthorized):
+//
+//   - the lifecycle state is exactly SYNCING (not READY, DEGRADED, GENESIS,
+//     DISCOVERING, STARTING, or RECOVERY_REQUIRED);
+//   - the controller is not stopped;
+//   - the authoritative metadata is present and FRESH (not stale) and valid;
+//   - the authoritative metadata is initialized (Initialized=true: the
+//     cluster has a baseline to fetch);
+//   - for a genesis-managed lifecycle configuration (a designated seed), the
+//     authoritative record is COMPLETELY finalized (the data-loss protection
+//     is armed and the one-time genesis authorization is consumed) — an
+//     initialized-but-unfinalized record must not authorize a joining
+//     replica to fetch;
+//   - a durable local database binding exists;
+//   - the binding's ClusterID and EpochID match the authoritative metadata
+//     (no conflicting or wrong-epoch authority);
+//   - the request's epoch context is present and matches the authoritative
+//     metadata (a missing or mismatched epoch context is rejected).
+//
+// When lifecycle protection is disabled (the guard is not enabled), all
+// checks are permitted, preserving the existing Milestone 4 behavior.
+func (a *Admission) CheckBootstrapFetch(ctx context.Context, reqCtx RequestContext) AdmissionDecision {
+	if !a.enabled {
+		return AdmissionDecision{Allowed: true, Reason: "lifecycle protection disabled"}
+	}
+	snap := a.snapshot()
+	if !snap.bootstrapAuthorized() {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "bootstrap fetch not authorized: " + snap.bootstrapAuthorizationReason(),
+			State:   snap.State,
+		}
+	}
+	// The request must carry a nonempty epoch context matching the local
+	// authorized metadata. A missing or mismatched context is rejected so a
+	// wrong-epoch or legacy (headerless) bootstrap request cannot be served.
+	if reqCtx.ClusterID == "" || reqCtx.EpochID == "" {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "missing epoch context in bootstrap fetch request",
+			State:   snap.State,
+		}
+	}
+	meta := snap.Metadata
+	if reqCtx.ClusterID != meta.ClusterID {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "cluster ID mismatch in bootstrap fetch request: request=" + reqCtx.ClusterID + " local=" + meta.ClusterID,
+			State:   snap.State,
+		}
+	}
+	if reqCtx.EpochID != meta.EpochID {
+		return AdmissionDecision{
+			Allowed: false,
+			Reason:  "epoch ID mismatch in bootstrap fetch request: request=" + reqCtx.EpochID + " local=" + meta.EpochID,
+			State:   snap.State,
+		}
+	}
+	return AdmissionDecision{
+		Allowed: true,
+		Reason:  "bootstrap fetch authorized: SYNCING replica with fresh, finalized, matching binding and matching epoch context",
+		State:   snap.State,
+	}
+}
+
 // RequestContext carries the caller's accepted cluster and epoch context in
 // an inbound replication request. It is parsed from bounded HTTP headers
 // (see the header constants in this package).
@@ -242,6 +515,79 @@ const (
 // ClusterID and EpochID are UUIDv7 strings (36 characters); 64 bytes
 // provides headroom while remaining finite.
 const MaxEpochHeaderBytes = 64
+
+// Request-purpose header (Milestone 5B, Stage 2 bootstrap admission). A
+// joining, epoch-bound SYNCING replica announces that a request to the sync
+// endpoints (GET /internal/sync/ids, POST /internal/sync/messages) is a
+// bootstrap baseline fetch rather than ordinary anti-entropy reconciliation.
+//
+// Security properties (see the CheckBootstrapFetch docs and the peer server
+// bootstrap handlers):
+//
+//   - It is UNTRUSTED request metadata, NOT authentication. It never grants
+//     any privilege on its own. mTLS identity and the epoch fencing headers
+//     remain the sole basis for peer identity and epoch authorization.
+//   - It is restricted in effect to the two sync endpoints. The serving
+//     replica uses it only to select the serving-side admission policy
+//     (CheckBootstrapSourceInbound vs. CheckReplicationInbound). Supplying
+//     the header on any other endpoint (POST /internal/messages,
+//     GET /internal/status, public API) has no effect.
+//   - A lifecycle-enabled serving replica that does NOT recognize the
+//     purpose (or receives an unsupported value) applies the ordinary
+//     replication policy. It is never rejected solely because the header is
+//     present or absent; the only way the header changes the decision is to
+//     route a SYNCING requester's read to the bootstrap source-eligibility
+//     check on a serving replica that is itself eligible to serve.
+//   - A legacy serving replica (lifecycle disabled) ignores the header
+//     entirely (legacy behavior preserved).
+//
+// The value is bounded and must be one of the supported purpose constants.
+const HeaderRequestPurpose = "X-GossipGrid-Request-Purpose"
+
+// Supported request-purpose values.
+const (
+	// PurposeBootstrapBaseline marks a bootstrap baseline fetch: a joining,
+	// epoch-bound SYNCING requester retrieving its initial baseline from an
+	// eligible authoritative source (READY or DEGRADED) via the sync
+	// inventory/fetch endpoints. This is a READ from the serving replica's
+	// perspective; it is distinct from inbound message insertion
+	// (POST /internal/messages) and from ordinary anti-entropy.
+	PurposeBootstrapBaseline = "bootstrap-baseline"
+
+	// PurposeOrdinarySync marks ordinary anti-entropy reconciliation
+	// (the default when the header is absent). A serving replica applies the
+	// ordinary replication policy (CheckReplicationInbound).
+	PurposeOrdinarySync = "ordinary-sync"
+)
+
+// maxRequestPurposeBytes bounds the request-purpose header value. It must fit
+// the longest supported constant ("bootstrap-baseline" = 18 bytes) with
+// headroom while remaining finite.
+const maxRequestPurposeBytes = 64
+
+// ParseRequestPurpose extracts the request-purpose header value and
+// normalizes it. It returns the purpose constant and a boolean reporting
+// whether the header was present and well-formed. An absent header yields
+// (PurposeOrdinarySync, false). A malformed or unsupported value yields
+// (PurposeOrdinarySync, false): the caller falls back to the ordinary
+// policy (the header is never an error and never grants a privilege).
+func ParseRequestPurpose(getHeader func(string) []string) (purpose string, present bool) {
+	vals := getHeader(HeaderRequestPurpose)
+	if len(vals) == 0 {
+		return PurposeOrdinarySync, false
+	}
+	if len(vals) > 1 {
+		return PurposeOrdinarySync, false
+	}
+	v := vals[0]
+	if v == "" || len(v) > maxRequestPurposeBytes {
+		return PurposeOrdinarySync, false
+	}
+	if v == PurposeBootstrapBaseline || v == PurposeOrdinarySync {
+		return v, true
+	}
+	return PurposeOrdinarySync, false
+}
 
 // Response envelope headers (Milestone 5A mixed-mode fencing). When a peer has
 // lifecycle protection enabled, it sets these headers on its replication

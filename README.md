@@ -5,10 +5,12 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-**Status:** Milestones 0 through 5A and 6 are implemented and locally tested (tag `v0.1.0-alpha.6`). Milestone 7A
-(Kubernetes staging) is **deployed and initially smoke-tested in Kubernetes**; the remaining acceptance tests in
+**Status:** Milestones 0 through 5A, 5B (Stages 0, 1A, 1B), and 6 are implemented and locally tested (tag
+`v0.1.0-alpha.6`). Milestone 5B Stage 2 (bootstrap replication admission) is implemented and locally tested but
+**under independent architecture review, not yet committed or cluster-verified**. Milestone 7A (Kubernetes
+staging) is **deployed and initially smoke-tested in Kubernetes**; the remaining acceptance tests in
 [deploy/STAGING-RUNBOOK.md](deploy/STAGING-RUNBOOK.md) are pending. Lifecycle enforcement is disabled in 7A
-because Milestones 5B and 5C are not yet implemented.
+because Milestones 5B (Stage 3) and 5C are not yet implemented.
 
 **Verified in the cluster** (operator-confirmed, 2026-11-22): five StatefulSet replicas running and ready with
 zero restarts; replicas distributed across two worker nodes; Kubernetes DNS peer discovery (4 remote peers + local
@@ -75,10 +77,14 @@ deliberate part of the testbed design.
 | Single-snapshot fail-closed admission (reads, writes, replication; per-send re-check) | ✅ |
 | Outbound epoch provider (current authorization, not stale) | ✅ |
 | Legacy-peer rejection (response envelope validation; mTLS alone does not prove epoch membership) | ✅ |
-| Kubernetes metadata authority (ConfigMap-backed, atomic resourceVersion update) | 🔜 Milestone 5B |
-| Initial snapshot transfer (SYNCING → READY) and automatic genesis | 🔜 Milestone 5B |
-| Snapshot-source eligibility (unsynced pods never source snapshots) | 🔜 Milestone 5B |
-| Fail-closed behavior when authoritative metadata is unavailable | 🔜 Milestone 5B |
+| Kubernetes metadata authority (ConfigMap-backed, atomic resourceVersion update) | ✅ Milestone 5B Stage 0 (read-only provider) |
+| Kubernetes genesis grant (operator-authorized, read-only RBAC) | ✅ Milestone 5B Stage 1A |
+| Operator-authorized genesis finalization (one-time, idempotent) | ✅ Milestone 5B Stage 1B |
+| Bootstrap replication admission (narrowly scoped, `SYNCING`-only, epoch-bound) | 🔜 Milestone 5B Stage 2 (implemented, **under independent review, not yet committed**) |
+| Bootstrap baseline fetch and commit (`FetchBootstrapBaseline`, bounded transactional install, pinned-epoch transport) | 🔜 Milestone 5B Stage 2 (implemented, **under independent review, not yet committed**) |
+| Initial snapshot transfer (SYNCING → READY) and operator-controlled one-time genesis | 🔜 Milestone 5B (Stage 3+) |
+| Snapshot-source eligibility (unsynced pods never source snapshots) | 🔜 Milestone 5B (Stage 3+) |
+| Fail-closed behavior when authoritative metadata is unavailable | 🔜 Milestone 5B (Stage 3+) |
 | Operator recovery/reset authorization (no automatic destructive reset by default) | 🔜 Milestone 5C |
 | Catastrophic data-loss handling and epoch transitions with stale-data fencing | 🔜 Milestone 5C |
 | Incident and recovery audit information (persistent banner, metadata record) | 🔜 Milestone 5C |
@@ -87,6 +93,7 @@ deliberate part of the testbed design.
 | Credential reload without restart; password rotation invalidates sessions immediately (no overlap window) | ✅ Milestone 6 (local) |
 | Session-bound CSRF protection (HMAC of the session SID) | ✅ Milestone 6 (local) |
 | Secure credential CLI (`init`/`rotate`/`verify`; interactive hidden prompts, no password in args) | ✅ Milestone 6 (local) |
+| Cluster visualization: authenticated diagnostics, interactive SVG topology, native telemetry, replication/lifecycle visualization (4 feature stages) | 🔜 Milestone 6B (designed; no implementation started) |
 | Kubernetes staging: five-replica StatefulSet, `emptyDir` SQLite, peer + web Services, shared Cilium Gateway | ✅ Milestone 7A (deployed and smoke-tested; full acceptance pending) |
 | cert-manager Vault PKI, per-pod mTLS via CSI, VSO-managed auth Secret | ✅ Milestone 7A (deployed and verified in cluster) |
 | Helm packaging, Argo CD deployment via immutable image from private GitLab registry | ✅ Milestone 7A (deployed) |
@@ -144,7 +151,7 @@ flowchart TB
     end
     KSEC -. mounted credential file .-> APP
 
-    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B/5C planned)"]
+    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B: Stages 0, 1A, 1B implemented; Stage 2 under independent review; Stage 3 pending; M5C planned)"]
       direction LR
       CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
       RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]
@@ -391,11 +398,15 @@ all existing behavior is preserved.
 
 **What it does NOT provide (deferred to Milestone 5B and later):**
 
-- No production Kubernetes metadata provider (the controller uses a no-op source that always reports metadata
-  unavailable; replicas with lifecycle enabled fail closed).
-- No automatic cluster genesis (a fresh replica with no binding cannot automatically initialize an empty epoch).
-- No initial snapshot transfer (the path from `SYNCING` to `READY` is not yet implemented).
-- No automatic epoch reset or operator reset endpoints.
+- No production Kubernetes metadata provider wired into the running application (Stage 0 implements the read-only
+  `lifecycle.MetadataSource` provider but it is not active in the default build; the controller uses a no-op
+  source that always reports metadata unavailable; replicas with lifecycle enabled fail closed).
+- No automatic cluster genesis (a fresh replica with no binding cannot automatically initialize an empty epoch;
+  the genesis procedure is Stage 3+).
+- No initial snapshot transfer orchestration (the path from `SYNCING` to `READY` via source discovery, sweep
+  scheduling, and `PromoteToReady` is Stage 3; Stage 2 provides the transport-and-commit mechanism
+  (`FetchBootstrapBaseline`) but not the scheduling or promotion).
+- No automatic epoch reset or operator reset endpoints (Milestone 5C).
 - mTLS alone does **not** prove a peer's epoch membership; the response envelope is a second, independent check.
 - 5A alone does **not** make GossipGrid safe for catastrophic cluster recovery.
 
@@ -699,7 +710,8 @@ or the cluster DNS). Those are pre-existing prerequisites owned by the cluster o
 | 0–5A | Single replica, local storage, peer discovery, peer mTLS, message exchange, gossip, anti-entropy, lifecycle state machine | ✅ Implemented and locally tested |
 | 6 | Browser UI, single-administrator password authentication, credential reload | ✅ Implemented and locally tested |
 | 7A | Kubernetes staging: 5-replica StatefulSet, shared Cilium Gateway, cert-manager, VSO, Argo CD | ✅ Deployed and smoke-tested; full acceptance tests pending |
-| 5B | Kubernetes metadata authority (ConfigMap), initial snapshot transfer, automatic genesis, snapshot-source eligibility | 🔜 Designed but not implemented |
+| 5B | Kubernetes metadata authority (ConfigMap), bootstrap replication admission, initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility | 🔜 Partial: Stages 0 (read-only provider), 1A (genesis grant), 1B (genesis finalization) implemented and locally tested; Stage 2 (bootstrap admission, under independent review) implemented and locally tested; Stage 3 (orchestration) designed but not implemented |
+| 6B | Cluster visualization: composed status aggregation, telemetry event buffers, propagation/reconciliation visualization, lifecycle/resilience visualization | 🔜 Designed (4 feature stages); no implementation started |
 | 5C | Operator recovery/reset authorization, catastrophic data-loss handling, epoch transitions, incident audit | 🔜 Designed but not implemented |
 | 7B | Lifecycle-aware staging: enable lifecycle enforcement, in-cluster recovery and partition tests | 🔜 Designed but not implemented |
 | 8 | GitOps delivery automation: digest-based Argo CD reconciliation, automated promotion | 🔜 Partial: immutable image + Argo CD work; automation incomplete |
@@ -707,10 +719,11 @@ or the cluster DNS). Those are pre-existing prerequisites owned by the cluster o
 
 Milestone 7A has been deployed and initially smoke-tested in the staging cluster. The remaining acceptance tests
 in [deploy/STAGING-RUNBOOK.md](deploy/STAGING-RUNBOOK.md) (cross-replica convergence, recovery after pod
-replacement, live password rotation, fault tolerance) are pending. Milestones 5B and 5C are required before
-lifecycle enforcement can be enabled (Milestone 7B). See
-[docs/development-plan.md](docs/development-plan.md) for the full milestone breakdown, acceptance criteria, and
-dependencies.
+replacement, live password rotation, fault tolerance) are pending. Milestone 5B is **partially implemented**
+(Stages 0, 1A, 1B implemented and locally tested; Stage 2 implemented and under independent review; Stage 3
+pending) and 5C is designed but not implemented; both are required before lifecycle enforcement can be enabled
+(Milestone 7B). See [docs/development-plan.md](docs/development-plan.md) for the full milestone breakdown,
+acceptance criteria, and dependencies.
 
 ## Scope
 

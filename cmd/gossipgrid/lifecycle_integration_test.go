@@ -63,6 +63,32 @@ type lifecycleTestNode struct {
 	podID      string
 }
 
+// synchronizedPeerHandler is a test-only http.Handler wrapper that holds an
+// optional custom handler behind a RWMutex. It is installed on the peer
+// server's HTTPServer.Handler BEFORE the server starts serving, so a test
+// can install a custom handler (e.g. to simulate a partial-404 or a slow
+// handler) after the node is up, without racing the server goroutine that
+// is concurrently reading the handler field. When no custom handler is
+// installed, requests are passed through to the production mux.
+type synchronizedPeerHandler struct {
+	mu     sync.RWMutex
+	inner  http.Handler // production mux (always non-nil)
+	custom http.Handler // optional test handler (nil when not installed)
+}
+
+// ServeHTTP serves the custom handler when one is installed; otherwise it
+// passes through to the production mux.
+func (h *synchronizedPeerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.RLock()
+	c := h.custom
+	h.mu.RUnlock()
+	if c != nil {
+		c.ServeHTTP(w, r)
+		return
+	}
+	h.inner.ServeHTTP(w, r)
+}
+
 // nodeTestOpts controls how a lifecycle test node is set up.
 type nodeTestOpts struct {
 	// bindTo, when non-nil, binds the store to the given cluster/epoch before
@@ -78,6 +104,12 @@ type nodeTestOpts struct {
 	// default is false to minimize goroutine count and cross-test
 	// interference).
 	engines bool
+	// aEngineRequestTimeout, when non-zero, overrides the anti-entropy engine's
+	// RequestTimeout before engine creation. The default is 5s (the production
+	// default). A test that exercises per-request timeout ownership sets this
+	// to match the peer client's RequestTimeout so the regression is caught
+	// if an engine-level shared deadline is reintroduced.
+	aEngineRequestTimeout time.Duration
 }
 
 // newLifecycleTestNode creates and starts a controller-driven lifecycle test
@@ -183,6 +215,21 @@ func newLifecycleTestNode(t *testing.T, ca *testCA, podID string, opts nodeTestO
 	// Peer client wired to the controller's current authorization decision.
 	peerClient := peertls.NewClient(mgr)
 	peerClient.SetEpochProvider(newControllerEpochProvider(ctrl))
+	// Milestone 5B, Stage 2, Issue 3: set the DEDICATED bootstrap
+	// authorization provider so the peer client enforces the full
+	// bootstrapAuthorized predicate at the transport boundary (same
+	// wiring as production in main.go).
+	peerClient.SetBootstrapEpochProvider(&controllerBootstrapProvider{ctrl: ctrl})
+
+	// Test-only pre-Serve handler wrapper: a test can install a custom
+	// handler (e.g. to simulate a partial-404 or a slow handler) via
+	// node.setPeerHandler. The wrapper is installed on peerSrv.HTTPServer.Handler
+	// BEFORE peerSrv.HTTPServer.Serve is started, so the handler is
+	// configured before any request is served (no race). When no custom
+	// handler is installed, the wrapper is a no-op passthrough to the
+	// production mux.
+	innerMux := peerSrv.HTTPServer.Handler
+	peerSrv.HTTPServer.Handler = &synchronizedPeerHandler{inner: innerMux}
 
 	// Gossip engine wired to the real delivery transport and the controller's
 	// outbound admission check (Milestone 5A: outbound gossip is fenced on the
@@ -232,13 +279,17 @@ func newLifecycleTestNode(t *testing.T, ca *testCA, podID string, opts nodeTestO
 		// scheduler's first tick does NOT fire during a test. The anti-entropy
 		// fencing is verified at the admission boundary (the check set on the
 		// engine), not by waiting for the scheduler to fire.
+		aTimeout := 5 * time.Second
+		if opts.aEngineRequestTimeout > 0 {
+			aTimeout = opts.aEngineRequestTimeout
+		}
 		aEngine = antientropy.New(antientropy.Config{
 			Interval:        10 * time.Second,
 			PageSize:        10,
 			FetchBatchSize:  8,
 			MaxPagesPerPeer: 4,
 			Workers:         2,
-			RequestTimeout:  5 * time.Second,
+			RequestTimeout:  aTimeout,
 		}, antientropy.NewDiscoveryPeerSource(intSuffix, func() antientropy.PeerSourceSnapshot {
 			// Default empty membership (no peers); replaced by
 			// setAntiEntropyPeer.
@@ -328,6 +379,28 @@ func newLifecycleTestNode(t *testing.T, ca *testCA, podID string, opts nodeTestO
 		_ = st.Close()
 	})
 	return node
+}
+
+// setPeerHandler installs a test-only custom handler on the node's peer
+// server. The handler is set through the synchronizedPeerHandler wrapper
+// (installed before the server started serving), so it is configured before
+// any request can be served — no race with the server goroutine. The custom
+// handler is responsible for delegating to the production handler (the
+// wrapper's inner mux) when it wants to fall through.
+func (n *lifecycleTestNode) setPeerHandler(custom http.Handler) {
+	n.t.Helper()
+	wrapper := n.peerSrv.HTTPServer.Handler.(*synchronizedPeerHandler)
+	wrapper.mu.Lock()
+	wrapper.custom = custom
+	wrapper.mu.Unlock()
+}
+
+// productionPeerHandler returns the production peer handler (the mux
+// registered by the peer server constructor), which a test can capture to
+// delegate to from a custom handler installed via setPeerHandler.
+func (n *lifecycleTestNode) productionPeerHandler() http.Handler {
+	n.t.Helper()
+	return n.peerSrv.HTTPServer.Handler.(*synchronizedPeerHandler).inner
 }
 
 // setGossipPeer wires a node's gossip engine to treat another node as an

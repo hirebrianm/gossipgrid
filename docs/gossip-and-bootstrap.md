@@ -3,9 +3,13 @@
 **Intent:** A compact, inspectable protocol that teaches real replication behavior without a separate broker or
 leader. Milestones 4A–4C implement the gossip and anti-entropy wire protocols (all **implemented and locally
 tested**); Milestone 5A (implemented 2026-11-21, `v0.1.0-alpha.5`) adds the lifecycle state machine, durable epoch
-binding, epoch fencing, and fail-closed admission (**implemented and locally tested**). Milestone 5B (Kubernetes
-metadata provider, initial snapshot transfer, automatic genesis, snapshot-source eligibility) is **designed but
-not implemented**.
+binding, epoch fencing, and fail-closed admission (**implemented and locally tested**). Milestone 5B is
+**partially implemented**: Stage 0 (read-only Kubernetes metadata provider) and Stage 2 (bootstrap replication
+admission, `FetchBootstrapBaseline` transport-and-commit mechanism) are implemented and locally tested but not
+yet committed or cluster-verified; Stage 3 (source discovery/selection, sweep scheduling, automatic `READY`
+promotion) is designed but not implemented. The Kubernetes metadata authority (ConfigMap-backed, schema v1),
+operator-controlled one-time genesis, and full initial snapshot transfer (SYNCING → READY) are **not yet
+complete** (Milestone 5B, Stages 3+).
 
 **Replication diagram:** The implemented distributed messaging mechanism (local persistence, gossip fanout,
 idempotent peer transfer, retries, and anti-entropy reconciliation toward eventual convergence) is illustrated
@@ -302,12 +306,12 @@ designated initial seed and becomes ready with an empty message set, then others
 narrow API-backed record holds **only metadata**, never messages. This should not be inferred from 'no peers
 answered'.
 
-**Status:** The genesis protocol is **designed but not implemented** (Milestone 5B). The 5A state machine has the
-`GENESIS` state and the transition to it is defined, but the control-plane-coordinated genesis procedure (the
-mechanism that atomically sets the `Initialized` flag in the ConfigMap and designates the seed pod) is deferred to
-5B.
+**Status:** The genesis protocol is **designed but not implemented** (Milestone 5B, Stages 3+). The 5A state
+machine has the `GENESIS` state and the transition to it is defined, but the control-plane-coordinated genesis
+procedure (the mechanism that atomically sets the `Initialized` flag in the ConfigMap and designates the seed
+pod) is deferred to 5B.
 
-## Milestone 5B — Authoritative metadata and initial synchronization (designed, not implemented)
+## Milestone 5B — Authoritative metadata and initial synchronization (partially implemented)
 
 Milestone 5B adds the Kubernetes metadata authority, the initial snapshot transfer, and the snapshot-source
 eligibility rules that complete the bootstrap protocol.
@@ -334,6 +338,215 @@ eligibility rules that complete the bootstrap protocol.
   revision, the replica stays in `DISCOVERING` or transitions to `RECOVERY_REQUIRED`; it does not invent an
   epoch. The `MetadataSource` interface (defined in 5A) is implemented with the ConfigMap-backed provider in
   5B.
+
+## Milestone 5B, Stage 2 — Bootstrap replication admission (implemented 2026-11-24; under independent review)
+
+Milestone 5B, Stage 2 implements the **narrowly scoped bootstrap baseline fetch authorization** that enables an
+authenticated, epoch-bound `SYNCING` replica to retrieve an initial data baseline from an eligible authoritative
+source **without** granting ordinary replication, public-write, or source privileges to an incompletely
+synchronized replica. The implementation is complete and locally tested (unit tests, race-enabled tests, real
+SQLite store tests, and per-package integration tests) but **not yet committed** — it is under independent
+architecture review. The production wiring in `cmd/gossipgrid/main.go` connects the bootstrap admission
+(`CheckBootstrapFetch`), authorization source (`BootstrapAuthorizationSnapshot`), and commit guard
+(`CommitUnderBootstrapAuthorization`) to the lifecycle controller. The mechanism is **only active** when
+lifecycle protection is enabled (`GOSSIPGRID_LIFECYCLE_ENABLED=true`); the default build has lifecycle disabled,
+so the bootstrap admission is a passthrough (legacy behavior preserved).
+
+### Authorization concepts (explicitly distinguished)
+
+The bootstrap admission contract defines **seven distinct authorization concepts**, each with its own predicate,
+boundary, and privilege. They are not interchangeable:
+
+| Concept | Predicate | Boundary | Privilege granted |
+| --- | --- | --- | --- |
+| **Bootstrap fetch authorization** | `AuthorizationSnapshot.bootstrapAuthorized()` | Before issuing a peer HTTP request (`CheckBootstrapFetch`) | Permits the replica to send `GET /internal/sync/ids` and `POST /internal/sync/messages` with the bootstrap request-purpose header |
+| **Bootstrap data insertion authorization** | `AuthorizationSnapshot.bootstrapAuthorized()` (revalidated) | At the local write boundary (`CommitUnderBootstrapAuthorization`) | Permits the replica to install a fetched bootstrap response into its local SQLite store |
+| **Ordinary replication authorization** | `AuthorizationSnapshot.authorized()` | Before every gossip/anti-entropy send and insert (`CheckReplicationOutbound` / `CheckReplicationInbound`) | Permits ordinary outbound gossip, ordinary inbound replication writes, and periodic anti-entropy |
+| **Public-write authorization** | `AuthorizationSnapshot.authorized()` | Before `POST /api/messages` (`CheckWrite`) | Permits the replica to accept public API writes |
+| **Authoritative source eligibility** | `StateSnapshot.IsReady()` + `AuthorizationSnapshot.authorized()` | Before serving any sync data (`CheckBootstrapSourceInbound`) | Permits the replica to serve a bootstrap baseline **or** ordinary sync data to other replicas |
+| **Kubernetes readiness** | `AuthorizationSnapshot.authorized()` | `GET /readyz` and peer `/internal/status` | Controls whether the replica is admitted to the user-facing Service |
+| **Synchronization completion / READY promotion** | Full baseline installed + initial catch-up | `Controller.PromoteToReady` (Stage 3, not yet implemented) | Transitions `SYNCING` → `READY`, enabling all ordinary privileges |
+
+### Bootstrap fetch authorization (requester side)
+
+A `SYNCING` replica may **fetch** a bootstrap baseline only when **all** of the following hold (the
+`bootstrapAuthorized()` predicate, evaluated from a single consistent `AuthorizationSnapshot`):
+
+1. Lifecycle enforcement is enabled (`Config.Enabled == true`).
+2. The lifecycle state is **exactly `SYNCING`** (not `READY`, `DEGRADED`, `GENESIS`, `STARTING`, `DISCOVERING`, or
+   `RECOVERY_REQUIRED`).
+3. The controller is **not stopped**.
+4. The authoritative metadata is **fresh** (`AuthorityState == "fresh"`, not stale or invalid).
+5. The authoritative metadata is **valid** and **initialized** (`Metadata != nil`, `Metadata.Initialized ==
+   true`).
+6. Genesis finalization is **complete** for genesis-managed configurations (the record is `GenesisAuthorized`,
+   `GenesisConsumer`, `DataLossProtected`, and `Initialized`).
+7. Data-loss protection is **armed** where required (the `DataLossProtected` flag is set for a genesis-managed
+   record).
+8. The local SQLite has a **durable binding** matching the authoritative `ClusterID` and `EpochID`
+   (`Binding != nil`, `Binding.MatchesMetadata(*Metadata)`).
+9. **No conflicting or revoked authority exists** (the observation is not stale, the binding is not mismatched,
+   and the controller has not been stopped).
+
+When any of these conditions fail, `CheckBootstrapFetch` returns a rejection (503-style unready or 409-style
+epoch mismatch), and **no peer HTTP request is sent**.
+
+### Bootstrap source eligibility (serving side)
+
+A peer is eligible to **serve** a bootstrap baseline only when:
+
+- Its lifecycle state is **`READY` or `DEGRADED`** (the `IsReady()` predicate; `SYNCING`, `GENESIS`,
+  `RECOVERY_REQUIRED`, `STARTING`, and `DISCOVERING` are never eligible).
+- It is **fully authorized** (the broad `authorized()` decision: ready state + fresh valid metadata + matching
+  binding + not stopped).
+- The request's epoch context **matches** its local authorized metadata (409 on mismatch/missing).
+
+A `SYNCING` replica is **never** an authoritative bootstrap source: its state is not ready, so the full
+`authorized()` decision fails regardless of the bootstrap request-purpose header. The request-purpose header is
+**untrusted metadata** — it only selects the serving-side admission check; it never grants a privilege.
+
+### Request-purpose header (untrusted metadata)
+
+The `X-GossipGrid-Request-Purpose` header carries the requester's intent (`bootstrap-baseline` or
+`ordinary-sync`). It is **not** authentication and **not** identity. Its only effect is to select the
+serving-side admission check:
+
+- `present && purpose == "bootstrap-baseline"` → routes to the bootstrap serving-side handler
+  (`CheckBootstrapSourceInbound`).
+- Missing, malformed, or unsupported → falls back to the ordinary serving-side handler
+  (`CheckReplicationInbound` / `authorized()`).
+
+A malformed or unsupported value is **never an error** and **never grants a privilege**. The mTLS identity and
+epoch validation continue to apply regardless of the header.
+
+### Bootstrap data insertion authorization (commit boundary)
+
+A successful bootstrap HTTP request **does not automatically authorize** insertion of its response. The
+`CommitUnderBootstrapAuthorization` method is the linearization point: it revalidates the **dedicated**
+bootstrap authorization (`bootstrapAuthorized()`) at the **actual local write boundary**, holding the
+controller's `c.mu RLock` and the machine's `m.mu RLock` (the established lock-order contract:
+`c.mu RLock → m.mu RLock → Engine.mu Lock`).
+
+If the bootstrap authorization is no longer valid at commit time (the replica left `SYNCING`, the epoch/metadata
+changed, the observation is stale or invalid, the binding changed, or the controller stopped), the callback is
+**not executed** and a rejection error is returned. Already-committed valid data is preserved (no rollback, no
+deletion).
+
+### Privilege isolation
+
+A bootstrap-authorized `SYNCING` replica:
+
+- **May** fetch a bootstrap baseline (`GET /internal/sync/ids` + `POST /internal/sync/messages` with the
+  bootstrap request-purpose header) and install it through the guarded commit boundary.
+- **May not** accept public writes (`POST /api/messages` → 503).
+- **May not** send ordinary outbound gossip (`CheckReplicationOutbound` → rejected: not ready).
+- **May not** accept ordinary inbound replication writes (`CheckReplicationInbound` → rejected: not ready).
+- **May not** act as an authoritative source for other replicas (`IsReady()` → false).
+- **May not** access unrelated endpoints (the sync endpoints are the only ones the bootstrap privilege
+  reaches).
+- **May not** self-promote to `READY` (the bootstrap commit path is not a promotion mechanism; only the full
+  synchronization completion in Stage 3 can do that).
+- **May not** enable unrestricted periodic anti-entropy (the anti-entropy engine's admission check is
+  `CheckReplicationOutbound`, not `CheckBootstrapFetch`; a `SYNCING` replica is not authorized for periodic
+  anti-entropy).
+
+### Lock ordering and revocation handling
+
+The lock-order contract is: `Controller.mu (c.mu) RLock → Machine.mu (m.mu) RLock → Engine.mu (Lock)`. All
+bootstrap authorization reads (admission checks, `CommitUnderBootstrapAuthorization`) acquire `c.mu RLock` then
+`m.mu RLock`. All state transitions (`SetRecoveryRequired`, `Stop`, etc.) acquire `c.mu RLock` then `m.mu Lock`.
+This ensures a revocation linearizes **either before or after** the commit, never "during" it.
+
+The bootstrap fetch and commit boundaries are tested at 5 deterministic contention boundaries:
+
+1. **Before issuing a bootstrap request** — the admission check rejects; no request is sent.
+2. **While a peer request is in flight** — the admission is checked at pass entry; the in-flight revocation is
+   observed at the commit boundary.
+3. **After receiving the response but before insertion** — the commit guard revalidates at the write boundary
+   and rejects.
+4. **During the guarded local commit** — the commit guard holds the RLocks; a concurrent revocation is queued
+   behind them; the commit linearizes first and succeeds.
+5. **While the controller is stopping** — Stop takes `c.mu Lock`; the commit guard's RLocks are queued behind
+   it, or the stopped flag is observed and the commit is rejected.
+
+### Trust boundary and response envelope (source-side)
+
+The bootstrap source-side (serving replica) trust boundary has three distinct layers, each independently
+validated. A compromise of any single layer does not break the others:
+
+1. **mTLS identity (transport layer).** The serving replica authenticates the requester's TLS certificate
+   against the workload CA trust bundle and verifies the exact expected DNS SAN identity. A peer without a
+   valid, workload-CA-issued certificate is rejected at the TLS handshake — no HTTP request is ever
+   processed. mTLS proves the requester holds a certificate issued by the same workload PKI; it does **not**
+   prove the requester's epoch membership or its lifecycle state (the caller's headers are untrusted).
+
+2. **Response epoch envelope (protocol layer).** Every lifecycle-enabled response carries exactly three
+   headers: `X-GossipGrid-Lifecycle-Active: true`, `X-GossipGrid-Cluster-Id`, and
+   `X-GossipGrid-Epoch-Id`. The values come from the **original admission snapshot** — the
+   `AuthorizationSnapshot` captured at the moment the serving-side admission check first passed, **not**
+   from a fresh re-read of the controller that could reflect a concurrent epoch change between admission
+   and response generation. The requester's client validates the envelope against the **captured request
+   context** (the `RequestContext` read once from the `EpochProvider` before the HTTP request was sent):
+   the envelope's cluster and epoch must match the request context exactly. A legacy peer (lifecycle
+   disabled, no envelope headers) is rejected as a synchronization source by a lifecycle-enabled client.
+   A peer whose envelope does not match the request context (a concurrent epoch change on the source
+   between the initial admission check and the recheck, or a different cluster) is rejected with a
+   permanent error (no retry). The envelope is **auditable metadata**, not bearer credentials: the
+   headers are bounded, compared, and never used to grant a privilege on their own.
+
+3. **Data-serving recheck (mutation layer).** Immediately before reading from SQLite and writing the
+   response body, the handler re-reads the **current** `AuthorizationSnapshot` and revalidates the
+   original request's epoch context against the current metadata using
+   `finalAdmissionCheckWithPredicate` (the serving-side bootstrap predicate: `CheckBootstrapSourceInbound`).
+   If the snapshot is no longer authorized (the replica was revoked, changed state, or stopped) **or**
+   the epoch changed (the current metadata's cluster/epoch no longer matches the request context), the
+   response is rejected with a permanent error **before any data is read**. The response envelope is
+   always bound to the **original** admission snapshot (step 2), not to this recheck snapshot — this
+   prevents a valid epoch-A request from being processed using epoch-B authorization.
+
+**The request-purpose header is untrusted in all three layers.** It only selects which admission check
+(`CheckBootstrapSourceInbound` vs. `CheckReplicationInbound`) the handler applies. A `SYNCING` replica can
+never pass `CheckBootstrapSourceInbound` (the `authorized()` predicate requires a ready state), so the
+header cannot be used to make a non-ready replica serve bootstrap data. A malformed or missing header
+falls back to the ordinary policy. mTLS, the envelope, and the recheck are all independent of the header.
+
+**Ordinary replication isolation.** The bootstrap source-side handler and the ordinary anti-entropy
+source-side handler are **separate** functions (`newLifecycleBootstrapSyncInventoryHandler` vs.
+`newLifecycleSyncInventoryHandler`). They are selected by the request-purpose header at dispatch time
+(`dispatchSyncInventoryHandler` / `dispatchSyncFetchHandler`). The bootstrap handler applies
+`CheckBootstrapSourceInbound` (ready state + full authorization + epoch match). The ordinary handler
+applies `CheckReplicationInbound` / `authorized()` (the same full authorization but without the explicit
+`IsBootstrapSourceEligible` belt-and-suspenders check). Both paths apply mTLS, envelope validation, and
+the data-serving recheck. A `SYNCING` replica cannot pass either check.
+
+**Lifecycle-disabled compatibility.** When `GOSSIPGRID_LIFECYCLE_ENABLED=false` (the default build), the
+`Admission` guard's `enabled` flag is `false`: `CheckBootstrapSourceInbound` and all other checks return
+`Allowed: true` immediately. The `setResponseEpochEnvelope` function is **never called** (the legacy
+handlers do not call it), and the client's `validateResponseEnvelope` returns `nil` immediately when the
+local `EpochProvider` reports enforcement disabled. The bootstrap request-purpose header is still sent
+by the client (it is set whenever `requestPurpose != ""` in `doRequest`), but it has no effect on the
+serving-side check (lifecycle disabled → all checks pass). This preserves the M4 anti-entropy behavior
+for a 7A cluster that has no authoritative epoch.
+
+### Remaining Stage 3 requirements (not yet implemented)
+
+Milestone 5B, Stage 3 will implement the full bootstrap orchestration:
+
+- **Source discovery and selection** — a `SYNCING` replica must discover eligible sources (peers in `READY` or
+  `DEGRADED` state with a matching epoch) and select one deterministically.
+- **Sweep scheduling** — the bootstrap baseline fetch is a single, bounded transfer (not the periodic
+  anti-entropy loop). Stage 3 defines when and how the sweep is scheduled (e.g., on transition to `SYNCING`,
+  with a bounded retry budget).
+- **Automatic READY promotion** — when the baseline is fully installed and initial catch-up succeeds, the
+  `SYNCING` replica transitions to `READY` (via `Controller.PromoteToReady`). This is the only path to `READY`
+  for a `SYNCING` replica.
+- **Complete sweep accounting** — the bootstrap sweep must track progress (per-peer cursor, completed passes)
+  and handle partial sweeps (page-budget exhaustion) correctly.
+
+**Milestone 5B is NOT complete.** Stage 2 provides the admission and transport-and-commit mechanism (implemented,
+under independent review); Stage 3 provides the orchestration (source discovery, sweep scheduling, automatic
+`READY` promotion) that uses it. The Kubernetes metadata authority (ConfigMap-backed schema v1 document) and
+operator-controlled one-time genesis remain unimplemented (Stage 3+).
 
 ## Joining an existing epoch
 
@@ -379,7 +592,7 @@ Key properties:
 - **No epoch management in 4A.** Cluster genesis and recovery lockout were reserved for Milestones 5A/5B.
   Milestone 5A (2026-11-21) implemented epoch fencing: when lifecycle protection is enabled, the message exchange
   endpoint checks the peer's epoch context against the local binding and rejects mismatches with 409.
-  Automatic genesis is still deferred to 5B.
+  Operator-controlled one-time genesis is still deferred to 5B.
 
 ## Epidemic gossip (Milestone 4B — implemented 2026-11-20)
 

@@ -37,6 +37,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"gossipgrid/internal/lifecycle"
 	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/store"
 )
@@ -151,19 +152,46 @@ type PeerSource interface {
 }
 
 // InventoryClient fetches a paginated inventory from a specific peer.
+// FetchBootstrapInventoryPage is the bootstrap-fetch variant (Milestone 5B,
+// Stage 2) that carries the bootstrap request-purpose header to an eligible
+// authoritative source. The peertls Client implements both.
 type InventoryClient interface {
 	FetchInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int) (*peertls.InventoryPageResponse, error)
+	// FetchBootstrapInventoryPage is the bootstrap-fetch variant (Milestone
+	// 5B, Stage 2): the pinned epoch context is passed so the transport
+	// binds the outbound headers to the pinned cluster/epoch (Issue 5).
+	FetchBootstrapInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int, pinnedCtx *lifecycle.RequestContext) (*peertls.InventoryPageResponse, error)
 }
 
 // MessageFetcher retrieves a bounded set of messages by ID from a specific peer.
+// FetchBootstrapMessages is the bootstrap-fetch variant (Milestone 5B, Stage 2)
+// that carries the bootstrap request-purpose header to an eligible
+// authoritative source. The peertls Client implements both.
 type MessageFetcher interface {
 	FetchMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string) ([]peertls.SyncMessageWire, error)
+	// FetchBootstrapMessages is the bootstrap-fetch variant (Milestone 5B,
+	// Stage 2): the pinned epoch context is passed so the transport binds
+	// the outbound headers to the pinned cluster/epoch (Issue 5).
+	FetchBootstrapMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string, pinnedCtx *lifecycle.RequestContext) ([]peertls.SyncMessageWire, error)
 }
 
-// LocalStore provides the local SQLite operations needed for reconciliation.
+// LocalStore provides the local SQLite operations needed for reconciliation
+// and bootstrap baseline installation.
 type LocalStore interface {
 	FindMissingIDs(ctx context.Context, ids []string) ([]string, error)
 	InsertReplicatedMessageReturningInserted(msg *store.Message) (bool, error)
+	// InsertReplicatedMessagesBounded installs a bounded batch of replicated
+	// messages in a single, context-aware, narrowly bounded SQLite transaction
+	// (Milestone 5B, Stage 2). It is the transactional commit boundary for
+	// bootstrap baseline installation: a single BEGIN…COMMIT that inserts the
+	// batch atomically (a conflict or error rolls the batch back; an idempotent
+	// duplicate is a no-op; an expired record is skipped). The
+	// expirationThreshold callback is invoked inside the transaction, after
+	// the transaction acquires the SQLite write lock, so the threshold
+	// reflects the time spent waiting for the connection and write lock. A
+	// nil callback disables retention filtering. The *store.Store implements
+	// this method.
+	InsertReplicatedMessagesBounded(ctx context.Context, msgs []*store.Message, expirationThreshold func() time.Time) (store.BootstrapInsertResult, error)
 }
 
 // CommitGuard executes a short, nonblocking commit callback while holding the
@@ -186,6 +214,175 @@ type LocalStore interface {
 // syncPeer, which does NOT advance the cursor or increment CompletedPasses.
 type CommitGuard interface {
 	CommitUnderAuthorization(fn func() error) error
+}
+
+// BootstrapGuard is the commit-boundary guard for installing a fetched
+// bootstrap baseline (Milestone 5B, Stage 2). It executes a short,
+// nonblocking commit callback (installing an authenticated, same-epoch
+// bootstrap response into the local store) while holding the lifecycle
+// controller's authorization read lock (c.mu RLock) and the lifecycle state
+// machine's read lock (m.mu RLock), revalidating the DEDICATED bootstrap
+// authorization decision (bootstrapAuthorized: a bound, epoch-bound SYNCING
+// replica with a fresh, valid, matching authoritative observation and a
+// matching durable binding, not stopped) at the actual local write boundary.
+//
+// A successful bootstrap HTTP request does NOT by itself authorize
+// installation of its response: the installation is gated on the bootstrap
+// authorization being valid at commit time. A revocation (a state change out
+// of SYNCING, an epoch/metadata change, a stale or invalid observation, a
+// binding change, or Stop) that linearizes before the guard enters is
+// observed and the callback is not executed (a rejection error is returned);
+// a revocation after the callback completes is a normal, permitted revocation
+// (already-committed valid data is preserved).
+//
+// It is the same lock-order and non-recursive contract as CommitGuard
+// (Controller.mu RLock → Machine.mu RLock → Engine.mu Lock): the callback
+// must NOT re-read any method that acquires Controller.mu or Machine.mu,
+// perform network I/O, or execute a blocking SQLite query. The callback
+// performs the idempotent local insert of the fetched baseline records. A nil
+// guard (lifecycle protection disabled) executes the callback directly
+// (legacy behavior preserved).
+//
+// The expected parameter (Milestone 5B, Stage 2, Issue 4) is the RequestContext
+// pinned from the consistent authorized snapshot at the start of the bootstrap
+// page (the cluster and epoch the page's data was fetched under). The guard
+// validates this expected context against the CURRENT authorization snapshot
+// under the same locks it holds for the bootstrap-authorized predicate: a
+// mismatch (the local epoch changed since the pin) or a non-authorized
+// snapshot (revocation, state change, stop) rejects the commit (the callback
+// is not executed and the transaction is rolled back). This prevents an old
+// response (fetched under epoch A) from being installed under newly acquired
+// authorization (epoch B). A zero expected context (lifecycle protection
+// disabled) is not validated (the guard checks only the predicate).
+type BootstrapGuard interface {
+	CommitUnderBootstrapAuthorization(expected lifecycle.RequestContext, fn func() error) error
+}
+
+// BootstrapAuthorizationSource is the production-wired source of the
+// requester's bootstrap authorization snapshot (Milestone 5B, Stage 2, Issue
+// 1 and Issue 4). It provides a consistent, internally synchronized view of
+// the requester's authorized cluster and epoch (the snapshot that the
+// bootstrap admission decision is based on), so the engine can pin the
+// expected RequestContext ONCE at the start of a bootstrap page and revalidate
+// against the current snapshot at every boundary (inventory, each fetch batch
+// and retry, and installation) without combining decisions from two different
+// snapshots.
+//
+// The production implementation is the lifecycle controller, which exposes
+// this via the bootstrap admission guard. The expected context is derived
+// from the SAME authorized snapshot that the admission check uses (the
+// controller's accepted metadata, read under its authorization locks), so the
+// pinned expected context and the admission decision are always consistent.
+//
+// A nil source (lifecycle protection disabled) means the engine does not pin
+// or revalidate a context (legacy behavior: the request carries whatever
+// context the provider supplies and no local revalidation is performed).
+type BootstrapAuthorizationSource interface {
+	// AuthorizationSnapshot returns a consistent, authorized view of the
+	// requester's cluster and epoch (and the admission decision for bootstrap
+	// fetch) under the controller's authorization read locks. The returned
+	// snapshot's RequestContext is the expected context the engine pins for
+	// the bootstrap page; Authorized is false (or an error is returned) when
+	// the requester is not authorized to fetch (not SYNCING, unbound, stale,
+	// invalid, stopped, or an epoch/cluster mismatch).
+	BootstrapAuthorizationSnapshot() (lifecycle.RequestContext, bool, error)
+}
+
+// BootstrapPageResult is the structured result of a single bootstrap baseline
+// inventory page (Milestone 5B, Stage 2, Issue 6). It is returned by
+// FetchBootstrapBaseline and is designed to be the unit of work that Stage 3
+// (sweep scheduling and convergence evidence) will consume, without Stage 3
+// needing to re-derive the authorization state.
+//
+// The result distinguishes the lifecycle of each record it touched and the
+// completion state of the page, so a consumer can tell a fully-succeeded page
+// from a partial or failed one without re-querying the controller.
+type BootstrapPageResult struct {
+	// Peer is the source the page was fetched from.
+	Peer PeerTarget
+
+	// InputCursor is the exclusive cursor that was passed to the inventory
+	// fetch (the "after" parameter). It is empty for the first page. A
+	// failed/revoked page must NEVER advance the sweep cursor: the next
+	// sweep attempt resumes from InputCursor (the original page boundary),
+	// not from NextCursor.
+	InputCursor string
+
+	// NextCursor is the exclusive cursor for the next inventory page. It is
+	// empty on the final page (HasMore is false). Preserved verbatim from the
+	// response so Stage 3 can resume a sweep from the same position. Only
+	// valid (advanceable) when Completed is true; on a failed page the sweep
+	// must resume from InputCursor.
+	NextCursor string
+	// HasMore is true when the source's inventory has additional pages beyond
+	// this one.
+	HasMore bool
+
+	// Records: per-record accounting for every ID in this page.
+	//
+	// Processing-stage sets (overlapping; an ID can appear in multiple sets):
+	//
+	//   - Inventoried: the ID was present in this inventory page (the source
+	//     advertised it as retained). This is the full page content.
+	//   - Missing: the ID was in the page but absent from the local store at
+	//     the diff (a candidate for fetch+install). A subset of Inventoried.
+	//   - Fetched: the ID was fetched from the source (the source served the
+	//     complete record). A subset of Missing (IDs that were actually
+	//     served, not confirmed absent).
+	//
+	// Terminal record dispositions (mutually exclusive per fetched ID; each
+	// fetched ID appears in exactly one of these sets):
+	//
+	//   - Inserted: the fetched record was actually stored locally (a new row
+	//     was created under the guarded commit; the transaction committed).
+	//   - AlreadyPresent: the fetched record was identical to an existing
+	//     local row (idempotent no-op; the transaction committed).
+	//   - Expired: the fetched record was expired on the requester side at
+	//     the install boundary (retention threshold) and was skipped without
+	//     being stored.
+	//   - ConfirmedAbsent: the source confirmed the ID was absent or expired
+	//     (the 404 missing-ID response reported it; it was not fetched).
+	//   - Conflict: the fetched record conflicted with a different local row
+	//     (an immutable content conflict; the local row was preserved and the
+	//     page failed).
+	Inventoried     []string
+	Missing         []string
+	Fetched         []string
+	Inserted        []string
+	AlreadyPresent  []string
+	Expired         []string
+	ConfirmedAbsent []string
+	Conflict        []string
+
+	// Completed is true when the page reached a clean terminal state (no
+	// unresolved error, no conflict, and the authorization was validated at
+	// the install boundary). A failed or revoked page (Err != nil) is NEVER
+	// completed, even if some records were inserted before the failure.
+	//
+	// Completed is also set only after the bootstrap authorization is
+	// validated at the install boundary — an empty or all-already-present page
+	// is completed only if the requester was still authorized to install
+	// (the authorization must be validated before reporting success, not
+	// assumed from the absence of records to install).
+	Completed bool
+
+	// Error is set when the page failed (a fetch or install error, an
+	// admission or commit-guard rejection, a context cancellation, or an
+	// authorization mismatch). When Error is set, Completed is false and the
+	// page must not be reported as successful. The already-inserted records
+	// (Inserted) are preserved (no rollback); the remaining work is
+	// resumable from InputCursor on the next Stage 3 sweep.
+	Error error
+}
+
+// IsPartial returns true when the page failed (Error is set or a conflict
+// occurred) but some records were committed before the failure. A partial
+// page is NOT completed: the caller must NOT report success and must NOT
+// advance the sweep cursor past InputCursor. The committed records remain
+// valid and idempotent (a retry resumes from InputCursor and the already-
+// inserted records are recognized as AlreadyPresent).
+func (r *BootstrapPageResult) IsPartial() bool {
+	return !r.Completed && (len(r.Inserted) > 0 || len(r.AlreadyPresent) > 0)
 }
 
 // syncStats holds concurrency-safe counters for observability.
@@ -297,10 +494,27 @@ type Engine struct {
 	doneWG sync.WaitGroup
 	st     syncStats
 
-	// admissionCheck is an optional lifecycle admission guard (Milestone 5A).
-	// When set, syncPeer checks it before performing any network operations.
-	// A nil check means lifecycle protection is disabled.
+	// admissionCheck is the ordinary lifecycle admission guard for outbound
+	// anti-entropy (Milestone 5A). When set, syncPeer checks it before
+	// performing any network operations. It is wired to
+	// Admission.CheckReplicationOutbound in production (a ready-state
+	// requirement). A nil check means lifecycle protection is disabled.
 	admissionCheck func(ctx context.Context) error
+
+	// bootstrapAdmissionCheck is the DEDICATED bootstrap outbound admission
+	// guard (Milestone 5B, Stage 2). When set, FetchBootstrapBaseline checks
+	// it before issuing any bootstrap request and before each retry. It is
+	// wired to Admission.CheckBootstrapFetch in production (a narrowly
+	// scoped, SYNCING-only, epoch-bound decision distinct from the ordinary
+	// anti-entropy admission, which requires a ready state that a joining
+	// replica does not have). A nil check means lifecycle protection is
+	// disabled (legacy passthrough).
+	//
+	// The separation is essential: a joining SYNCING replica is authorized for
+	// bootstrap fetch but NOT for ordinary replication. Using the ordinary
+	// admission check for bootstrap would make production bootstrap impossible
+	// from SYNCING (CheckReplicationOutbound requires a ready state).
+	bootstrapAdmissionCheck func(ctx context.Context) error
 
 	// commitGuard is the lifecycle commit guard (Milestone 5A). When set,
 	// commitCursor executes the cursor mutation while holding the controller's
@@ -309,6 +523,24 @@ type Engine struct {
 	// decision and the in-memory commit. A nil guard (lifecycle protection
 	// disabled) executes the commit directly under e.mu.
 	commitGuard CommitGuard
+
+	// bootstrapGuard is the lifecycle commit guard for installing a fetched
+	// bootstrap baseline (Milestone 5B, Stage 2). When set, commitBootstrap
+	// executes the local insert while holding the controller's authorization
+	// read lock (c.mu RLock) and the machine's read lock (m.mu RLock),
+	// revalidating the dedicated bootstrap authorization at the write boundary.
+	// A nil guard (lifecycle protection disabled) executes the insert directly.
+	bootstrapGuard BootstrapGuard
+
+	// bootstrapAuthSource is the production-wired source of the requester's
+	// bootstrap authorization snapshot (Milestone 5B, Stage 2, Issue 1 and
+	// Issue 4). When set, FetchBootstrapBaseline pins the expected
+	// RequestContext from a consistent authorized snapshot ONCE at the start
+	// of a page and revalidates it against the current snapshot at every
+	// boundary (inventory, each fetch batch and retry, and installation).
+	// A nil source (lifecycle protection disabled) means no context is pinned
+	// or revalidated (legacy behavior).
+	bootstrapAuthSource BootstrapAuthorizationSource
 
 	// initialSyncTracker is the opt-in initial anti-entropy synchronization
 	// barrier tracker (Milestone 7A enhancement). When set, syncPeer records a
@@ -397,6 +629,420 @@ func (e *Engine) SetCommitGuard(guard CommitGuard) {
 	e.commitGuard = guard
 }
 
+// SetBootstrapGuard configures the lifecycle commit guard for installing a
+// fetched bootstrap baseline (Milestone 5B, Stage 2). When set, commitBootstrap
+// executes the local insert under the controller's authorization read lock
+// (c.mu RLock) and machine read lock (m.mu RLock), revalidating the dedicated
+// bootstrap authorization at the write boundary so a revocation or epoch change
+// between the HTTP fetch and the local insert prevents installation. A nil
+// guard (lifecycle protection disabled) executes the insert directly (legacy
+// behavior preserved). Must be called before Start.
+func (e *Engine) SetBootstrapGuard(guard BootstrapGuard) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.bootstrapGuard = guard
+}
+
+// SetBootstrapAdmissionCheck configures the DEDICATED bootstrap outbound
+// admission guard (Milestone 5B, Stage 2). When set, FetchBootstrapBaseline
+// checks the guard before issuing a bootstrap request and before each retry.
+// It is wired to Admission.CheckBootstrapFetch in production — the narrowly
+// scoped, SYNCING-only, epoch-bound bootstrap decision that is distinct from
+// the ordinary anti-entropy admission (SetAdmissionCheck, wired to
+// CheckReplicationOutbound, which requires a ready state). A nil check means
+// lifecycle protection is disabled (legacy passthrough). Must be called before
+// the bootstrap baseline fetch is used.
+//
+// The separation from SetAdmissionCheck is essential: a joining SYNCING replica
+// is authorized for bootstrap fetch but not for ordinary replication, so the
+// two admission paths must be independent.
+func (e *Engine) SetBootstrapAdmissionCheck(check func(ctx context.Context) error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.bootstrapAdmissionCheck = check
+}
+
+// SetBootstrapAuthorizationSource configures the production-wired source of the
+// requester's bootstrap authorization snapshot (Milestone 5B, Stage 2, Issue 1
+// and Issue 4). When set, FetchBootstrapBaseline pins the expected
+// RequestContext from a consistent authorized snapshot once per page and
+// revalidates it at every boundary. A nil source (lifecycle protection
+// disabled) means no context is pinned or revalidated (legacy behavior). Must
+// be called before the bootstrap baseline fetch is used.
+func (e *Engine) SetBootstrapAuthorizationSource(src BootstrapAuthorizationSource) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.bootstrapAuthSource = src
+}
+
+// commitBootstrap executes a short, nonblocking local insert callback for a
+// fetched bootstrap baseline while holding the lifecycle controller's
+// authorization read lock (c.mu RLock) and machine read lock (m.mu RLock),
+// revalidating the DEDICATED bootstrap authorization (bootstrapAuthorized) at
+// the actual local write boundary (Milestone 5B, Stage 2).
+//
+// A successful bootstrap HTTP request does not by itself authorize
+// installation of its response. This method is the linearization point: if the
+// bootstrap authorization is no longer valid at commit time (the replica left
+// SYNCING, the epoch/metadata changed, the observation is stale or invalid,
+// the binding changed, or the controller stopped), the callback is not
+// executed and a rejection error is returned. Already-committed valid data is
+// preserved (this method never deletes or resets the store).
+//
+// Lock-order contract: Controller.mu (RLock) → Machine.mu (RLock) →
+// Engine.mu (Lock). The callback may take the engine's mutex but must NOT
+// re-read any method that acquires Controller.mu or Machine.mu (both RWMutexes
+// are non-reentrant), perform network I/O, or execute a blocking SQLite
+// query. When the bootstrap guard is nil (lifecycle protection disabled), the
+// callback is executed directly under e.mu (legacy behavior preserved).
+//
+// The expected parameter is the pinned RequestContext for the bootstrap page
+// (Issue 4); the guard validates it against the current authorization snapshot
+// under the same locks, rejecting a commit when the epoch changed or the
+// authorization was revoked since the pin.
+func (e *Engine) commitBootstrap(expected lifecycle.RequestContext, fn func() error) error {
+	e.mu.Lock()
+	guard := e.bootstrapGuard
+	e.mu.Unlock()
+
+	if guard != nil {
+		return guard.CommitUnderBootstrapAuthorization(expected, fn)
+	}
+	// Lifecycle protection disabled: insert directly under e.mu.
+	return fn()
+}
+
+// FetchBootstrapBaseline retrieves a bounded bootstrap baseline page from an
+// eligible authoritative source and installs the fetched records into the local
+// store through the guarded bootstrap commit boundary (Milestone 5B, Stage 2).
+//
+// It is the transport-and-commit mechanism for a joining, epoch-bound SYNCING
+// replica to install an authenticated, same-epoch baseline. It is NOT the full
+// synchronization orchestrator (Stage 3): it fetches a single inventory page
+// (after is the exclusive cursor, empty for the first page) and the
+// corresponding message records, and installs them in bounded batches. It
+// performs NO source discovery or selection, NO READY promotion, and NO
+// repeated sweeping; those are Stage 3's job. The eligible source is supplied
+// by the caller.
+//
+// Authorization (narrowly scoped, fail-closed, epoch-bound):
+//
+//   - Before issuing the request, the engine's DEDICATED bootstrap admission
+//     guard is checked (e.bootstrapAdmissionCheck, wired to
+//     Admission.CheckBootstrapFetch in production — a SYNCING-only, epoch-bound
+//     decision distinct from the ordinary anti-entropy admission, which
+//     requires a ready state a joining replica lacks). A non-SYNCING, unbound,
+//     or un-authorized requester is blocked (no request is sent).
+//   - The expected cluster/epoch is pinned ONCE from a consistent authorized
+//     snapshot (e.bootstrapAuthSource, the production-wired lifecycle
+//     controller). The pinned context is revalidated against the CURRENT
+//     snapshot before the inventory fetch, before every fetch batch and
+//     retry, and before the installation commit, so a concurrent epoch change
+//     or revocation is observed at the boundary and the page is failed (no
+//     data installed). An old response is never installed under newly
+//     acquired authorization.
+//   - The request is sent over mTLS with the locally authorized epoch headers
+//     and the bootstrap request-purpose header (the peertls client's
+//     FetchBootstrap* methods). The response epoch envelope is validated
+//     client-side, so a legacy or wrong-epoch peer is rejected as a source.
+//   - The local install is executed in a single, bounded, context-aware
+//     SQLite transaction under the bootstrap commit guard
+//     (commitBootstrap → CommitUnderBootstrapAuthorization), which holds the
+//     controller's authorization read lock for the duration of the
+//     transaction. A revocation or epoch change between the fetch and the
+//     commit prevents installation; the transaction is rolled back (no
+//     partial commit).
+//
+// Boundedness: the missing IDs are split into batches of
+// e.cfg.FetchBatchSize (the configured, validated batch limit; the peer
+// protocol also caps a batch at 8). Each batch is a single transactional
+// install (Issue 5). The per-HTTP-request timeout is owned by the peertls
+// client (Issue 2): each network operation (inventory fetch, message-fetch
+// batch, partial-404 retry) gets its own client.requestTimeout budget. The
+// page-level parent context bounds the whole page (cancellation, overall
+// deadline). The context is checked before every request and every batch.
+//
+// Retention (requester-side, single-transaction correction): the same
+// requester-side expiration threshold used by ordinary anti-entropy
+// (store.ExpirationThreshold(e.retentionTTL, e.now())) is applied at the
+// local install boundary. The threshold is evaluated INSIDE the
+// transactional install, after the transaction acquires the SQLite write
+// lock, so it reflects the time spent waiting for the connection and write
+// lock. A fetched record whose creation timestamp is strictly older than
+// the threshold is skipped (classified Expired) without being stored,
+// without resurrection, and without failing the page — the source's
+// inventory (which excludes expired records) will not re-advertise it.
+//
+// Idempotency and preservation: the install uses the store's idempotent
+// ON CONFLICT DO NOTHING path; duplicate records are no-ops and
+// already-committed valid data is never deleted or reset. A rejected commit
+// (revocation observed) rolls back the current batch (no partial commit);
+// records committed in prior batches of the page are preserved. A content
+// conflict fails the batch (rollback) and the page (unresolved conflict); the
+// local row is preserved.
+//
+// The method returns a structured *BootstrapPageResult (Issue 6) that
+// distinguishes NextCursor/HasMore, the per-record categories (inventoried,
+// missing, fetched, inserted, already-present, expired, confirmed-absent,
+// conflict), and completed-versus-partial. A failed or revoked page is NEVER
+// marked completed, even if some records were committed in a prior batch.
+// Authorization is validated before reporting successful completion,
+// including empty and all-already-present pages (the authorization must be
+// validated at the install boundary, not assumed from the absence of
+// records).
+func (e *Engine) FetchBootstrapBaseline(ctx context.Context, dialAddr, expectedIdentity, after string, limit int) *BootstrapPageResult {
+	peer := PeerTarget{DialAddr: dialAddr, ExpectedIdentity: expectedIdentity}
+	res := &BootstrapPageResult{Peer: peer, InputCursor: after}
+
+	// Boundary 1 (before issuing any request): the DEDICATED bootstrap
+	// admission check (wired to CheckBootstrapFetch in production, NOT the
+	// ordinary CheckReplicationOutbound). A non-authorized requester (not
+	// SYNCING, unbound, stale, invalid, stopped, or wrong epoch) is blocked
+	// before any request. A nil check (lifecycle protection disabled)
+	// always permits (legacy behavior).
+	if err := e.bootstrapAdmissionOK(ctx); err != nil {
+		res.Error = fmt.Errorf("lifecycle bootstrap admission: %w", err)
+		return res
+	}
+
+	// Pin the expected cluster/epoch ONCE from a consistent authorized
+	// snapshot (the production-wired lifecycle controller). The pinned
+	// context is the single epoch the whole page is bound to; it is
+	// revalidated at every boundary. A nil source (lifecycle protection
+	// disabled) yields a zero context (no revalidation).
+	expected, err := e.pinBootstrapAuth(ctx)
+	if err != nil {
+		res.Error = err
+		return res
+	}
+
+	// Revalidate the pinned context before the inventory fetch (boundary 2:
+	// a revocation or epoch change between the pin and the inventory fetch
+	// fails the page before any network I/O). The revalidation context is
+	// only used for a ctx.Err() cancellation check; the actual network
+	// request gets its own request-timeout context (Issue 3: the request
+	// timeout is per network operation, not a page-level snapshot).
+	if err := e.revalidateBootstrapAuth(ctx, expected); err != nil {
+		res.Error = err
+		return res
+	}
+
+	// Fetch a bounded inventory page from the eligible source. The peertls
+	// client's FetchBootstrapInventoryPage carries the bootstrap request
+	// purpose and validates the response epoch envelope (a legacy or
+	// wrong-epoch peer is rejected as a source).
+	//
+	// Timeout ownership (Issue 2): the engine passes the page-level parent
+	// context (ctx) directly to FetchBootstrapInventoryPage WITHOUT wrapping
+	// it in its own request timeout. The peertls client applies its own
+	// per-HTTP-request timeout independently to the inventory request.
+	// The engine's RequestTimeout is a page-level cancellation bound, not a
+	// shared wall-clock deadline across multiple HTTP operations.
+	page, err := e.invClient.FetchBootstrapInventoryPage(ctx, dialAddr, expectedIdentity, after, limit, &expected)
+	if err != nil {
+		res.Error = fmt.Errorf("fetching bootstrap inventory from peer %s: %w", expectedIdentity, err)
+		return res
+	}
+	res.NextCursor = page.NextCursor
+	res.HasMore = page.HasMore
+	res.Inventoried = append(res.Inventoried, page.IDs...)
+	if len(page.IDs) == 0 {
+		// No records to install (the source has no baseline or the sweep is
+		// complete). This is a successful no-op, but the authorization must
+		// still be validated before reporting completion (Issue 6): a
+		// revoked requester does not "complete" an empty page.
+		if err := e.revalidateBootstrapAuth(ctx, expected); err != nil {
+			res.Error = err
+			return res
+		}
+		res.Completed = true
+		return res
+	}
+
+	// Diff against the local store: fetch only the IDs we do not have.
+	// FindMissingIDs is a local DB operation (no network); the page-level
+	// parent context bounds it (the caller's ctx may independently cancel
+	// the whole page).
+	missing, err := e.localStore.FindMissingIDs(ctx, page.IDs)
+	if err != nil {
+		res.Error = fmt.Errorf("diffing bootstrap inventory against local store: %w", err)
+		return res
+	}
+	res.Missing = append(res.Missing, missing...)
+
+	// Partition the page's IDs into the already-present set (the complement
+	// of missing).
+	missingSet := make(map[string]bool, len(missing))
+	for _, id := range missing {
+		missingSet[id] = true
+	}
+	for _, id := range page.IDs {
+		if !missingSet[id] {
+			res.AlreadyPresent = append(res.AlreadyPresent, id)
+		}
+	}
+
+	if len(missing) == 0 {
+		// All records are already present: the baseline is installed (no-op).
+		// The authorization must still be validated before reporting
+		// completion (Issue 6).
+		if err := e.revalidateBootstrapAuth(ctx, expected); err != nil {
+			res.Error = err
+			return res
+		}
+		res.Completed = true
+		return res
+	}
+
+	// Split the missing IDs into bounded batches of e.cfg.FetchBatchSize
+	// (Issue 2). Each batch is a single transactional install and each
+	// network request uses the request-timeout context. A batch that fails
+	// (fetch error, conflict, commit rejection, or epoch change) fails the
+	// page; batches committed before the failure are preserved (no
+	// rollback across batches).
+	batchSize := e.cfg.FetchBatchSize
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	for start := 0; start < len(missing); start += batchSize {
+		end := start + batchSize
+		if end > len(missing) {
+			end = len(missing)
+		}
+		batch := missing[start:end]
+
+		// Revalidate the pinned context before each fetch batch (boundary 3:
+		// a revocation or epoch change between batches fails the page).
+		// The revalidation context is the page-level parent (used only for
+		// a ctx.Err() cancellation check).
+		if err := e.revalidateBootstrapAuth(ctx, expected); err != nil {
+			res.Error = err
+			return res
+		}
+
+		// Fetch the batch's records from the eligible source. The peertls
+		// client's FetchBootstrapMessages carries the bootstrap request
+		// purpose, validates the response epoch envelope, and performs the
+		// 404 missing-ID reconciliation (a record that expired on the
+		// source between the inventory and the fetch is reported as
+		// confirmed-absent, not fetched).
+		//
+		// Timeout ownership (Issue 2): the engine passes the page-level
+		// parent context (ctx) directly to FetchBootstrapMessages WITHOUT
+		// wrapping it in its own request timeout. The peertls client
+		// applies its own per-HTTP-request timeout (client.requestTimeout)
+		// independently to each network operation: the initial request and
+		// the partial-404 retry each get their own RequestTimeout budget.
+		// This is the authoritative per-HTTP-request timeout policy for
+		// bootstrap transport. The engine's RequestTimeout is NOT a shared
+		// budget across multiple HTTP operations; it is a page-level
+		// cancellation bound (the caller can cancel the whole page via ctx),
+		// not a wall-clock deadline applied to individual requests.
+		msgs, err := e.msgFetcher.FetchBootstrapMessages(ctx, dialAddr, expectedIdentity, batch, &expected)
+		if err != nil {
+			res.Error = fmt.Errorf("fetching bootstrap messages from peer %s: %w", expectedIdentity, err)
+			return res
+		}
+		fetchedSet := make(map[string]bool, len(msgs))
+		for _, m := range msgs {
+			fetchedSet[m.ID] = true
+		}
+		for _, id := range batch {
+			if fetchedSet[id] {
+				res.Fetched = append(res.Fetched, id)
+			} else {
+				// The source confirmed the ID was absent or expired (the
+				// 404 reconciliation reported it); it was not fetched.
+				res.ConfirmedAbsent = append(res.ConfirmedAbsent, id)
+			}
+		}
+		if len(msgs) == 0 {
+			// All of this batch's IDs were confirmed absent/expired by the
+			// source: nothing to install. Continue to the next batch (a
+			// confirmed-absent record is a legitimate, expected outcome, not
+			// a failure).
+			continue
+		}
+
+		// Build the store messages (validating the timestamp). A malformed
+		// timestamp is a batch failure (the record cannot be installed).
+		var storeMsgs []*store.Message
+		for _, m := range msgs {
+			ts, perr := parseTimestamp(m.CreatedAt)
+			if perr != nil {
+				res.Error = fmt.Errorf("bootstrap message %q has malformed timestamp: %v", m.ID, perr)
+				return res
+			}
+			storeMsgs = append(storeMsgs, &store.Message{
+				ID:        m.ID,
+				Body:      m.Body,
+				Origin:    m.Origin,
+				CreatedAt: ts,
+			})
+		}
+
+		// Revalidate the pinned context before the installation commit
+		// (boundary 4: a revocation or epoch change between the fetch and
+		// the commit fails the page; the commit guard ALSO revalidates at
+		// the write boundary under the same locks).
+		if err := e.revalidateBootstrapAuth(ctx, expected); err != nil {
+			res.Error = err
+			return res
+		}
+
+		// Install the batch through the guarded bootstrap commit boundary: a
+		// single, bounded, context-aware SQLite transaction under the
+		// controller's authorization read lock. The retention threshold
+		// callback is evaluated INSIDE the transaction, after the
+		// transaction acquires the SQLite write lock (single-transaction
+		// correction). A nil callback (retention disabled) skips the
+		// write-lock acquisition and threshold evaluation.
+		var insertRes store.BootstrapInsertResult
+		var thresholdCb func() time.Time
+		if e.retentionTTL > 0 {
+			thresholdCb = func() time.Time {
+				return store.ExpirationThreshold(e.retentionTTL, e.now())
+			}
+		}
+		ierr := e.commitBootstrap(expected, func() error {
+			r, ierr := e.localStore.InsertReplicatedMessagesBounded(ctx, storeMsgs, thresholdCb)
+			insertRes = r
+			return ierr
+		})
+		if ierr != nil {
+			// Commit rejected (revocation or epoch change observed at the
+			// write boundary) or a non-conflict insert error: the batch is
+			// rolled back (no partial commit) and the page is failed.
+			// Batches committed before this one are preserved.
+			res.Error = fmt.Errorf("installing bootstrap batch: %w", ierr)
+			return res
+		}
+		// Record the per-disposition counts from the transactional install.
+		res.Inserted = append(res.Inserted, insertRes.Inserted...)
+		res.AlreadyPresent = append(res.AlreadyPresent, insertRes.AlreadyPresent...)
+		res.Expired = append(res.Expired, insertRes.Expired...)
+		if len(insertRes.Conflict) > 0 {
+			// An immutable content conflict: the batch is rolled back (no
+			// records in this batch persisted) and the page is failed
+			// (unresolved conflict). The local row is preserved.
+			res.Conflict = append(res.Conflict, insertRes.Conflict...)
+			res.Error = fmt.Errorf("unresolved conflict on bootstrap batch (local row preserved): %v", insertRes.Conflict)
+			return res
+		}
+	}
+
+	// Revalidate the pinned context before reporting completion (Issue 6:
+	// the authorization must be validated at the install boundary, not
+	// assumed from the absence of records). A revoked or epoch-changed
+	// requester does not "complete" a page that was fully processed.
+	if err := e.revalidateBootstrapAuth(ctx, expected); err != nil {
+		res.Error = err
+		return res
+	}
+	res.Completed = true
+	return res
+}
+
 // SetInitialSyncTracker configures the opt-in initial anti-entropy
 // synchronization barrier tracker (Milestone 7A enhancement). When set,
 // syncPeer records a verified full inventory pass to the tracker immediately
@@ -436,6 +1082,107 @@ func (e *Engine) admissionOK(ctx context.Context) error {
 		return nil
 	}
 	return check(ctx)
+}
+
+// bootstrapAdmissionOK returns nil when the DEDICATED bootstrap outbound
+// admission is currently authorized, or an error when the bootstrap admission
+// guard rejects the operation. A nil guard (lifecycle protection disabled)
+// always permits. It is the bootstrap counterpart to admissionOK: it uses
+// e.bootstrapAdmissionCheck (wired to CheckBootstrapFetch in production), NOT
+// e.admissionCheck (wired to CheckReplicationOutbound, which requires a ready
+// state a joining replica lacks). It is checked before issuing a bootstrap
+// request and before each retry, so a bootstrap pass admitted while authorized
+// does not fetch after a subsequent revocation.
+func (e *Engine) bootstrapAdmissionOK(ctx context.Context) error {
+	e.mu.Lock()
+	check := e.bootstrapAdmissionCheck
+	e.mu.Unlock()
+	if check == nil {
+		return nil
+	}
+	return check(ctx)
+}
+
+// pinBootstrapAuth pins the expected RequestContext for a bootstrap page from
+// a consistent, authorized snapshot (Milestone 5B, Stage 2, Issue 1 and Issue
+// 4). It reads the bootstrap authorization source once (under the
+// controller's authorization read locks) and returns the expected context the
+// engine binds to for the whole page (inventory, every fetch batch and retry,
+// and installation). The expected context comes from the SAME snapshot the
+// bootstrap admission decision is based on, so the pinned context and the
+// admission decision are always consistent (no combining decisions from two
+// different snapshots).
+//
+// When the bootstrap authorization source is nil (lifecycle protection
+// disabled), the expected context is the zero context and revalidation is a
+// no-op (legacy behavior).
+//
+// It returns an error (and no pinned context) when the source is set but the
+// requester is not authorized (not SYNCING, unbound, stale, invalid, stopped,
+// or a context mismatch) — a bootstrap request must not be issued for a
+// requester that is not authorized to fetch.
+func (e *Engine) pinBootstrapAuth(ctx context.Context) (lifecycle.RequestContext, error) {
+	if ctx.Err() != nil {
+		return lifecycle.RequestContext{}, ctx.Err()
+	}
+	e.mu.Lock()
+	src := e.bootstrapAuthSource
+	e.mu.Unlock()
+	if src == nil {
+		// Lifecycle protection disabled: no context is pinned or revalidated.
+		return lifecycle.RequestContext{}, nil
+	}
+	reqCtx, authorized, err := src.BootstrapAuthorizationSnapshot()
+	if err != nil {
+		return lifecycle.RequestContext{}, fmt.Errorf("reading bootstrap authorization snapshot: %w", err)
+	}
+	if !authorized {
+		return lifecycle.RequestContext{}, errors.New("lifecycle bootstrap admission: requester is not authorized to fetch (not SYNCING, unbound, stale, invalid, stopped, or epoch/cluster mismatch)")
+	}
+	return reqCtx, nil
+}
+
+// revalidateBootstrapAuth revalidates the pinned expected RequestContext
+// against the CURRENT bootstrap authorization snapshot (Milestone 5B, Stage 2,
+// Issue 4). It is called at every boundary (before the inventory fetch, before
+// every fetch batch and retry, and before the installation commit) so a
+// concurrent epoch change or revocation between the pin and the boundary is
+// observed and the page is failed (no request is issued, no data installed).
+//
+// The revalidation reads the bootstrap authorization source fresh (a new
+// consistent snapshot) and compares its cluster and epoch against the pinned
+// expected context: a mismatch means the local epoch changed since the pin and
+// the page's data (fetched under the old epoch) must not be installed under
+// the new authorization. A non-authorized snapshot (revocation, state change,
+// stop) is likewise rejected. When the source is nil (lifecycle protection
+// disabled), this is a no-op (nil).
+func (e *Engine) revalidateBootstrapAuth(ctx context.Context, expected lifecycle.RequestContext) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	e.mu.Lock()
+	src := e.bootstrapAuthSource
+	e.mu.Unlock()
+	if src == nil {
+		return nil // lifecycle protection disabled
+	}
+	reqCtx, authorized, err := src.BootstrapAuthorizationSnapshot()
+	if err != nil {
+		return fmt.Errorf("revalidating bootstrap authorization snapshot: %w", err)
+	}
+	if !authorized {
+		return errors.New("lifecycle bootstrap admission: requester is no longer authorized (revocation or state change observed at the boundary)")
+	}
+	if expected.ClusterID == "" && expected.EpochID == "" {
+		// A zero pinned context (defensive; should not occur when src is
+		// set) is not revalidated against a concrete expected value.
+		return nil
+	}
+	if reqCtx.ClusterID != expected.ClusterID || reqCtx.EpochID != expected.EpochID {
+		return fmt.Errorf("lifecycle bootstrap admission: epoch changed at the boundary (pinned=%s/%s, current=%s/%s); page data is not authorized for the current epoch",
+			expected.ClusterID, expected.EpochID, reqCtx.ClusterID, reqCtx.EpochID)
+	}
+	return nil
 }
 
 // commitCursor is the local linearization point for a successful page

@@ -614,6 +614,20 @@ func run() (retErr error) {
 		// than using a stale startup copy.
 		if lifeCtrl != nil {
 			peerClient.SetEpochProvider(newControllerEpochProvider(lifeCtrl))
+			// Milestone 5B, Stage 2, Issue 3: set the DEDICATED bootstrap
+			// authorization provider on the peer client. This enforces the
+			// full bootstrapAuthorized predicate (SYNCING-only, epoch-bound,
+			// narrowly scoped) at the transport boundary, not just the
+			// general authorized predicate (READY/DEGRADED). A replica that
+			// leaves SYNCING cannot issue subsequent bootstrap requests.
+			peerClient.SetBootstrapEpochProvider(&controllerBootstrapProvider{ctrl: lifeCtrl})
+		}
+		// Milestone 5B Stage 2: give each bootstrap HTTP operation (initial
+		// fetch, partial-404 retry) its own per-request timeout budget,
+		// subject to cancellation and the caller's overall parent deadline.
+		// The value matches the anti-entropy engine's RequestTimeout.
+		if cfg.AntiEntropyRequestTimeout > 0 {
+			peerClient.SetRequestTimeout(cfg.AntiEntropyRequestTimeout)
 		}
 	}
 
@@ -731,6 +745,15 @@ func run() (retErr error) {
 			// under the controller's read lock) would cause when a writer
 			// (Stop or a metadata update) is waiting for the write lock.
 			aEngine.SetCommitGuard(lifeCtrl)
+			// Milestone 5B, Stage 2: set the DEDICATED bootstrap outbound
+			// admission check (SEPARATE from the ordinary SetAdmissionCheck
+			// above), the bootstrap authorization source (pins the expected
+			// cluster/epoch from a consistent authorized snapshot and
+			// revalidates it at every boundary), and the bootstrap commit
+			// guard (revalidates the pinned context at the local write
+			// boundary). Shared with the integration tests via
+			// wireBootstrapEngine.
+			wireBootstrapEngine(aEngine, lifeCtrl)
 		}
 		// Set the peer source to bridge discovery.Snapshot into
 		// antientropy.PeerSourceSnapshot (avoiding a circular import).
@@ -867,6 +890,26 @@ func (p controllerEpochProvider) Enforcement() bool { return p.enforced }
 
 func newControllerEpochProvider(ctrl *lifecycle.Controller) controllerEpochProvider {
 	return controllerEpochProvider{ctrl: ctrl, enforced: true}
+}
+
+// controllerBootstrapProvider adapts the lifecycle controller to the
+// peertls.BootstrapEpochProvider interface (Milestone 5B, Stage 2, Issue 3).
+// It delegates to the controller's BootstrapAuthorizationSnapshot, which
+// evaluates the DEDICATED bootstrapAuthorized predicate (State == SYNCING,
+// not stopped, metadata present, Initialized, genesis finalization, fresh,
+// not stale, binding matches). A general valid epoch context (authorized:
+// READY/DEGRADED) is NOT equivalent to authorization to perform a bootstrap
+// fetch. This is used by the peer client's doRequest to enforce the
+// bootstrap-specific authorization at the transport boundary before every
+// bootstrap HTTP operation (including partial-404 retries).
+type controllerBootstrapProvider struct {
+	ctrl *lifecycle.Controller
+}
+
+// BootstrapDecision returns the current bootstrap authorization decision
+// from the controller's BootstrapAuthorizationSnapshot.
+func (p *controllerBootstrapProvider) BootstrapDecision() (lifecycle.RequestContext, bool, error) {
+	return p.ctrl.BootstrapAuthorizationSnapshot()
 }
 
 func levelFromName(name string) slog.Level {

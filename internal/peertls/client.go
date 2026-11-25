@@ -174,6 +174,29 @@ type EpochProvider interface {
 	Enforcement() bool
 }
 
+// BootstrapEpochProvider is the narrow interface the peer client uses to
+// enforce the DEDICATED bootstrap authorization decision at the transport
+// boundary (Milestone 5B, Stage 2, Issue 3). It is separate from EpochProvider
+// because a general valid epoch context (authorized: READY/DEGRADED state) is
+// NOT equivalent to authorization to perform a bootstrap fetch
+// (bootstrapAuthorized: SYNCING-only, epoch-bound, narrowly scoped). A
+// replica that leaves SYNCING (e.g., transitions to RECOVERY_REQUIRED)
+// cannot issue subsequent bootstrap requests even if its cluster ID, epoch
+// ID, metadata freshness, and local binding remain unchanged.
+//
+// BootstrapDecision returns the current bootstrap authorization decision:
+// the pinned cluster/epoch context (from a consistent authorized snapshot),
+// an authorized flag (true when the replica is authorized to fetch bootstrap
+// data), and an error (when the decision cannot be established). When the
+// controller is disabled (lifecycle protection off), it returns a zero context
+// and authorized=true (passthrough). When not authorized (revocation, state
+// change to non-SYNCING, stop, stale/invalid observation, binding change),
+// it returns authorized=false with the zero context.
+type BootstrapEpochProvider interface {
+	// BootstrapDecision returns the current bootstrap authorization decision.
+	BootstrapDecision() (lifecycle.RequestContext, bool, error)
+}
+
 // Client is an authenticated peer HTTP client for the private peer endpoints.
 // It wraps the Manager's credential snapshot for the mTLS transport. When an
 // EpochProvider is configured (lifecycle protection enabled), outbound
@@ -184,10 +207,13 @@ type EpochProvider interface {
 type Client struct {
 	mgr *Manager
 
-	// mu protects provider (set by SetEpochProvider, read by doRequest and the
-	// response validators).
-	mu       sync.RWMutex
-	provider EpochProvider
+	// mu protects provider, bootstrapProvider, and requestTimeout (set by
+	// SetEpochProvider / SetBootstrapEpochProvider / SetRequestTimeout, read
+	// by doRequest, fetchMessages, and the response validators).
+	mu                sync.RWMutex
+	provider          EpochProvider
+	bootstrapProvider BootstrapEpochProvider
+	requestTimeout    time.Duration
 }
 
 // NewClient creates a Client bound to the given Manager. The Manager must have
@@ -207,11 +233,57 @@ func (c *Client) SetEpochProvider(p EpochProvider) {
 	c.provider = p
 }
 
+// SetBootstrapEpochProvider configures the BootstrapEpochProvider that
+// supplies the dedicated bootstrap authorization decision for outbound
+// bootstrap fetches (Milestone 5B, Stage 2, Issue 3). When set, the
+// doRequest method uses this provider (not the general EpochProvider)
+// for the pre-transmission and in-flight checks on bootstrap fetches
+// (pinnedCtx != nil). When nil, the general EpochProvider is used
+// (legacy behavior; the general provider does not enforce the full
+// bootstrapAuthorized predicate).
+func (c *Client) SetBootstrapEpochProvider(p BootstrapEpochProvider) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.bootstrapProvider = p
+}
+
 // getProvider returns the configured EpochProvider, or nil when none is set.
 func (c *Client) getProvider() EpochProvider {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.provider
+}
+
+// getBootstrapProvider returns the configured BootstrapEpochProvider, or nil
+// when none is set.
+func (c *Client) getBootstrapProvider() BootstrapEpochProvider {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.bootstrapProvider
+}
+
+// SetRequestTimeout sets the per-request timeout applied to individual bootstrap
+// HTTP operations (initial fetch, partial-404 retry). Each operation gets its own
+// timeout derived from the caller's context; the overall caller deadline still
+// bounds the total. When d <= 0, no per-request timeout is applied (the caller's
+// context deadline is the only bound).
+func (c *Client) SetRequestTimeout(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.requestTimeout = d
+}
+
+// withRequestTimeout returns a context derived from ctx with the configured
+// per-request timeout applied. When requestTimeout <= 0, ctx is returned
+// unchanged. The caller must call the returned cancel function.
+func (c *Client) withRequestTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	c.mu.RLock()
+	d := c.requestTimeout
+	c.mu.RUnlock()
+	if d <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
 }
 
 // peerStatusResponse is the JSON response from GET /internal/status. It
@@ -498,7 +570,24 @@ func buildClient(tlsCfg *tls.Config) *http.Client {
 // request was sent. The caller must pass it to validateResponseEnvelope (or
 // validateDiagnosticEnvelope for status) so the response is validated against
 // the original request epoch, not a potentially-changed current epoch.
-func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expectedIdentity string, body []byte, responseLimit int64) ([]byte, int, http.Header, lifecycle.RequestContext, error) {
+//
+// requestPurpose is the optional request-purpose header value (empty for
+// ordinary requests; lifecycle.PurposeBootstrapBaseline for a bootstrap
+// baseline fetch). It is UNTRUSTED metadata — it only signals intent to the
+// serving replica and never grants a privilege.
+//
+// pinnedCtx is an optional pinned epoch context (non-nil for bootstrap
+// fetches; nil for ordinary requests). When non-nil, the outbound epoch
+// headers use the pinned context, and the provider's current cluster/epoch
+// is compared against the pinned context both BEFORE transmission and in
+// flight (Milestone 5B, Stage 2, Issue 5 correction: the transport must NOT
+// silently substitute a newer epoch from its current provider). A mismatch
+// or a revocation blocks the request before network I/O, or rejects the
+// response, respectively. When lifecycle enforcement is active, an
+// incomplete pinned context (empty ClusterID or EpochID) is rejected: the
+// bootstrap fetch is bound to a specific epoch and there is no defensive
+// bypass that permits an empty context.
+func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expectedIdentity string, body []byte, responseLimit int64, requestPurpose string, pinnedCtx *lifecycle.RequestContext) ([]byte, int, http.Header, lifecycle.RequestContext, error) {
 	tlsCfg, err := c.mgr.TLSConfigForClient(dialAddr, expectedIdentity)
 	if err != nil {
 		return nil, 0, nil, lifecycle.RequestContext{}, fmt.Errorf("building peer TLS client config: %w", err)
@@ -517,6 +606,11 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json")
+	// Milestone 5B, Stage 2: optional request-purpose header (untrusted
+	// metadata). Set only when nonempty; it does not gate authorization.
+	if requestPurpose != "" {
+		req.Header.Set(lifecycle.HeaderRequestPurpose, requestPurpose)
+	}
 
 	// Milestone 5A: source the outbound epoch context from the current
 	// EpochProvider (the lifecycle controller's authorization decision), not
@@ -527,9 +621,76 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 	// establish the current epoch safely, the request is blocked (not sent) —
 	// a block is a typed, permanent error so the caller does not retry
 	// indefinitely.
+	//
+	// Milestone 5B, Stage 2 (Correction 3): bootstrap operations are
+	// identified by the request purpose (PurposeBootstrapBaseline), not by
+	// pinnedCtx != nil. For a bootstrap operation with lifecycle enforcement
+	// enabled, the DEDICATED bootstrap authorization decision
+	// (BootstrapEpochProvider.BootstrapDecision) is required: the pinned
+	// context must be non-nil and complete, the bootstrap provider must be
+	// configured, the decision must be authorized with no error, and the
+	// returned cluster/epoch must match the pinned context. Any failed
+	// condition is rejected with PeerBlockedError BEFORE network
+	// transmission. There is NO fallback to the general EpochProvider for
+	// lifecycle-enabled bootstrap requests. The general provider remains
+	// appropriate for ordinary operations. Lifecycle-disabled bootstrap
+	// retains legacy passthrough behavior (headers set from pinnedCtx if
+	// present, no authorization gate).
 	var reqCtx lifecycle.RequestContext
 	p := c.getProvider()
-	if p != nil && p.Enforcement() {
+	isBootstrap := requestPurpose == lifecycle.PurposeBootstrapBaseline
+	if isBootstrap && p != nil && p.Enforcement() {
+		// Bootstrap fetch with lifecycle enforcement: fail-closed.
+		// Require the dedicated bootstrap provider and a complete pinned
+		// context. No fallback to the general EpochProvider.
+		if pinnedCtx == nil {
+			return nil, 0, nil, lifecycle.RequestContext{}, NewPeerBlockedError(expectedIdentity,
+				"bootstrap fetch with lifecycle enforcement requires a pinned context")
+		}
+		if pinnedCtx.ClusterID == "" || pinnedCtx.EpochID == "" {
+			return nil, 0, nil, lifecycle.RequestContext{}, NewPeerBlockedError(expectedIdentity,
+				fmt.Sprintf("incomplete pinned context for bootstrap fetch (cluster=%q, epoch=%q); lifecycle enforcement is active",
+					pinnedCtx.ClusterID, pinnedCtx.EpochID))
+		}
+		bp := c.getBootstrapProvider()
+		if bp == nil {
+			return nil, 0, nil, lifecycle.RequestContext{}, NewPeerBlockedError(expectedIdentity,
+				"bootstrap fetch with lifecycle enforcement requires a configured BootstrapEpochProvider")
+		}
+		// Check the DEDICATED bootstrap authorization decision. The
+		// BootstrapDecision method evaluates bootstrapAuthorized
+		// (State == SYNCING, not stopped, metadata present, Initialized,
+		// genesis finalization, fresh, not stale, binding matches).
+		currentCtx, authorized, derr := bp.BootstrapDecision()
+		if derr != nil {
+			return nil, 0, nil, lifecycle.RequestContext{}, NewPeerBlockedError(expectedIdentity,
+				fmt.Sprintf("local bootstrap authorization decision failed before request transmission: %s", derr.Error()))
+		}
+		if !authorized {
+			return nil, 0, nil, lifecycle.RequestContext{}, NewPeerBlockedError(expectedIdentity,
+				fmt.Sprintf("local bootstrap authorization was revoked before request transmission (pinned=%s/%s); request is not authorized",
+					pinnedCtx.ClusterID, pinnedCtx.EpochID))
+		}
+		// Compare the bootstrap provider's current cluster/epoch against
+		// the pinned context. An epoch change (mismatch) blocks the request.
+		if currentCtx.ClusterID != pinnedCtx.ClusterID || currentCtx.EpochID != pinnedCtx.EpochID {
+			return nil, 0, nil, lifecycle.RequestContext{}, NewPeerBlockedError(expectedIdentity,
+				fmt.Sprintf("local epoch changed before bootstrap request transmission (pinned=%s/%s, current=%s/%s); request is not authorized",
+					pinnedCtx.ClusterID, pinnedCtx.EpochID, currentCtx.ClusterID, currentCtx.EpochID))
+		}
+		reqCtx = *pinnedCtx
+		req.Header.Set(lifecycle.HeaderClusterID, reqCtx.ClusterID)
+		req.Header.Set(lifecycle.HeaderEpochID, reqCtx.EpochID)
+	} else if isBootstrap {
+		// Bootstrap fetch with lifecycle disabled: legacy passthrough.
+		// Headers are set from the pinned context if present.
+		if pinnedCtx != nil {
+			reqCtx = *pinnedCtx
+			req.Header.Set(lifecycle.HeaderClusterID, reqCtx.ClusterID)
+			req.Header.Set(lifecycle.HeaderEpochID, reqCtx.EpochID)
+		}
+	} else if p != nil && p.Enforcement() {
+		// Ordinary request: use the current provider's context.
 		localCtx, cerr := p.Context()
 		if cerr != nil {
 			return nil, 0, nil, lifecycle.RequestContext{}, NewPeerBlockedError(expectedIdentity, cerr.Error())
@@ -583,7 +744,36 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 	// consumed (the data is from an epoch that no longer has authority).
 	// This prevents accepting a response from epoch B as the acknowledgment
 	// for a request authorized under epoch A.
-	if p != nil && p.Enforcement() {
+	//
+	// Milestone 5B, Stage 2 (Correction 3): for a bootstrap operation
+	// (identified by requestPurpose == PurposeBootstrapBaseline), the
+	// in-flight recheck applies the DEDICATED bootstrap authorization
+	// decision (BootstrapDecision) at response-consumption time, not the
+	// general EpochProvider. Every partial-404 retry independently repeats
+	// this bootstrap authorization decision.
+	if isBootstrap && p != nil && p.Enforcement() {
+		bp := c.getBootstrapProvider()
+		if bp == nil {
+			return nil, resp.StatusCode, respHeaders, reqCtx, NewPeerBlockedError(expectedIdentity,
+				"bootstrap fetch with lifecycle enforcement requires a configured BootstrapEpochProvider")
+		}
+		currentCtx, authorized, derr := bp.BootstrapDecision()
+		if derr != nil {
+			return nil, resp.StatusCode, respHeaders, reqCtx, NewPeerBlockedError(expectedIdentity,
+				"local bootstrap authorization decision failed while the request was in flight: "+derr.Error())
+		}
+		if !authorized {
+			return nil, resp.StatusCode, respHeaders, reqCtx, NewPeerBlockedError(expectedIdentity,
+				fmt.Sprintf("local bootstrap authorization was revoked while the request was in flight (request=%s/%s); response is not authorized",
+					reqCtx.ClusterID, reqCtx.EpochID))
+		}
+		if currentCtx.ClusterID != reqCtx.ClusterID || currentCtx.EpochID != reqCtx.EpochID {
+			return nil, resp.StatusCode, respHeaders, reqCtx, NewPeerBlockedError(expectedIdentity,
+				fmt.Sprintf("local epoch changed while the request was in flight (request=%s/%s, current=%s/%s); response is not authorized",
+					reqCtx.ClusterID, reqCtx.EpochID, currentCtx.ClusterID, currentCtx.EpochID))
+		}
+	} else if p != nil && p.Enforcement() {
+		// Ordinary request: recheck the general provider's context.
 		currentCtx, cerr := p.Context()
 		if cerr != nil {
 			return nil, resp.StatusCode, respHeaders, reqCtx, NewPeerBlockedError(expectedIdentity, "local authorization was revoked while the request was in flight: "+cerr.Error())
@@ -613,7 +803,7 @@ func (c *Client) doRequest(ctx context.Context, method, path, dialAddr, expected
 // match expectedIdentity all cause the handshake to fail and this method to
 // return an error.
 func (c *Client) GetStatus(ctx context.Context, dialAddr, expectedIdentity string) (*PeerStatusInfo, error) {
-	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodGet, "/internal/status", dialAddr, expectedIdentity, nil, maxResponseBodyBytes)
+	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodGet, "/internal/status", dialAddr, expectedIdentity, nil, maxResponseBodyBytes, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -685,7 +875,7 @@ func (c *Client) SendMessage(ctx context.Context, dialAddr, expectedIdentity str
 	if err != nil {
 		return nil, fmt.Errorf("encoding send request: %w", err)
 	}
-	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodPost, "/internal/messages", dialAddr, expectedIdentity, body, maxResponseBodyBytes)
+	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodPost, "/internal/messages", dialAddr, expectedIdentity, body, maxResponseBodyBytes, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -799,11 +989,43 @@ type missingIDsResponse struct {
 // All protocol violations return a typed *PeerAckError; no panic occurs
 // regardless of response shape.
 func (c *Client) FetchInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int) (*InventoryPageResponse, error) {
+	return c.fetchInventoryPage(ctx, dialAddr, expectedIdentity, after, limit, "", nil)
+}
+
+// FetchBootstrapInventoryPage is the bootstrap-fetch variant of
+// FetchInventoryPage (Milestone 5B, Stage 2): it requests a bounded inventory
+// page from an eligible authoritative source, carrying the bootstrap
+// request-purpose header to signal intent to the serving replica. The header
+// is UNTRUSTED metadata — it only selects the serving-side admission policy;
+// mTLS identity and the response epoch envelope remain the sole basis for
+// source authorization. All response validation is identical to
+// FetchInventoryPage.
+//
+// pinnedCtx is the pinned epoch context (Milestone 5B, Stage 2, Issue 5):
+// the outbound epoch headers use the pinned cluster/epoch, not the current
+// EpochProvider. A nil pinnedCtx (defensive; the engine always pins) falls
+// back to the current provider (ordinary behavior).
+func (c *Client) FetchBootstrapInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int, pinnedCtx *lifecycle.RequestContext) (*InventoryPageResponse, error) {
+	return c.fetchInventoryPage(ctx, dialAddr, expectedIdentity, after, limit, lifecycle.PurposeBootstrapBaseline, pinnedCtx)
+}
+
+// fetchInventoryPage is the shared body of FetchInventoryPage and
+// FetchBootstrapInventoryPage. requestPurpose is the optional request-purpose
+// header value (empty for ordinary anti-entropy;
+// lifecycle.PurposeBootstrapBaseline for a bootstrap baseline fetch).
+// pinnedCtx is the pinned epoch context (non-nil for bootstrap; nil for
+// ordinary).
+func (c *Client) fetchInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int, requestPurpose string, pinnedCtx *lifecycle.RequestContext) (*InventoryPageResponse, error) {
 	path := fmt.Sprintf("/internal/sync/ids?limit=%d", limit)
 	if after != "" {
 		path += "&after=" + after
 	}
-	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodGet, path, dialAddr, expectedIdentity, nil, maxSyncResponseBodyBytes)
+	// Give the inventory retrieval its own timeout budget (M5B Stage 2,
+	// Correction 2): the peer client owns the per-HTTP-operation timeout;
+	// the caller's parent context is the cancellation/overall-deadline bound.
+	invCtx, invCancel := c.withRequestTimeout(ctx)
+	defer invCancel()
+	respBody, status, respHeaders, reqCtx, err := c.doRequest(invCtx, http.MethodGet, path, dialAddr, expectedIdentity, nil, maxSyncResponseBodyBytes, requestPurpose, pinnedCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -915,11 +1137,50 @@ func (c *Client) FetchInventoryPage(ctx context.Context, dialAddr, expectedIdent
 // a rejected 404 and the IDs are not re-advertised, so the same page is not
 // re-fetched in a loop.
 func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string) ([]SyncMessageWire, error) {
+	return c.fetchMessages(ctx, dialAddr, expectedIdentity, ids, "", nil)
+}
+
+// FetchBootstrapMessages is the bootstrap-fetch variant of FetchMessages
+// (Milestone 5B, Stage 2): it requests a bounded set of complete message
+// records by ID from an eligible authoritative source, carrying the bootstrap
+// request-purpose header. The header is UNTRUSTED metadata that only selects
+// the serving-side admission policy; mTLS identity and the response epoch
+// envelope remain the sole basis for source authorization. All response
+// validation (including the 404 missing-ID reconciliation and the per-record
+// wire-size bounds) is identical to FetchMessages.
+//
+// pinnedCtx is the pinned epoch context (Milestone 5B, Stage 2, Issue 5):
+// the outbound epoch headers use the pinned cluster/epoch, not the current
+// EpochProvider. A nil pinnedCtx (defensive; the engine always pins) falls
+// back to the current provider (ordinary behavior).
+func (c *Client) FetchBootstrapMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string, pinnedCtx *lifecycle.RequestContext) ([]SyncMessageWire, error) {
+	return c.fetchMessages(ctx, dialAddr, expectedIdentity, ids, lifecycle.PurposeBootstrapBaseline, pinnedCtx)
+}
+
+// fetchMessages is the shared body of FetchMessages and
+// FetchBootstrapMessages. requestPurpose is the optional request-purpose
+// header value (empty for ordinary anti-entropy;
+// lifecycle.PurposeBootstrapBaseline for a bootstrap baseline fetch).
+// pinnedCtx is the pinned epoch context (non-nil for bootstrap; nil for
+// ordinary).
+//
+// Request timeout semantics (Milestone 5B, Stage 2, Issue 3 correction): the
+// initial message-fetch request and its partial-404 retry each get their own
+// configured RequestTimeout budget, subject to the caller's parent context
+// (cancellation and the overall parent deadline). The timeout is NOT shared
+// between the initial request and the retry: each network operation has its
+// own wall-clock budget. The per-request timeout is applied via a derived
+// context (context.WithTimeout) from the caller's ctx, so the caller's
+// cancellation is honored and the overall parent deadline is preserved.
+func (c *Client) fetchMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string, requestPurpose string, pinnedCtx *lifecycle.RequestContext) ([]SyncMessageWire, error) {
 	body, err := json.Marshal(fetchMessagesRequest{IDs: ids})
 	if err != nil {
 		return nil, fmt.Errorf("encoding fetch request: %w", err)
 	}
-	respBody, status, respHeaders, reqCtx, err := c.doRequest(ctx, http.MethodPost, "/internal/sync/messages", dialAddr, expectedIdentity, body, maxSyncResponseBodyBytes)
+	// Give the initial request its own timeout budget.
+	initialCtx, initialCancel := c.withRequestTimeout(ctx)
+	defer initialCancel()
+	respBody, status, respHeaders, reqCtx, err := c.doRequest(initialCtx, http.MethodPost, "/internal/sync/messages", dialAddr, expectedIdentity, body, maxSyncResponseBodyBytes, requestPurpose, pinnedCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -959,11 +1220,15 @@ func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity s
 			return []SyncMessageWire{}, nil
 		}
 		// Only some IDs are missing: retry once with the present IDs.
+		// The retry gets its OWN timeout budget (Issue 3): the initial
+		// request's timeout is not shared with the retry.
 		retryBody, rerr := json.Marshal(fetchMessagesRequest{IDs: presentIDs})
 		if rerr != nil {
 			return nil, fmt.Errorf("encoding retry fetch request: %w", rerr)
 		}
-		respBody, status, respHeaders, reqCtx, err = c.doRequest(ctx, http.MethodPost, "/internal/sync/messages", dialAddr, expectedIdentity, retryBody, maxSyncResponseBodyBytes)
+		retryCtx, retryCancel := c.withRequestTimeout(ctx)
+		defer retryCancel()
+		respBody, status, respHeaders, reqCtx, err = c.doRequest(retryCtx, http.MethodPost, "/internal/sync/messages", dialAddr, expectedIdentity, retryBody, maxSyncResponseBodyBytes, requestPurpose, pinnedCtx)
 		if err != nil {
 			return nil, err
 		}

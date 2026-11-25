@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"gossipgrid/internal/lifecycle"
 	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/store"
 )
@@ -126,6 +127,14 @@ func (f *fakeInventoryClient) FetchInventoryPage(ctx context.Context, dialAddr, 
 	return resp, nil
 }
 
+// FetchBootstrapInventoryPage is the bootstrap-fetch variant of
+// FetchInventoryPage (Milestone 5B, Stage 2). The test fake serves the same
+// data; the request-purpose header is untrusted and does not change the
+// serving-side decision in the fake.
+func (f *fakeInventoryClient) FetchBootstrapInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int, _ *lifecycle.RequestContext) (*peertls.InventoryPageResponse, error) {
+	return f.FetchInventoryPage(ctx, dialAddr, expectedIdentity, after, limit)
+}
+
 // fakeMessageFetcher implements MessageFetcher.
 type fakeMessageFetcher struct {
 	mu    sync.Mutex
@@ -150,6 +159,14 @@ func (f *fakeMessageFetcher) FetchMessages(ctx context.Context, dialAddr, expect
 		result = append(result, m)
 	}
 	return result, nil
+}
+
+// FetchBootstrapMessages is the bootstrap-fetch variant of FetchMessages
+// (Milestone 5B, Stage 2). The test fake serves the same data; the request
+// purpose header is untrusted and does not change the serving-side decision in
+// the fake.
+func (f *fakeMessageFetcher) FetchBootstrapMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string, _ *lifecycle.RequestContext) ([]peertls.SyncMessageWire, error) {
+	return f.FetchMessages(ctx, dialAddr, expectedIdentity, ids)
 }
 
 // fakeLocalStore implements LocalStore.
@@ -187,6 +204,44 @@ func (f *fakeLocalStore) InsertReplicatedMessageReturningInserted(msg *store.Mes
 	f.ids[msg.ID] = true
 	f.inserted = append(f.inserted, msg.ID)
 	return true, nil
+}
+
+// InsertReplicatedMessagesBounded implements the LocalStore interface for the
+// deterministic bootstrap tests. It mirrors the store's transactional batch
+// install: a new row is created (Inserted), an identical duplicate is a no-op
+// (AlreadyPresent), a conflicting duplicate is a Conflict (the batch fails),
+// and an expired record (createdAt < threshold) is skipped (Expired). The
+// expirationThreshold callback is invoked to obtain the threshold (nil =
+// disabled).
+func (f *fakeLocalStore) InsertReplicatedMessagesBounded(_ context.Context, msgs []*store.Message, expirationThreshold func() time.Time) (store.BootstrapInsertResult, error) {
+	var res store.BootstrapInsertResult
+	var threshold time.Time
+	if expirationThreshold != nil {
+		threshold = expirationThreshold()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return res, f.err
+	}
+	for _, msg := range msgs {
+		// Retention: skip expired records (requester-side threshold).
+		if !threshold.IsZero() && msg.CreatedAt.Before(threshold) {
+			res.Expired = append(res.Expired, msg.ID)
+			continue
+		}
+		if f.ids[msg.ID] {
+			// A conflicting duplicate (the fake has no content comparison;
+			// any pre-existing ID is treated as a conflict to exercise the
+			// conflict path deterministically).
+			res.Conflict = append(res.Conflict, msg.ID)
+			return res, nil
+		}
+		f.ids[msg.ID] = true
+		f.inserted = append(f.inserted, msg.ID)
+		res.Inserted = append(res.Inserted, msg.ID)
+	}
+	return res, nil
 }
 
 func (f *fakeLocalStore) addLocal(id string) {
@@ -521,6 +576,31 @@ func (c *conflictStore) InsertReplicatedMessageReturningInserted(msg *store.Mess
 	c.ids[msg.ID] = true
 	c.inserted = append(c.inserted, msg.ID)
 	return true, nil
+}
+
+// InsertReplicatedMessagesBounded implements the LocalStore interface for the
+// conflict test. It delegates per-record to the single-insert semantics: a
+// conflict ID produces a Conflict (the batch is rolled back); a duplicate ID
+// already in the store is AlreadyPresent; otherwise Inserted.
+func (c *conflictStore) InsertReplicatedMessagesBounded(_ context.Context, msgs []*store.Message, _ func() time.Time) (store.BootstrapInsertResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var res store.BootstrapInsertResult
+	for _, m := range msgs {
+		if m.ID == c.conflictID {
+			c.ids[m.ID] = true
+			res.Conflict = append(res.Conflict, m.ID)
+			return res, nil
+		}
+		if c.ids[m.ID] {
+			res.AlreadyPresent = append(res.AlreadyPresent, m.ID)
+			continue
+		}
+		c.ids[m.ID] = true
+		c.inserted = append(c.inserted, m.ID)
+		res.Inserted = append(res.Inserted, m.ID)
+	}
+	return res, nil
 }
 
 // TestSyncMultipleBatches: missing records exceed one fetch batch.
@@ -2151,6 +2231,14 @@ func (f *subsetFetcher) FetchMessages(ctx context.Context, dialAddr, expectedIde
 	// No error: the client's 404-retry succeeded (or there was no 404).
 	// The engine receives the subset of present messages.
 	return result, nil
+}
+
+// FetchBootstrapMessages is the bootstrap-fetch variant of FetchMessages
+// (Milestone 5B, Stage 2). The test fake serves the same data; the request
+// purpose header is untrusted and does not change the serving-side decision in
+// the fake.
+func (f *subsetFetcher) FetchBootstrapMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string, _ *lifecycle.RequestContext) ([]peertls.SyncMessageWire, error) {
+	return f.FetchMessages(ctx, dialAddr, expectedIdentity, ids)
 }
 
 // TestAntiEntropyExpiredAfterCleanupSweep verifies that, after a cleanup sweep

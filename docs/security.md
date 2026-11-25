@@ -15,8 +15,11 @@ NetworkPolicy and CiliumNetworkPolicy protections deployed, and non-root contain
 The **remaining acceptance tests** (cross-replica convergence, recovery after pod replacement, live
 password rotation, fault tolerance) are pending. The M5A lifecycle functionality is implemented in code but
 **intentionally disabled** in the current M7A Kubernetes staging deployment
-(`GOSSIPGRID_LIFECYCLE_ENABLED=false`) because the required 5B implementation is incomplete. The Kubernetes
-metadata provider (5B) and the operator recovery procedure (5C) are **designed but not implemented**.
+(`GOSSIPGRID_LIFECYCLE_ENABLED=false`) because the required 5B implementation is incomplete. Milestone 5B is
+**partially implemented**: Stage 0 (read-only Kubernetes metadata provider) and Stage 2 (bootstrap replication
+admission) are implemented and locally tested but not yet committed or cluster-verified; Stage 3 (orchestration,
+automatic `READY` promotion) is designed but not implemented. The operator recovery procedure (5C) is **designed
+but not implemented**.
 
 ## Threat model and trust boundaries
 
@@ -141,8 +144,8 @@ tests plus a two-node integration test (all run under the FIPS build and the rac
   established; it is a provisional direct-exchange capability, not a complete safe cluster bootstrap protocol.
   Milestone 5A (2026-11-21) subsequently implemented epoch fencing and the recovery lockout (opt-in via
   `GOSSIPGRID_LIFECYCLE_ENABLED`): the message exchange endpoint checks the peer's epoch context against the local
-  binding and rejects mismatches with 409. Automatic genesis and operator recovery/reset are still deferred to
-  5B and later.
+  binding and rejects mismatches with 409. Operator-controlled one-time genesis and operator recovery/reset are
+  still deferred to 5B and later.
 - **4A scope.** At the time of Milestone 4A, automatic gossip fanout, bounded queues, retry scheduling, and
   anti-entropy were not yet implemented. `POST /api/messages` did not automatically replicate in 4A.
   Milestone 4B (2026-11-20) subsequently implemented automatic epidemic gossip fanout (opt-in); when
@@ -221,7 +224,8 @@ integration tests (all run under the FIPS build and the race detector):
   enabled fail closed. No security guarantee is claimed for cluster recovery until the 5B provider is deployed.
 - **No automatic genesis or reset.** 5A does not implement automatic cluster initialization, automatic epoch reset,
   or operator reset endpoints. A fresh replica with no binding cannot automatically become ready. A
-  `RECOVERY_REQUIRED` replica cannot automatically return to `READY`. These are deferred to 5B and later.
+  `RECOVERY_REQUIRED` replica cannot automatically return to `READY`. Operator-controlled one-time genesis is
+  deferred to 5B (Stage 3+).
 - **Commit authorization (lock-order guarantee).** The anti-entropy cursor commit
   (`Controller.CommitUnderAuthorization`) evaluates the complete authorization decision — ready state,
   not stopped, fresh valid metadata with `Initialized=true`, and a matching durable binding with no

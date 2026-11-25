@@ -12,9 +12,9 @@ procedure) are not yet implemented. The staging phase therefore has
 **reduced safety guarantees**: a pod replacement loses its local SQLite data
 and is re-reconciled by anti-entropy (a best-effort test, **not** an
 authoritative-snapshot guarantee). Do **not** claim authoritative initial
-snapshot synchronization, safe automatic genesis, lifecycle-based readiness
-authorization, or catastrophic recovery guarantees — those capabilities belong
-to later milestones (5B/5C/7B).
+snapshot synchronization, safe operator-controlled one-time genesis,
+lifecycle-based readiness authorization, or catastrophic recovery guarantees
+— those capabilities belong to later milestones (5B/5C/7B).
 
 ## 0. Pre-deployment prerequisites (verify first)
 
@@ -493,9 +493,10 @@ discovers its peers via DNS, and the anti-entropy engine (default 30s cycle)
 fetches missing messages from peers that still have them.
 
 This is **NOT** an authoritative initial snapshot synchronization, safe
-automatic genesis, or lifecycle readiness gating guarantee. Those capabilities
-belong to Milestones 5B (Kubernetes metadata provider, initial snapshot
-transfer, snapshot-source eligibility) and 7B (lifecycle-aware staging).
+operator-controlled one-time genesis, or lifecycle readiness gating guarantee.
+Those capabilities belong to Milestones 5B (Kubernetes metadata provider,
+initial snapshot transfer, snapshot-source eligibility) and 7B (lifecycle-aware
+staging).
 
 **Do not claim** that a replaced pod "safely re-syncs from an authoritative
 snapshot" in 7A. The actual behavior is: the new pod starts with an empty

@@ -294,8 +294,17 @@ func newPeerServerWithLifecycle(mgr *Manager, addr, nodeID, version string, s *s
 	// messages that have since expired.
 	if enabledAntiEntropy && s != nil {
 		if ctrl != nil && ctrl.Admission().Enabled() {
-			mux.HandleFunc("GET /internal/sync/ids", newLifecycleSyncInventoryHandler(s, ctrl, retentionTTL, now))
-			mux.HandleFunc("POST /internal/sync/messages", newLifecycleSyncFetchHandler(s, ctrl, retentionTTL, now))
+			// The sync endpoints are registered once each and dispatch on the
+			// untrusted request-purpose header (Milestone 5B, Stage 2): a
+			// bootstrap baseline fetch (purpose = bootstrap-baseline) is served
+			// by the bootstrap source-eligibility policy; an ordinary
+			// anti-entropy request (no purpose, or the ordinary purpose) is
+			// served by the ordinary replication policy. The header is not
+			// authentication: it only selects the serving-side admission
+			// check. A legacy peer (lifecycle disabled, handled in the else
+			// branch) ignores the header entirely.
+			mux.HandleFunc("GET /internal/sync/ids", dispatchSyncInventoryHandler(s, ctrl, retentionTTL, now))
+			mux.HandleFunc("POST /internal/sync/messages", dispatchSyncFetchHandler(s, ctrl, retentionTTL, now))
 		} else {
 			mux.HandleFunc("GET /internal/sync/ids", newSyncInventoryHandler(s, retentionTTL, now))
 			mux.HandleFunc("POST /internal/sync/messages", newSyncFetchHandler(s, retentionTTL, now))
@@ -513,8 +522,29 @@ func newMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessage func(m
 // original admission snapshot (the one that first authorized the request),
 // not to this recheck snapshot.
 func finalAdmissionCheck(snap lifecycle.AuthorizationSnapshot, reqCtx lifecycle.RequestContext) (int, string) {
-	if !snap.Authorized() {
-		reason := snap.Reason
+	return finalAdmissionCheckWithPredicate(snap, reqCtx, snap.Authorized(), snap.Reason)
+}
+
+// finalAdmissionCheckWithPredicate is the shared body of the data-serving
+// admission re-checks. It revalidates the original request's epoch context
+// against the CURRENT snapshot's metadata, and rejects (with a permanent 409
+// on an epoch mismatch) when the snapshot is no longer authorized by the
+// supplied predicate.
+//
+// The predicate is the authorization decision the serving-side policy applies:
+// the ordinary replication decision (snapshot.Authorized) for ordinary
+// anti-entropy, or the dedicated bootstrap source-serving decision
+// (CheckBootstrapSourceInbound, which requires the serving replica to be in a
+// ready state, fully authorized, and epoch-matched) for a bootstrap fetch. A
+// non-ready serving replica (e.g. SYNCING) can never pass the bootstrap
+// predicate (IsReady is false), so the header never broadens what is served.
+//
+// This prevents a valid epoch-A request from being processed using epoch-B
+// authorization. The response envelope is always bound to the original
+// admission snapshot (the one that first authorized the request), not to this
+// recheck snapshot.
+func finalAdmissionCheckWithPredicate(snap lifecycle.AuthorizationSnapshot, reqCtx lifecycle.RequestContext, authorized bool, reason string) (int, string) {
+	if !authorized {
 		status := lifecycle.UnreadyStatus
 		if strings.Contains(reason, "mismatch") || strings.Contains(reason, "missing") {
 			status = lifecycle.EpochMismatchStatus
@@ -576,9 +606,11 @@ func newLifecycleMessageExchangeHandler(mgr *Manager, s *store.Store, onNewMessa
 		// processed. It is used for BOTH the admission check AND the response
 		// envelope, so the response reflects the same epoch that authorized
 		// the operation — not a concurrent epoch change that occurred between
-		// admission and response generation.
+		// admission and response generation (Milestone 5B, Stage 2, Issue 4:
+		// the admission decision is derived from the same snapshot as the
+		// response envelope, eliminating the two-snapshot pattern).
 		snap := ctrl.Authorization()
-		decision := ctrl.Admission().CheckReplicationInbound(r.Context(), reqCtx)
+		decision := ctrl.Admission().CheckReplicationInboundFromSnapshot(snap, reqCtx)
 		if !decision.Allowed {
 			// Distinguish mismatch (409) from unready/no-metadata (503).
 			status := lifecycle.UnreadyStatus
@@ -632,10 +664,13 @@ func newLifecycleSyncInventoryHandler(s *store.Store, ctrl *lifecycle.Controller
 		}
 
 		// Capture the authorization snapshot ONCE for both the admission
-		// check and the response envelope (so the response reflects the same
-		// epoch that authorized the operation).
+		// check and the response envelope (Milestone 5B, Stage 2, Issue 4:
+		// the admission decision and the response envelope are both derived
+		// from the SAME consistent snapshot, eliminating the two-snapshot
+		// pattern where the admission check read a fresh snapshot
+		// independent of the one used for the envelope).
 		snap := ctrl.Authorization()
-		decision := ctrl.Admission().CheckReplicationInbound(r.Context(), reqCtx)
+		decision := ctrl.Admission().CheckReplicationInboundFromSnapshot(snap, reqCtx)
 		if !decision.Allowed {
 			status := lifecycle.UnreadyStatus
 			if strings.Contains(decision.Reason, "mismatch") || strings.Contains(decision.Reason, "missing") {
@@ -678,9 +713,11 @@ func newLifecycleSyncFetchHandler(s *store.Store, ctrl *lifecycle.Controller, re
 		}
 
 		// Capture the authorization snapshot ONCE for both the admission
-		// check and the response envelope.
+		// check and the response envelope (Milestone 5B, Stage 2, Issue 4:
+		// the admission decision and the response envelope are both derived
+		// from the SAME consistent snapshot).
 		snap := ctrl.Authorization()
-		decision := ctrl.Admission().CheckReplicationInbound(r.Context(), reqCtx)
+		decision := ctrl.Admission().CheckReplicationInboundFromSnapshot(snap, reqCtx)
 		if !decision.Allowed {
 			status := lifecycle.UnreadyStatus
 			if strings.Contains(decision.Reason, "mismatch") || strings.Contains(decision.Reason, "missing") {
@@ -702,6 +739,154 @@ func newLifecycleSyncFetchHandler(s *store.Store, ctrl *lifecycle.Controller, re
 			return finalAdmissionCheck(recheckSnap, reqCtx)
 		}
 
+		setResponseEpochEnvelope(w, snap)
+		newSyncFetchHandlerWithAdmission(s, preDataAdmission, retentionTTL, now)(w, r)
+	}
+}
+
+// dispatchSyncInventoryHandler serves GET /internal/sync/ids and selects the
+// serving-side admission policy based on the untrusted request-purpose header
+// (Milestone 5B, Stage 2). A bootstrap baseline fetch (purpose
+// bootstrap-baseline, a well-formed single header) is served by
+// newLifecycleBootstrapSyncInventoryHandler (the serving replica must be in a
+// ready state and fully authorized); otherwise the ordinary
+// newLifecycleSyncInventoryHandler (ordinary replication policy) is used.
+//
+// The header is UNTRUSTED request metadata: it only selects the check. It is
+// never an error and never grants a privilege. A malformed or unsupported
+// purpose falls back to the ordinary policy (ParseRequestPurpose returns
+// PurposeOrdinarySync), and a missing header likewise uses the ordinary
+// policy. mTLS identity and the response envelope are validated in both
+// paths, so a legacy peer is never accepted as a source by a lifecycle-enabled
+// requester regardless of the header.
+func dispatchSyncInventoryHandler(s *store.Store, ctrl *lifecycle.Controller, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
+	bootstrap := newLifecycleBootstrapSyncInventoryHandler(s, ctrl, retentionTTL, now)
+	ordinary := newLifecycleSyncInventoryHandler(s, ctrl, retentionTTL, now)
+	return func(w http.ResponseWriter, r *http.Request) {
+		purpose, present := lifecycle.ParseRequestPurpose(func(name string) []string { return r.Header.Values(name) })
+		if present && purpose == lifecycle.PurposeBootstrapBaseline {
+			bootstrap(w, r)
+			return
+		}
+		ordinary(w, r)
+	}
+}
+
+// dispatchSyncFetchHandler serves POST /internal/sync/messages and selects the
+// serving-side admission policy based on the untrusted request-purpose header
+// (Milestone 5B, Stage 2). A bootstrap baseline fetch is served by
+// newLifecycleBootstrapSyncFetchHandler; otherwise the ordinary
+// newLifecycleSyncFetchHandler is used. The header is untrusted metadata that
+// only selects the serving-side check (see dispatchSyncInventoryHandler).
+func dispatchSyncFetchHandler(s *store.Store, ctrl *lifecycle.Controller, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
+	bootstrap := newLifecycleBootstrapSyncFetchHandler(s, ctrl, retentionTTL, now)
+	ordinary := newLifecycleSyncFetchHandler(s, ctrl, retentionTTL, now)
+	return func(w http.ResponseWriter, r *http.Request) {
+		purpose, present := lifecycle.ParseRequestPurpose(func(name string) []string { return r.Header.Values(name) })
+		if present && purpose == lifecycle.PurposeBootstrapBaseline {
+			bootstrap(w, r)
+			return
+		}
+		ordinary(w, r)
+	}
+}
+
+// newLifecycleBootstrapSyncInventoryHandler serves GET /internal/sync/ids for a
+// bootstrap baseline fetch (Milestone 5B, Stage 2). It is the serving-side
+// counterpart to the requesting replica's CheckBootstrapFetch. It is
+// registered only on the private peer listener; it is selected by the peer
+// client's FetchBootstrapInventoryPage (which carries the bootstrap
+// request-purpose header) and otherwise unreachable through a distinct route
+// (the sync endpoints are not split by purpose in the mux; the purpose header
+// is untrusted and only signals intent).
+//
+// The serving-side policy is CheckBootstrapSourceInbound: the serving replica
+// must be in a ready state (READY or DEGRADED) AND fully authorized (fresh,
+// valid, matching observation + matching durable binding, not stopped) AND the
+// request's epoch context must match. A non-ready serving replica (including
+// SYNCING, GENESIS, RECOVERY_REQUIRED) is rejected (503/409); the request
+// purpose header never broadens what is served. The pre-data-serving re-check
+// revalidates against the CURRENT snapshot at the data-serving boundary using
+// the same bootstrap predicate, so a revocation between the initial check and
+// the SQLite read is observed.
+func newLifecycleBootstrapSyncInventoryHandler(s *store.Store, ctrl *lifecycle.Controller, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		reqCtx, err := lifecycle.ParseRequestContext(
+			func(name string) []string { return r.Header.Values(name) },
+			true,
+		)
+		if err != nil {
+			writePeerJSONError(w, http.StatusConflict, "epoch context: "+err.Error())
+			return
+		}
+		// Capture the authorization snapshot ONCE for both the admission
+		// check and the response envelope (Milestone 5B, Stage 2, Issue 4:
+		// the admission decision and the response envelope are both derived
+		// from the SAME consistent snapshot).
+		snap := ctrl.Authorization()
+		decision := ctrl.Admission().CheckBootstrapSourceFromSnapshot(snap, reqCtx)
+		if !decision.Allowed {
+			status := lifecycle.UnreadyStatus
+			if strings.Contains(decision.Reason, "mismatch") || strings.Contains(decision.Reason, "missing") {
+				status = lifecycle.EpochMismatchStatus
+			}
+			writePeerJSONError(w, status, decision.Reason)
+			return
+		}
+		// The pre-data-serving admission callback re-checks the current
+		// local authorization at the data-serving boundary using the same
+		// bootstrap source predicate.
+		preDataAdmission := func() (int, string) {
+			recheckSnap := ctrl.Authorization()
+			rd := ctrl.Admission().CheckBootstrapSourceFromSnapshot(recheckSnap, reqCtx)
+			return finalAdmissionCheckWithPredicate(recheckSnap, reqCtx, rd.Allowed, rd.Reason)
+		}
+		setResponseEpochEnvelope(w, snap)
+		newSyncInventoryHandlerWithAdmission(s, preDataAdmission, retentionTTL, now)(w, r)
+	}
+}
+
+// newLifecycleBootstrapSyncFetchHandler serves POST /internal/sync/messages for
+// a bootstrap baseline fetch (Milestone 5B, Stage 2). It is the serving-side
+// counterpart to the requesting replica's CheckBootstrapFetch, for the message
+// fetch. The POST fetch endpoint is a READ from the serving replica's
+// perspective: it is NOT inbound message insertion (POST /internal/messages)
+// and NOT ordinary gossip exchange. The serving-side policy is
+// CheckBootstrapSourceInbound (ready state + fully authorized + matching
+// epoch), and the pre-data-serving re-check revalidates at the data-serving
+// boundary using the same predicate.
+func newLifecycleBootstrapSyncFetchHandler(s *store.Store, ctrl *lifecycle.Controller, retentionTTL time.Duration, now func() time.Time) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		reqCtx, err := lifecycle.ParseRequestContext(
+			func(name string) []string { return r.Header.Values(name) },
+			true,
+		)
+		if err != nil {
+			writePeerJSONError(w, http.StatusConflict, "epoch context: "+err.Error())
+			return
+		}
+		// Capture the authorization snapshot ONCE for both the admission
+		// check and the response envelope (Milestone 5B, Stage 2, Issue 4:
+		// the admission decision and the response envelope are both derived
+		// from the SAME consistent snapshot).
+		snap := ctrl.Authorization()
+		decision := ctrl.Admission().CheckBootstrapSourceFromSnapshot(snap, reqCtx)
+		if !decision.Allowed {
+			status := lifecycle.UnreadyStatus
+			if strings.Contains(decision.Reason, "mismatch") || strings.Contains(decision.Reason, "missing") {
+				status = lifecycle.EpochMismatchStatus
+			}
+			writePeerJSONError(w, status, decision.Reason)
+			return
+		}
+		// The pre-data-serving admission callback re-checks the current
+		// local authorization at the data-serving boundary using the same
+		// bootstrap source predicate.
+		preDataAdmission := func() (int, string) {
+			recheckSnap := ctrl.Authorization()
+			rd := ctrl.Admission().CheckBootstrapSourceFromSnapshot(recheckSnap, reqCtx)
+			return finalAdmissionCheckWithPredicate(recheckSnap, reqCtx, rd.Allowed, rd.Reason)
+		}
 		setResponseEpochEnvelope(w, snap)
 		newSyncFetchHandlerWithAdmission(s, preDataAdmission, retentionTTL, now)(w, r)
 	}

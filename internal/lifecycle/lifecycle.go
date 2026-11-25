@@ -97,9 +97,20 @@ func (s State) IsReady() bool {
 
 // IsBootstrapSourceEligible reports whether a replica in this state is
 // eligible to supply an authoritative bootstrap snapshot to other unsynced
-// replicas. Only READY is eligible; SYNCING and RECOVERY_REQUIRED are not.
+// replicas. A replica in a ready state (READY or DEGRADED) is eligible: DEGRADED
+// retains valid local authority (it was previously READY and is only experiencing
+// a peer or convergence failure), so it can still serve a same-epoch baseline.
+// All non-ready states (STARTING, DISCOVERING, GENESIS, SYNCING,
+// RECOVERY_REQUIRED) are never eligible — in particular, a SYNCING replica is
+// obtaining its own baseline and must not serve one to others.
+//
+// This is a state-only predicate: it does not itself check the durable binding,
+// the authoritative observation, or authorization. The serving-side check
+// (the peer status handler) combines it with the full authorization snapshot
+// (fresh, valid, matching observation + matching binding, not stopped) so a
+// peer reported eligible is one the handlers would authorize to serve.
 func (s State) IsBootstrapSourceEligible() bool {
-	return s == READY
+	return s.IsReady()
 }
 
 // transitionRecord is an immutable record of a state transition.
