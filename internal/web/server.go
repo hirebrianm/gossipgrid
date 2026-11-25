@@ -44,6 +44,21 @@ type Diagnostics struct {
 	LifecycleState   string `json:"lifecycle_state,omitempty"`
 	LifecycleReason  string `json:"lifecycle_reason,omitempty"`
 
+	// Genesis (Milestone 5B, Stage 1B). Present only when lifecycle protection
+	// is enabled; omitted when disabled. They let an operator determine the
+	// current genesis authorization status, the local binding state, whether
+	// the cluster is finalized, and whether the data-loss protection is armed
+	// — the same information exposed on the private peer /internal/status
+	// endpoint. The values are reported exactly as observed (never invented).
+	ClusterID                       string `json:"cluster_id,omitempty"`
+	EpochID                         string `json:"epoch_id,omitempty"`
+	LocalBindingPresent             bool   `json:"local_binding_present,omitempty"`
+	BindingMatchesMetadata          bool   `json:"binding_matches_metadata,omitempty"`
+	GenesisAuthorizationOutstanding bool   `json:"genesis_authorization_outstanding,omitempty"`
+	Finalized                       bool   `json:"finalized,omitempty"`
+	DataLossProtected               bool   `json:"data_loss_protected,omitempty"`
+	GenesisConsumer                 string `json:"genesis_consumer,omitempty"`
+
 	// Initial synchronization barrier (Milestone 7A enhancement, when the
 	// barrier is enabled; the fields are omitted when disabled).
 	InitialSyncEnabled   bool     `json:"initial_sync_enabled"`
@@ -362,6 +377,29 @@ func (h *Handler) diagnostics(w http.ResponseWriter, _ *http.Request) {
 		snap := h.cfg.Lifecycle.Authorization()
 		d.LifecycleState = snap.State.String()
 		d.LifecycleReason = snap.Reason
+		// Genesis (Milestone 5B, Stage 1B): expose the authoritative
+		// metadata's cluster/epoch, the local binding state, the genesis
+		// authorization status, the finalization state, and the data-loss
+		// protection. These are the fields an operator needs to drive the
+		// manual genesis runbook (grant → seed binding → verification →
+		// finalization → READY). The values are reported exactly as observed
+		// (empty when no authoritative observation is available) — never
+		// invented.
+		if snap.Metadata != nil {
+			d.ClusterID = snap.Metadata.ClusterID
+			d.EpochID = snap.Metadata.EpochID
+			d.GenesisAuthorizationOutstanding = !snap.Metadata.Initialized && snap.Metadata.GenesisAuthorized && snap.Metadata.GenesisConsumer == ""
+			d.Finalized = snap.Metadata.Initialized && !snap.Metadata.GenesisAuthorized && snap.Metadata.DataLossProtected && snap.Metadata.GenesisConsumer != ""
+			d.DataLossProtected = snap.Metadata.DataLossProtected
+			d.GenesisConsumer = snap.Metadata.GenesisConsumer
+		}
+		// Local database binding state.
+		if snap.Binding != nil {
+			d.LocalBindingPresent = true
+			if snap.Metadata != nil {
+				d.BindingMatchesMetadata = snap.Binding.MatchesMetadata(*snap.Metadata)
+			}
+		}
 	}
 	// Initial-sync barrier (Milestone 7A enhancement).
 	isEnabled := h.trackerEnabled()

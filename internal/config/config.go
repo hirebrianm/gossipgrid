@@ -78,6 +78,36 @@ const (
 	// all existing Milestone 4 behavior is preserved.
 	EnvLifecycleEnabled = "GOSSIPGRID_LIFECYCLE_ENABLED"
 
+	// Kubernetes cluster-metadata provider (Milestone 5B). When
+	// LifecycleMetadataKubernetes is true AND LifecycleEnabled is true, the
+	// lifecycle controller reads the authoritative cluster metadata from the
+	// named Kubernetes ConfigMap (k8smetadata.Provider) instead of the
+	// no-op unavailable source. When disabled (the default), the existing
+	// 7A behavior is preserved exactly (no Kubernetes metadata provider; the
+	// lifecycle controller uses a no-op source that is always unavailable).
+	// This is opt-in: enabling it requires a working in-cluster service
+	// account and a ConfigMap, and it is disabled by default so that the 7A
+	// staging deployment is unaffected.
+	EnvLifecycleMetadataKubernetes = "GOSSIPGRID_LIFECYCLE_METADATA_KUBERNETES"
+	// The name of the authoritative cluster-metadata ConfigMap (must match
+	// the genesis grant / finalization name). Default:
+	// gossipgrid-cluster-metadata.
+	EnvLifecycleMetadataConfigMapName = "GOSSIPGRID_LIFECYCLE_METADATA_CONFIGMAP_NAME"
+	// The namespace of the authoritative cluster-metadata ConfigMap. When
+	// empty (the default), the namespace is read from the in-cluster service
+	// account's mounted namespace file (the pod's namespace).
+	EnvLifecycleMetadataNamespace = "GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE"
+
+	// Genesis seed identity (Milestone 5B, Stage 1B). When
+	// GenesisSeedIdentity is nonempty, the replica whose local identity
+	// (NodeID) EXACTLY equals this value may take the genesis authorization
+	// path (lifecycle.Controller.AuthorizeGenesis): it binds the local
+	// database to the authoritative metadata and enters GENESIS. The value
+	// is the designated seed (e.g. gossipgrid-0, the StatefulSet ordinal 0).
+	// When empty (the default), no replica may take the genesis path (the
+	// existing 7A behavior is preserved exactly).
+	EnvGenesisSeedIdentity = "GOSSIPGRID_GENESIS_SEED_IDENTITY"
+
 	// Initial anti-entropy synchronization barrier (Milestone 7A
 	// enhancement, synchronization-aware Kubernetes readiness). When enabled,
 	// a new replica remains NotReady (HTTP 503 from /readyz) until it has
@@ -194,6 +224,28 @@ type Config struct {
 	// peer identity configuration). When false (default), all existing
 	// behavior is preserved and no epoch protection is claimed.
 	LifecycleEnabled bool
+
+	// LifecycleMetadataKubernetes (Milestone 5B). When true (AND
+	// LifecycleEnabled is true), the lifecycle controller reads the
+	// authoritative cluster metadata from the named Kubernetes ConfigMap
+	// (k8smetadata.Provider) instead of the no-op unavailable source. When
+	// false (the default), the existing 7A behavior is preserved exactly.
+	LifecycleMetadataKubernetes bool
+	// LifecycleMetadataConfigMapName is the name of the authoritative
+	// cluster-metadata ConfigMap. Default: gossipgrid-cluster-metadata.
+	LifecycleMetadataConfigMapName string
+	// LifecycleMetadataNamespace is the namespace of the authoritative
+	// cluster-metadata ConfigMap. When empty (the default), the namespace is
+	// read from the in-cluster service account's mounted namespace file.
+	LifecycleMetadataNamespace string
+
+	// GenesisSeedIdentity (Milestone 5B, Stage 1B). When nonempty, the
+	// replica whose local identity (NodeID) exactly equals this value may
+	// take the genesis authorization path (lifecycle.Controller.
+	// AuthorizeGenesis). The value is the designated seed (e.g. gossipgrid-0).
+	// When empty (the default), no replica may take the genesis path (the
+	// existing 7A behavior is preserved exactly).
+	GenesisSeedIdentity string
 
 	// InitialSyncBarrierEnabled (Milestone 7A enhancement). When true, the
 	// initial anti-entropy synchronization barrier is active: a new replica
@@ -443,6 +495,27 @@ func load(lookup envFunc) (*Config, error) {
 			errs = append(errs, perr)
 		}
 		cfg.LifecycleEnabled = b
+	}
+	// Kubernetes cluster-metadata provider (Milestone 5B). Opt-in: the
+	// provider is created only when enabled AND lifecycle is enabled. The
+	// ConfigMap name defaults to the canonical cluster-metadata name; the
+	// namespace defaults to the in-cluster namespace (resolved at the wiring
+	// site, not here). These are string fields (no bool/parse needed).
+	if v, ok := lookup(EnvLifecycleMetadataKubernetes); ok {
+		b, perr := parseBoolEnv(v, EnvLifecycleMetadataKubernetes)
+		if perr != nil {
+			errs = append(errs, perr)
+		}
+		cfg.LifecycleMetadataKubernetes = b
+	}
+	cfg.LifecycleMetadataConfigMapName = getEnv(lookup, EnvLifecycleMetadataConfigMapName, "gossipgrid-cluster-metadata")
+	if v, ok := lookup(EnvLifecycleMetadataNamespace); ok {
+		cfg.LifecycleMetadataNamespace = v
+	}
+	// Genesis seed identity (Milestone 5B, Stage 1B). Opt-in: when set, the
+	// replica whose NodeID equals this value may take the genesis path.
+	if v, ok := lookup(EnvGenesisSeedIdentity); ok {
+		cfg.GenesisSeedIdentity = v
 	}
 	if err := validateLifecycleConfig(cfg); err != nil {
 		errs = append(errs, err)
@@ -992,12 +1065,30 @@ func validateDiscoveryConfig(cfg *Config) error {
 // validation is performed and all existing Milestone 4 behavior is preserved.
 func validateLifecycleConfig(cfg *Config) error {
 	if !cfg.LifecycleEnabled {
+		// When lifecycle is disabled, the Kubernetes metadata provider and
+		// the genesis seed identity must not be enabled (they are only
+		// meaningful with the lifecycle state machine active). Enabling
+		// them without lifecycle is a misconfiguration the operator must
+		// fix at load time.
+		if cfg.LifecycleMetadataKubernetes {
+			return fmt.Errorf("%s: the Kubernetes cluster-metadata provider requires lifecycle protection to be enabled (%s=true)", EnvLifecycleMetadataKubernetes, EnvLifecycleEnabled)
+		}
+		if cfg.GenesisSeedIdentity != "" {
+			return fmt.Errorf("%s: the genesis seed identity requires lifecycle protection to be enabled (%s=true)", EnvGenesisSeedIdentity, EnvLifecycleEnabled)
+		}
 		return nil
 	}
 	// Lifecycle protection requires peer mTLS (the transport for
 	// authenticated peer identity).
 	if !cfg.PeerTLSEnabled {
 		return fmt.Errorf("%s: lifecycle protection requires peer mTLS to be enabled (%s=true)", EnvLifecycleEnabled, EnvPeerTLSEnabled)
+	}
+	// The Kubernetes cluster-metadata provider (Milestone 5B) requires a
+	// nonempty ConfigMap name (the namespace is resolved at the wiring site
+	// from the in-cluster namespace). A provider enabled without a name is a
+	// misconfiguration.
+	if cfg.LifecycleMetadataKubernetes && cfg.LifecycleMetadataConfigMapName == "" {
+		return fmt.Errorf("%s: the Kubernetes cluster-metadata provider requires a non-empty ConfigMap name (%s)", EnvLifecycleMetadataKubernetes, EnvLifecycleMetadataConfigMapName)
 	}
 	return nil
 }

@@ -106,6 +106,23 @@ type ResetIncident struct {
 // (the documented identifier length limit; it matches MaxEpochHeaderBytes).
 const MaxIDBytes = 64
 
+// DesignatedGenesisSeed is the deterministic seed-identity convention
+// (Milestone 5B, Stage 1B): the canonical seed for a GossipGrid StatefulSet
+// deployment is always the ordinal-0 pod, "gossipgrid-0" (the
+// <statefulset-name>-0 pattern). It is the default and the only seed identity
+// the genesis finalization will arm: the operator's finalization Job is
+// validated against this constant (a finalization with a GenesisConsumer that
+// differs from it fails closed before any ConfigMap update, so the
+// data-loss protection is armed only for the designated seed). The seed is
+// still EXPLICITLY operator-configured (lifecycle.seedIdentity /
+// GOSSIPGRID_GENESIS_SEED_IDENTITY); this constant is the deterministic
+// convention that the finalization enforces, not an additional authority
+// mechanism. A non-StatefulSet deployment (or one that deliberately uses a
+// different seed name) must set the seed identity to match the pod it designates
+// and accept that the finalization will not arm data-loss protection for a
+// consumer that differs from this convention.
+const DesignatedGenesisSeed = "gossipgrid-0"
+
 // Validate checks the metadata for well-formedness. It returns an error when
 // any required field is empty or malformed, when an identifier exceeds the
 // documented byte-length limit, or when the metadata state is incoherent

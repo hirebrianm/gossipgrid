@@ -302,6 +302,65 @@ messageRetention:
 # automatically return to READY.
 lifecycle:
   enabled: false
+  # The Kubernetes cluster-metadata provider (Milestone 5B, Stage 1B).
+  #
+  # When true (AND lifecycle.enabled is also true), the application reads the
+  # authoritative cluster-metadata ConfigMap (k8smetadata provider) as its
+  # lifecycle metadata source. The application's ServiceAccount needs a
+  # narrowly scoped, read-only RBAC (get on the named ConfigMap only) to
+  # perform the read: this is rendered by app-rbac.yaml, gated on this value.
+  #
+  # DISABLED by default: the 7A staging values must not enable this. Enabling
+  # it requires an override values file (7B) and implies that lifecycle
+  # enforcement is also enabled. The ConfigMap name defaults to
+  # "gossipgrid-cluster-metadata" (matching the genesis grant and
+  # finalization ConfigMap); set it only if the name differs.
+  #
+  # The RBAC is namespaced (no ClusterRole), grants get ONLY (no
+  # update/create/delete/patch/list/watch), and is scoped to the single
+  # named ConfigMap via resourceNames. The application ServiceAccount is
+  # the subject (not the separate genesis or finalization ServiceAccounts).
+  metadataKubernetes:
+    enabled: false
+    # The name of the authoritative cluster-metadata ConfigMap the
+    # application reads (must match genesis.configMapName and
+    # finalize.configMapName).
+    configMapName: gossipgrid-cluster-metadata
+    # The Role and RoleBinding names (namespaced, distinct from the genesis
+    # and finalization identities).
+    roleName: gossipgrid-metadata-reader
+    roleBindingName: gossipgrid-metadata-reader
+    # The namespace of the authoritative cluster-metadata ConfigMap. When
+    # empty (the default), the application reads the namespace from the
+    # in-cluster service account's mounted namespace file (the pod's
+    # namespace). Set it explicitly only if the ConfigMap lives in a
+    # different namespace than the application pods.
+    #
+    # Emits the GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE environment
+    # variable ONLY when non-empty AND lifecycle.metadataKubernetes.enabled
+    # is true. When empty (the default), no env var is emitted and the
+    # application falls back to the in-cluster namespace file.
+    metadataNamespace: ""
+
+  # The designated seed identity for operator-authorized genesis (Milestone
+  # 5B, Stage 1B). When nonempty, the replica whose NodeID EXACTLY equals
+  # this value may take the genesis authorization path (AuthorizeGenesis):
+  # it binds the local database to the authoritative metadata and enters
+  # GENESIS. All other replicas are no-ops (they cannot enter GENESIS).
+  #
+  # The value must equal the deterministic seed-identity convention
+  # (lifecycle.DesignatedGenesisSeed, "gossipgrid-0" — the StatefulSet
+  # ordinal-0 pod): the genesis finalization enforces this convention
+  # (a finalization with a different consumer fails closed before any
+  # ConfigMap update). A non-StatefulSet deployment that deliberately uses
+  # a different seed name must set this value to match the pod it
+  # designates.
+  #
+  # Emits the GOSSIPGRID_GENESIS_SEED_IDENTITY environment variable ONLY
+  # when nonempty AND lifecycle.enabled is true. When empty (the default),
+  # no env var is emitted and no replica may take the genesis path (the
+  # existing 7A behavior is preserved exactly).
+  seedIdentity: ""
 
 # -- Browser authentication (Milestone 6).
 #
@@ -453,6 +512,66 @@ genesis:
   # identity).
   roleName: gossipgrid-genesis
   roleBindingName: gossipgrid-genesis
+
+# -- Genesis finalization (Milestone 5B, Stage 1B).
+#
+# The genesis finalization is the explicit, operator-authorized consumption of
+# the one-time genesis authorization: it performs a single, atomic
+# resourceVersion compare-and-swap (CAS) update on the authoritative
+# cluster-metadata ConfigMap (gossipgrid-cluster-metadata) that sets, all
+# together in one update, Initialized=true, GenesisAuthorized=false,
+# GenesisConsumer=<seed>, and DataLossProtected=true. It is performed by a
+# SEPARATE, operator-triggered Job with a dedicated ServiceAccount, Role, and
+# RoleBinding — NOT by the application pods (the application ServiceAccount is
+# read-only and has no update permission) and NOT by a Helm hook or Argo CD
+# reconciliation (there is no automatic execution).
+#
+# The finalization is distinct from the genesis grant (Stage 1A): the grant
+# creates the ConfigMap (create permission, see the genesis block above), and
+# the finalization updates it (update permission, this block). Both RBAC blocks
+# are namespaced, both are disabled by default, and both use separate, distinct
+# ServiceAccounts.
+#
+# The RBAC (ServiceAccount + Role + RoleBinding) is DISABLED by default
+# (enabled: false): the finalization Job must never be created by the existing
+# deployment configuration. To prepare a cluster for a finalization, an operator
+# sets finalize.enabled to true (via an override values file, not the 7A
+# staging values) and lets Argo CD reconcile the RBAC, then explicitly launches
+# the finalization Job (see docs/genesis-runbook.md). The Job is always
+# disabled (the Job is an operator-managed manifest, not a chart template).
+#
+# RBAC permissions (namespaced; no ClusterRole, no privileged container):
+#   - get on the NAMED ConfigMap gossipgrid-cluster-metadata (resourceNames
+#     IS honored for get, so this is correctly scoped to that one object).
+#     The Job reads the authoritative record before the CAS and re-reads it on
+#     an ambiguous result (a conflict, a transient unavailability, or a nil
+#     response).
+#   - update on the NAMED ConfigMap gossipgrid-cluster-metadata (resourceNames
+#     IS honored for update, so this is correctly scoped to that one object).
+#     The Job performs ONLY a resourceVersion CAS update (it never creates,
+#     deletes, patches, lists, or watches).
+#   - NO create, delete, patch, list, or watch permissions.
+#
+# The normal application ServiceAccount (serviceAccount.name) must NOT inherit
+# finalization privileges: it has no Role/RoleBinding in the default
+# configuration, and the finalization ServiceAccount is a separate, distinct
+# identity.
+finalize:
+  enabled: false
+  # The ServiceAccount name for the genesis finalization Job. Distinct from
+  # serviceAccount.name (the application SA) and from genesis.serviceAccountName
+  # (the grant SA) so the app pods and the grant Job never inherit the update
+  # permission.
+  serviceAccountName: gossipgrid-finalize
+  # The name of the authoritative cluster-metadata ConfigMap the finalization
+  # updates (a single, cluster-wide record; the finalization CAS writes the
+  # four finalization fields into it, preserving every other field). Must match
+  # the application's metadata provider (k8smetadata) name.
+  configMapName: gossipgrid-cluster-metadata
+  # The Role and RoleBinding names (namespaced, distinct from the application
+  # and genesis identities).
+  roleName: gossipgrid-finalize
+  roleBindingName: gossipgrid-finalize
 
 # -- Additional labels/annotations applied to all GossipGrid resources.
 podLabels: {}

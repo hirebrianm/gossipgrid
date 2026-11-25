@@ -65,6 +65,12 @@ const (
 	// APIClassUnavailable is a transient unavailability (network/timeout/5xx)
 	// error.
 	APIClassUnavailable
+	// APIClassConflict is a 409 conflict (IsConflict) error, produced by a
+	// compare-and-swap Update whose resourceVersion no longer matches (another
+	// writer advanced the object). It is distinct from unavailability so a
+	// finalization CAS caller can re-read and retry rather than treating the
+	// conflict as an API outage.
+	APIClassConflict
 )
 
 // apiError is a typed error carrying an API error classification and the
@@ -87,6 +93,8 @@ func (e *apiError) Error() string {
 		label = "permission denied"
 	case APIClassUnavailable:
 		label = "unavailable"
+	case APIClassConflict:
+		label = "conflict"
 	}
 	if e.err != nil {
 		return "kubernetes api error (" + label + "): " + e.err.Error()
@@ -103,6 +111,12 @@ func NewAPIError(class APIErrorClass, err error) error { return &apiError{class:
 
 // NewAPIPermissionDenied wraps err as a typed permission-denied (403) API error.
 func NewAPIPermissionDenied(err error) error { return NewAPIError(APIClassForbidden, err) }
+
+// NewAPIConflict wraps err as a typed 409 conflict API error (a compare-and-swap
+// Update whose resourceVersion no longer matches). The original error is
+// preserved through wrapping so the full chain is reachable via errors.Is /
+// errors.Unwrap.
+func NewAPIConflict(err error) error { return NewAPIError(APIClassConflict, err) }
 
 // ClassOf returns the APIErrorClass of err, or APIClassUnknown when err is not
 // a typed API error. It recognizes all three typed API error shapes (the

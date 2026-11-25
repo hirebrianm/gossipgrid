@@ -73,6 +73,37 @@ type PeerStatus struct {
 	Readiness               bool   `json:"readiness,omitempty"`
 	BootstrapSourceEligible bool   `json:"bootstrap_source_eligible,omitempty"`
 	DiagnosticReason        string `json:"diagnostic_reason,omitempty"`
+
+	// Genesis fields (Milestone 5B, Stage 1B). These are present only when
+	// lifecycle protection is enabled; they are empty/zero when disabled.
+	// They let an operator determine the current genesis authorization
+	// status, the local binding state, whether the cluster is finalized, and
+	// whether the data-loss protection is armed — the information needed to
+	// drive the manual genesis runbook (grant → seed binding → verification →
+	// finalization → READY).
+	//
+	//   - LocalBindingPresent: a durable local database binding exists
+	//     (the local SQLite has a binding). Empty when lifecycle is disabled
+	//     or the local database is unbound.
+	//   - BindingMatchesMetadata: the local binding, if present, matches the
+	//     authoritative metadata (ClusterID and EpochID). False when there is
+	//     no binding or when the binding conflicts with the metadata.
+	//   - GenesisAuthorizationOutstanding: the authoritative metadata reports
+	//     an outstanding, unconsumed one-time authorization (Initialized=false
+	//     AND GenesisAuthorized=true AND GenesisConsumer="").
+	//   - Finalized: the authoritative metadata reports the cluster is
+	//     finalized (Initialized=true AND GenesisAuthorized=false AND
+	//     DataLossProtected=true AND GenesisConsumer is set).
+	//   - DataLossProtected: the authoritative metadata's data-loss
+	//     protection flag is armed (DataLossProtected=true).
+	//   - GenesisConsumer: the identity that consumed the one-time
+	//     authorization (empty until the authorization is consumed).
+	LocalBindingPresent             bool   `json:"local_binding_present,omitempty"`
+	BindingMatchesMetadata          bool   `json:"binding_matches_metadata,omitempty"`
+	GenesisAuthorizationOutstanding bool   `json:"genesis_authorization_outstanding,omitempty"`
+	Finalized                       bool   `json:"finalized,omitempty"`
+	DataLossProtected               bool   `json:"data_loss_protected,omitempty"`
+	GenesisConsumer                 string `json:"genesis_consumer,omitempty"`
 }
 
 // PeerServer is a private HTTPS server for the peer listener. It is a thin
@@ -395,6 +426,29 @@ func newLifecycleStatusHandler(mgr *Manager, nodeID, version string, ctrl *lifec
 			status.ClusterID = snap.Metadata.ClusterID
 			status.EpochID = snap.Metadata.EpochID
 			status.Generation = snap.Metadata.Generation
+			// Genesis (Milestone 5B, Stage 1B): expose the authoritative
+			// metadata's genesis authorization status, finalization, and
+			// data-loss protection. These are the fields an operator needs to
+			// drive the manual genesis runbook. The values are reported
+			// exactly as observed (empty when no authoritative observation is
+			// available) — they are never invented.
+			status.GenesisAuthorizationOutstanding = !snap.Metadata.Initialized && snap.Metadata.GenesisAuthorized && snap.Metadata.GenesisConsumer == ""
+			status.Finalized = snap.Metadata.Initialized && !snap.Metadata.GenesisAuthorized && snap.Metadata.DataLossProtected && snap.Metadata.GenesisConsumer != ""
+			status.DataLossProtected = snap.Metadata.DataLossProtected
+			status.GenesisConsumer = snap.Metadata.GenesisConsumer
+		}
+
+		// Report the local database binding state (Milestone 5B, Stage 1B).
+		// A binding exists only when the local SQLite has a binding; it
+		// matches the metadata only when both ClusterID and EpochID are
+		// present and equal. These let an operator verify (via this endpoint,
+		// over mTLS) that the seed is durably bound to the exact cluster/epoch
+		// before invoking the finalization.
+		if snap.Binding != nil {
+			status.LocalBindingPresent = true
+			if snap.Metadata != nil {
+				status.BindingMatchesMetadata = snap.Binding.MatchesMetadata(*snap.Metadata)
+			}
 		}
 
 		// Set the response epoch-envelope headers so a lifecycle-enabled

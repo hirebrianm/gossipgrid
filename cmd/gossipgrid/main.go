@@ -22,12 +22,17 @@ import (
 	"syscall"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+
 	"gossipgrid/internal/antientropy"
 	"gossipgrid/internal/auth"
 	"gossipgrid/internal/config"
 	"gossipgrid/internal/discovery"
 	"gossipgrid/internal/gossip"
 	"gossipgrid/internal/lifecycle"
+	"gossipgrid/internal/lifecycle/k8smetadata"
 	"gossipgrid/internal/peertls"
 	"gossipgrid/internal/retention"
 	"gossipgrid/internal/server"
@@ -73,6 +78,19 @@ func main() {
 	// cluster). Any other first argument is ignored (the server has no
 	// subcommands besides credential and genesis).
 	if len(os.Args) >= 2 && os.Args[1] == "genesis" {
+		// Milestone 5B (Stage 1B): `genesis finalize` is the explicit,
+		// operator-authorized finalization that consumes the one-time genesis
+		// authorization (a CAS update on the ConfigMap). It is dispatched as a
+		// subcommand of `genesis`. It is NEVER run automatically: it is invoked
+		// explicitly by the operator (the finalization Job) after the operator
+		// has verified the preconditions (the seed is durably bound).
+		if len(os.Args) >= 3 && os.Args[2] == "finalize" {
+			if err := runGenesisFinalize(os.Args[3:]); err != nil {
+				fmt.Fprintln(os.Stderr, "genesis finalize:", err)
+				os.Exit(1)
+			}
+			return
+		}
 		if err := runGenesis(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "genesis:", err)
 			os.Exit(1)
@@ -237,14 +255,62 @@ func run() (retErr error) {
 		// its epoch and must remain unready.
 		if cfg.LifecycleEnabled {
 			machine := lifecycle.NewMachine(nil)
-			// A no-op metadata source: always unavailable. The future
-			// Kubernetes provider will replace this with a real
-			// resourceVersion-based reader.
-			metadataSource := lifecycle.NewFakeMetadataSourceUnavailable()
+			// Build the authoritative metadata source.
+			//
+			// In Milestone 5A (the 7A default) there is no production
+			// Kubernetes metadata provider. The metadata source is a no-op
+			// that always returns ErrMetadataUnavailable. This is the correct
+			// fail-closed behavior: without an authoritative observation, the
+			// replica cannot establish its epoch and must remain unready.
+			//
+			// In Milestone 5B (opt-in), when
+			// cfg.LifecycleMetadataKubernetes is true, the metadata source is
+			// the real, read-only, ConfigMap-backed k8smetadata.Provider
+			// (an in-cluster client-go ConfigMap getter). This is the
+			// production Kubernetes metadata provider; it is created only when
+			// explicitly enabled, so the 7A staging deployment is unaffected.
+			var metadataSource lifecycle.MetadataSource
+			if cfg.LifecycleMetadataKubernetes {
+				// Resolve the namespace: when cfg.LifecycleMetadataNamespace is
+				// empty, read it from the in-cluster service account's mounted
+				// namespace file (the pod's namespace).
+				ns := cfg.LifecycleMetadataNamespace
+				if ns == "" {
+					ns = inClusterNamespace()
+				}
+				if ns == "" {
+					return fmt.Errorf("lifecycle: the Kubernetes metadata provider requires a namespace (set %s or run in-cluster)", config.EnvLifecycleMetadataNamespace)
+				}
+				getter, gerr := newClientGoConfigMapGetter()
+				if gerr != nil {
+					return fmt.Errorf("lifecycle: building the Kubernetes metadata getter (in-cluster): %w", gerr)
+				}
+				provider, perr := k8smetadata.NewProvider(k8smetadata.ProviderConfig{
+					Namespace: ns,
+					Name:      cfg.LifecycleMetadataConfigMapName,
+				}, getter)
+				if perr != nil {
+					return fmt.Errorf("lifecycle: building the Kubernetes metadata provider: %w", perr)
+				}
+				metadataSource = provider
+				logger.Info("lifecycle: Kubernetes cluster-metadata provider enabled",
+					slog.String("namespace", ns),
+					slog.String("configmap", cfg.LifecycleMetadataConfigMapName),
+				)
+			} else {
+				// A no-op metadata source: always unavailable (the 5A/7A
+				// default; the future production provider is opt-in).
+				metadataSource = lifecycle.NewFakeMetadataSourceUnavailable()
+			}
 			lcCfg := lifecycle.Config{
 				MetadataPollInterval: 30 * time.Second,
 				NodeID:               cfg.NodeID,
-				Enabled:              true,
+				// Genesis seed identity (Milestone 5B, Stage 1B): only the
+				// replica whose NodeID exactly equals this value may take the
+				// genesis authorization path. Empty (the 7A default) means no
+				// replica may enter GENESIS.
+				SeedIdentity: cfg.GenesisSeedIdentity,
+				Enabled:      true,
 			}
 			lifeCtrl = lifecycle.NewController(lcCfg, machine, metadataSource, st, logger)
 			// Defer the controller shutdown on every exit path.
@@ -256,11 +322,27 @@ func run() (retErr error) {
 			if err := lifeCtrl.Start(ctx); err != nil {
 				return fmt.Errorf("starting lifecycle controller: %w", err)
 			}
+			// Genesis-entry mechanism (Milestone 5B, Stage 1B): when a seed
+			// identity is configured, start a goroutine that periodically
+			// attempts the operator-authorized genesis binding
+			// (lifecycle.Controller.AuthorizeGenesis). The call is a no-op
+			// for a non-seed replica (SeedIdentity does not match NodeID) and
+			// fails closed when the preconditions are not met (no fresh,
+			// authorized metadata, a nonempty/unbound DB, a conflicting
+			// binding, or a stopped controller). The loop stops once the
+			// seed is bound (a local binding exists) or the controller is
+			// stopped, so it does not spin or emit log spam after binding.
+			// The loop is independent of the metadata worker: it is the
+			// explicit, opt-in entry into GENESIS.
+			if cfg.GenesisSeedIdentity != "" && cfg.GenesisSeedIdentity == cfg.NodeID {
+				go runGenesisEntryLoop(ctx, cfg.GenesisSeedIdentity, lifeCtrl, logger)
+			}
 			lSnap := lifeCtrl.Snapshot()
 			logger.Info("lifecycle controller started",
 				slog.String("state", lSnap.State.String()),
 				slog.String("reason", lSnap.Reason),
 				slog.String("authority_state", lSnap.AuthorityState),
+				slog.String("seed_identity", cfg.GenesisSeedIdentity),
 			)
 		}
 
@@ -966,3 +1048,141 @@ func buildPeerTLSConfig(cfg *config.Config) (peertls.Config, error) {
 	}
 	return pc, nil
 }
+
+// clientGoConfigMapGetter is the production adapter over the official
+// client-go ConfigMap client for the Kubernetes cluster-metadata provider
+// (Milestone 5B). It implements k8smetadata.ConfigMapGetter (read-only) and
+// classifies API errors via k8s.io/apimachinery's typed StatusError
+// (IsNotFound / IsForbidden / IsTimeout / IsServerTimeout) — not message-text
+// matching. The 409 conflict and 5xx classes are conservatively treated as
+// unavailability (the provider re-reads on the next poll; it never infers a
+// state from an unclassified error).
+type clientGoConfigMapGetter struct {
+	clientset *kubernetes.Clientset
+}
+
+// newClientGoConfigMapGetter builds the production Kubernetes client using
+// in-cluster configuration (the application pod runs in-cluster with the
+// application ServiceAccount, which is read-only for the ConfigMap). A build
+// failure (no service account, no API server, a malformed config) is returned
+// as a non-nil error (fail-closed).
+func newClientGoConfigMapGetter() (k8smetadata.ConfigMapGetter, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("in-cluster config: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("building client-go clientset: %w", err)
+	}
+	return &clientGoConfigMapGetter{clientset: clientset}, nil
+}
+
+// Get implements k8smetadata.ConfigMapGetter. It reads the named ConfigMap and
+// classifies the result: a missing object → k8smetadata.NewConfigMapNotFound;
+// a permission denial → k8smetadata.NewAPIPermissionDenied; a transient
+// unavailability (timeout or 5xx) → k8smetadata.NewAPIUnavailable; an
+// unclassified error → k8smetadata.NewAPIError(APIClassUnknown, err).
+func (c *clientGoConfigMapGetter) Get(ctx context.Context, name, namespace string) (*k8smetadata.ConfigMap, error) {
+	cm, err := c.clientset.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, classifyFinalizeK8sError(err)
+	}
+	return &k8smetadata.ConfigMap{
+		ResourceVersion: cm.ResourceVersion,
+		Data:            cm.Data,
+	}, nil
+}
+
+// runGenesisEntryLoop is the genesis-entry mechanism (Milestone 5B, Stage 1B).
+// It periodically attempts the operator-authorized genesis binding
+// (lifecycle.Controller.AuthorizeGenesis) until the seed has successfully
+// entered GENESIS or the loop's stop conditions are met.
+//
+// The call is a no-op for a non-seed replica (seedIdentity does not match
+// NodeID) and fails closed when the preconditions are not met. The loop:
+//   - sleeps for the metadata poll interval between attempts (it is not a
+//     busy-loop);
+//   - stops when the controller is in GENESIS (the seed has successfully
+//     entered GENESIS — the legitimate terminal state for this loop), when
+//     the controller is in READY or DEGRADED (promoted), when the
+//     controller is in RECOVERY_REQUIRED (irreversible recovery condition),
+//     or when the context is cancelled;
+//   - logs a warning on a persistent (irrecoverable) failure so an operator
+//     can diagnose the genesis path, but does NOT fail startup (the replica
+//     continues to run);
+//   - logs at debug level for transient (recoverable) failures to avoid log
+//     spam;
+//   - does NOT treat "a local binding exists" as proof that the controller
+//     successfully entered GENESIS: the binding may exist (from a prior
+//     AuthorizeGenesis attempt) while the authorization was subsequently
+//     revoked by the guard, in which case the seed is NOT in GENESIS and the
+//     loop must continue to attempt reconciliation.
+//
+// The loop is safe to run concurrently with the metadata worker (the
+// controller uses its own internal locking; AuthorizeGenesis acquires the
+// controller's write lock only to update the binding cache and transition
+// state, never holding a lock across a network operation).
+func runGenesisEntryLoop(ctx context.Context, seedIdentity string, ctrl *lifecycle.Controller, logger *slog.Logger) {
+	const pollInterval = 30 * time.Second
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			snap := ctrl.Snapshot()
+			// Stop only when a legitimate lifecycle state and authorization
+			// outcome justify stopping:
+			//   - GENESIS: the seed has successfully entered GENESIS (the
+			//     loop's goal is achieved).
+			//   - READY / DEGRADED: the seed has been promoted; the loop has
+			//     no further work.
+			//   - RECOVERY_REQUIRED: an irreversible recovery condition;
+			//     retrying AuthorizeGenesis will not help (the binding
+			//     conflicts or the epoch has changed).
+			switch snap.State {
+			case lifecycle.GENESIS:
+				logger.Debug("genesis entry loop: seed is in GENESIS; stopping",
+					slog.String("reason", snap.Reason))
+				return
+			case lifecycle.READY, lifecycle.DEGRADED:
+				logger.Debug("genesis entry loop: seed has been promoted; stopping",
+					slog.String("state", snap.State.String()))
+				return
+			case lifecycle.RECOVERY_REQUIRED:
+				logger.Warn("genesis entry loop: controller is in RECOVERY_REQUIRED (irrecoverable); stopping",
+					slog.String("reason", snap.Reason))
+				return
+			}
+			aerr := ctrl.AuthorizeGenesis(ctx)
+			if aerr != nil {
+				// Distinguish persistent (irrecoverable) failures from
+				// transient (recoverable) ones to control log verbosity:
+				//   - A binding conflict or a nonempty unbound DB is
+				//     persistent (it will not resolve by retrying); log a
+				//     warning.
+				//   - A transient metadata-unavailable or stale-observation
+				//     error is expected during bootstrap; log at debug to
+				//     avoid spam.
+				errStr := aerr.Error()
+				isPersistent := strings.Contains(errStr, "conflicts with the authorized epoch") ||
+					strings.Contains(errStr, "unbound messages")
+				if isPersistent {
+					logger.Warn("genesis entry loop: AuthorizeGenesis failed (persistent condition)",
+						slog.String("seed_identity", seedIdentity),
+						slog.Any("error", aerr))
+				} else {
+					logger.Debug("genesis entry loop: AuthorizeGenesis not yet possible (transient)",
+						slog.String("seed_identity", seedIdentity),
+						slog.Any("error", aerr))
+				}
+			}
+		}
+	}
+}
+
+// _ is a compile-time assertion that clientGoConfigMapGetter satisfies
+// k8smetadata.ConfigMapGetter.
+var _ k8smetadata.ConfigMapGetter = (*clientGoConfigMapGetter)(nil)

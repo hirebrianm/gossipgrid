@@ -19,6 +19,25 @@
 #      disabled by default; when enabled it grants create on configmaps and
 #      get on the named ConfigMap only (no update/patch/delete, no
 #      ClusterRole, the app ServiceAccount is not a subject).
+#   12. Genesis finalization RBAC and Job (Milestone 5B, Stage 1B): the
+#      finalization RBAC is disabled by default; when enabled it grants
+#      get and update on the named ConfigMap only (no create/delete/patch/
+#      list/watch, no ClusterRole, the app ServiceAccount is not a
+#      subject). The operator-managed Job runs "genesis finalize" with the
+#      --confirm-seed-bound flag (the explicit operator gate).
+#   13. Application read-only metadata RBAC (Milestone 5B, Stage 1B): the
+#      app metadata RBAC is disabled by default; when enabled it grants
+#      get on the named ConfigMap only (no update/create/delete/patch/
+#      list/watch, no ClusterRole, the app ServiceAccount is the subject).
+#   14. Genesis override configuration (Milestone 5B, Stage 1B): renders
+#      the exact override values file documented in docs/genesis-runbook.md
+#      section 10 (lifecycle.enabled, metadataKubernetes.enabled,
+#      configMapName, metadataNamespace, seedIdentity, genesis.enabled,
+#      finalize.enabled) and verifies the effective env vars (seed
+#      identity, metadata namespace, metadata provider, lifecycle enabled)
+#      and the RBAC (app read-only, genesis grant, finalization). Also
+#      verifies the default and 7A staging renderings do NOT emit the
+#      genesis-specific env vars.
 #
 # Usage: bash deploy/helm/gossipgrid/tests/deploy_checks.sh
 # Requires: helm (for rendering), grep, awk, sed. Read-only: no files modified.
@@ -974,6 +993,457 @@ if grep -q 'os.Args\[1\] == "genesis"' "$REPO_ROOT/cmd/gossipgrid/main.go"; then
   pass 'main.go dispatches the "genesis" subcommand (one-shot, operator-authorized)'
 else
   fail 'main.go does not dispatch the "genesis" subcommand'
+fi
+
+# ---------------------------------------------------------------------------
+# 12. Genesis finalization RBAC and Job (Milestone 5B, Stage 1B)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- 12. Genesis finalization RBAC and Job ---"
+
+# 12a. DEFAULT rendering (finalize.enabled: false) must NOT emit any
+# finalization RBAC resources (ServiceAccount, Role, RoleBinding). The
+# finalization Job must never be created by the existing deployment
+# configuration, and the finalization RBAC must not leak into the default
+# rendering.
+FIN_SA_DEFAULT=$(grep -c 'name: gossipgrid-finalize' <<< "$RENDERED_OUTPUT" || true)
+if [ "$FIN_SA_DEFAULT" -eq 0 ]; then
+  pass "Default rendering: no 'gossipgrid-finalize' identity (finalization RBAC disabled by default)"
+else
+  fail "Default rendering: found $FIN_SA_DEFAULT 'gossipgrid-finalize' identities (finalization RBAC must be disabled by default)"
+fi
+# No finalization Role or RoleBinding in the default rendering (the genesis
+# grant RBAC is also disabled by default, so there should be no Role or
+# RoleBinding at all).
+if grep -q 'kind: Role$' <<< "$RENDERED_OUTPUT" || grep -q 'kind: RoleBinding$' <<< "$RENDERED_OUTPUT"; then
+  fail "Default rendering: a Role or RoleBinding was rendered (finalization and genesis RBAC must be disabled by default)"
+else
+  pass "Default rendering: no Role or RoleBinding (finalization RBAC not rendered)"
+fi
+
+# 12b. ENABLED rendering (finalize.enabled: true) must emit the finalization
+# ServiceAccount, Role, and RoleBinding.
+FINALIZE_RENDERED_OUTPUT=$(helm template "$RELEASE" "$CHART_DIR" --namespace "$NAMESPACE" --set finalize.enabled=true 2>&1)
+if [ $? -ne 0 ]; then
+  echo "FATAL: helm template with finalize.enabled=true failed:"
+  echo "$FINALIZE_RENDERED_OUTPUT"
+  exit 1
+fi
+# The finalization ServiceAccount must be present.
+if grep -q 'name: gossipgrid-finalize' <<< "$FINALIZE_RENDERED_OUTPUT" && \
+   grep -q 'kind: ServiceAccount$' <<< "$FINALIZE_RENDERED_OUTPUT"; then
+  pass "Enabled rendering: finalization ServiceAccount (gossipgrid-finalize) rendered"
+else
+  fail "Enabled rendering: finalization ServiceAccount not rendered"
+fi
+# The Role and RoleBinding must be present.
+if grep -q 'kind: Role$' <<< "$FINALIZE_RENDERED_OUTPUT" && \
+   grep -q 'kind: RoleBinding$' <<< "$FINALIZE_RENDERED_OUTPUT"; then
+  pass "Enabled rendering: finalization Role and RoleBinding rendered"
+else
+  fail "Enabled rendering: finalization Role or RoleBinding not rendered"
+fi
+
+# 12c. RBAC PERMISSIONS: the Role must grant get AND update on the NAMED
+# ConfigMap (resourceNames). It must NOT grant create, delete, patch, list,
+# or watch (the finalization performs only a single CAS update; it never
+# creates, deletes, or otherwise mutates the ConfigMap).
+ROLE_SECTION=$(awk '
+  /^kind: Role$/ {inrole=1}
+  inrole && /^---/ {inrole=0}
+  inrole {print}
+' <<< "$FINALIZE_RENDERED_OUTPUT")
+# get on the NAMED ConfigMap (resourceNames) must be present.
+if grep -q 'resourceNames: \["gossipgrid-cluster-metadata"\]' <<< "$ROLE_SECTION" && \
+   grep -q 'verbs: \["get"\]' <<< "$ROLE_SECTION"; then
+  pass "Enabled rendering: Role grants get on the named ConfigMap (resourceNames)"
+else
+  fail "Enabled rendering: Role does not grant get on the named ConfigMap (resourceNames)"
+fi
+# update on the NAMED ConfigMap (resourceNames) must be present.
+if grep -q 'resourceNames: \["gossipgrid-cluster-metadata"\]' <<< "$ROLE_SECTION" && \
+   grep -q 'verbs: \["update"\]' <<< "$ROLE_SECTION"; then
+  pass "Enabled rendering: Role grants update on the named ConfigMap (resourceNames)"
+else
+  fail "Enabled rendering: Role does not grant update on the named ConfigMap (resourceNames)"
+fi
+# create, delete, patch, list, and watch must NOT be present.
+for BAD_VERB in 'create' 'delete' 'patch' 'list' 'watch'; do
+  if grep -q "\"$BAD_VERB\"" <<< "$ROLE_SECTION"; then
+    fail "Enabled rendering: Role grants the forbidden verb '$BAD_VERB' (the finalization performs only a single CAS update)"
+  else
+    pass "Enabled rendering: Role does not grant the forbidden verb '$BAD_VERB'"
+  fi
+done
+
+# 12d. NO ClusterRole, no cluster-scoped binding. The RBAC must be
+# namespaced only.
+if grep -q 'kind: ClusterRole' <<< "$FINALIZE_RENDERED_OUTPUT" || \
+   grep -q 'kind: ClusterRoleBinding' <<< "$FINALIZE_RENDERED_OUTPUT"; then
+  fail "Enabled rendering: a ClusterRole or ClusterRoleBinding was rendered (the finalization RBAC must be namespaced only)"
+else
+  pass "Enabled rendering: no ClusterRole or ClusterRoleBinding (namespaced only)"
+fi
+
+# 12e. The RoleBinding must bind the finalization ServiceAccount (not the
+# application ServiceAccount). The subjects must reference
+# gossipgrid-finalize.
+RB_SECTION=$(awk '
+  /^kind: RoleBinding$/ {inrb=1}
+  inrb {print}
+' <<< "$FINALIZE_RENDERED_OUTPUT")
+if grep -q 'name: gossipgrid-finalize' <<< "$RB_SECTION" && \
+   grep -q 'kind: ServiceAccount' <<< "$RB_SECTION"; then
+  pass "Enabled rendering: RoleBinding binds the finalization ServiceAccount"
+else
+  fail "Enabled rendering: RoleBinding does not bind the finalization ServiceAccount"
+fi
+
+# 12f. The application ServiceAccount (gossipgrid) must NOT be a subject of
+# the finalization RoleBinding (the app pods must not inherit update
+# permission). Only the subjects: block matters.
+SUBJECTS_BLOCK=$(awk '
+  /^subjects:/ {insubj=1; next}
+  insubj && /^---/ {insubj=0}
+  insubj && /^[^ ]/ && !/^  / {insubj=0}
+  insubj {print}
+' <<< "$RB_SECTION")
+if grep -qE 'name: gossipgrid[[:space:]]*$' <<< "$SUBJECTS_BLOCK"; then
+  fail "Enabled rendering: the application ServiceAccount (gossipgrid) is a subject of the finalization RoleBinding (must be separate)"
+else
+  pass "Enabled rendering: the application ServiceAccount is NOT a subject of the finalization RoleBinding (separate identity)"
+fi
+
+# 12g. The Job manifest (deploy/genesis/finalize-job.yaml) must be
+# operator-managed: it must NOT carry a Helm hook annotation, must reference
+# the finalization ServiceAccount, and must run the "genesis finalize"
+# subcommand with the --confirm-seed-bound flag (the explicit operator gate).
+JOB_MANIFEST="deploy/genesis/finalize-job.yaml"
+if [ -f "$REPO_ROOT/$JOB_MANIFEST" ]; then
+  # Match "helm.sh/hook:" as a YAML annotation key (not a comment).
+  if grep -qE '^[[:space:]]*helm\.sh/hook:' "$REPO_ROOT/$JOB_MANIFEST"; then
+    fail "Finalize Job manifest carries a helm.sh/hook annotation (the Job must be operator-managed, not a Helm hook)"
+  else
+    pass "Finalize Job manifest has no helm.sh/hook annotation (operator-managed, not a Helm hook)"
+  fi
+  if grep -q 'serviceAccountName: gossipgrid-finalize' "$REPO_ROOT/$JOB_MANIFEST"; then
+    pass "Finalize Job manifest references the finalization ServiceAccount (gossipgrid-finalize)"
+  else
+    fail "Finalize Job manifest does not reference the finalization ServiceAccount"
+  fi
+  # The command list must include "genesis" and "finalize" as the
+  # subcommand pair.
+  if grep -qE '^[[:space:]]*-[[:space:]]*genesis[[:space:]]*$' "$REPO_ROOT/$JOB_MANIFEST" && \
+     grep -qE '^[[:space:]]*-[[:space:]]*finalize[[:space:]]*$' "$REPO_ROOT/$JOB_MANIFEST"; then
+    pass 'Finalize Job manifest runs the "genesis finalize" subcommand'
+  else
+    fail 'Finalize Job manifest does not run the "genesis finalize" subcommand'
+  fi
+  # The --confirm-seed-bound flag is the explicit operator gate and must be
+  # present (a missing flag fails closed).
+  if grep -qE '^[[:space:]]*-[[:space:]]*--confirm-seed-bound[[:space:]]*$' "$REPO_ROOT/$JOB_MANIFEST"; then
+    pass "Finalize Job manifest carries the --confirm-seed-bound flag (the explicit operator gate)"
+  else
+    fail "Finalize Job manifest is missing the --confirm-seed-bound flag (the explicit operator gate)"
+  fi
+  if grep -q 'backoffLimit: 0' "$REPO_ROOT/$JOB_MANIFEST"; then
+    pass "Finalize Job manifest has backoffLimit: 0 (no automatic retries; failures are surfaced to the operator)"
+  else
+    fail "Finalize Job manifest does not have backoffLimit: 0 (automatic retries could mask a failure)"
+  fi
+
+  # 12g-structural: Parse the Job YAML and validate its structure.
+  JOB_YAML_STRUCTURAL=$(python3 -c "
+import yaml, sys
+with open('$REPO_ROOT/$JOB_MANIFEST') as f:
+    job = yaml.safe_load(f)
+assert job['kind'] == 'Job', 'kind must be Job'
+assert job['apiVersion'] == 'batch/v1', 'apiVersion must be batch/v1'
+spec = job['spec']
+assert spec.get('backoffLimit') == 0, 'backoffLimit must be 0'
+assert 'restartPolicy' not in spec, 'restartPolicy must not be at Job spec level (it belongs under spec.template.spec)'
+pod_spec = spec['template']['spec']
+assert pod_spec.get('restartPolicy') == 'Never', 'restartPolicy must be Never under spec.template.spec'
+assert pod_spec.get('serviceAccountName') == 'gossipgrid-finalize', 'serviceAccountName must be gossipgrid-finalize'
+container = pod_spec['containers'][0]
+assert container['command'][0] == '/gossipgrid', 'command[0] must be /gossipgrid (got %s)' % container['command'][0]
+assert container['command'][1] == 'genesis', 'command[1] must be genesis'
+assert container['command'][2] == 'finalize', 'command[2] must be finalize'
+assert '--namespace' in container['command'], 'command must include --namespace'
+assert '--configmap' in container['command'], 'command must include --configmap'
+assert 'gossipgrid-cluster-metadata' in container['command'], 'command must include gossipgrid-cluster-metadata'
+assert '--cluster-id' in container['command'], 'command must include --cluster-id'
+assert '--epoch-id' in container['command'], 'command must include --epoch-id'
+assert '--genesis-consumer' in container['command'], 'command must include --genesis-consumer'
+assert '--confirm-seed-bound' in container['command'], 'command must include --confirm-seed-bound (the explicit operator gate)'
+sc = container.get('securityContext', {})
+assert sc.get('runAsNonRoot') == True, 'securityContext.runAsNonRoot must be true'
+assert sc.get('runAsUser') == 65534, 'securityContext.runAsUser must be 65534'
+assert sc.get('runAsGroup') == 65534, 'securityContext.runAsGroup must be 65534'
+assert sc.get('allowPrivilegeEscalation') == False, 'securityContext.allowPrivilegeEscalation must be false'
+assert sc.get('readOnlyRootFilesystem') == True, 'securityContext.readOnlyRootFilesystem must be true'
+assert sc.get('seccompProfile', {}).get('type') == 'RuntimeDefault', 'securityContext.seccompProfile.type must be RuntimeDefault'
+caps = sc.get('capabilities', {})
+assert 'ALL' in caps.get('drop', []), 'securityContext.capabilities.drop must include ALL'
+assert 'fsGroup' not in sc, 'fsGroup must not be in container securityContext (it is a pod-level field; the Job has no volumes)'
+print('OK')
+" 2>&1)
+  if [ $? -eq 0 ] && [ "$JOB_YAML_STRUCTURAL" = "OK" ]; then
+    pass "Finalize Job manifest YAML structure validated (executable path, restartPolicy placement, securityContext, --confirm-seed-bound flag)"
+  else
+    fail "Finalize Job manifest YAML structure invalid: $JOB_YAML_STRUCTURAL"
+  fi
+else
+  fail "Finalize Job manifest $JOB_MANIFEST not found"
+fi
+
+# 12h. The "genesis finalize" subcommand must be dispatched in main.go (the
+# finalization is a one-shot, operator-authorized operation; it is not a
+# server subcommand). The dispatch checks os.Args[1] == "genesis" and
+# os.Args[2] == "finalize".
+if grep -q 'os.Args\[2\] == "finalize"' "$REPO_ROOT/cmd/gossipgrid/main.go"; then
+  pass 'main.go dispatches the "genesis finalize" subcommand (one-shot, operator-authorized)'
+else
+  fail 'main.go does not dispatch the "genesis finalize" subcommand'
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Application read-only metadata RBAC (Milestone 5B, Stage 1B)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- 13. Application read-only metadata RBAC ---"
+
+# 13a. DEFAULT rendering (lifecycle.metadataKubernetes.enabled: false) must
+# NOT emit any app metadata reader RBAC resources (Role, RoleBinding). The
+# read-only Role must not leak into the default rendering.
+APP_RBAC_DEFAULT=$(grep -c 'name: gossipgrid-metadata-reader' <<< "$RENDERED_OUTPUT" || true)
+if [ "$APP_RBAC_DEFAULT" -eq 0 ]; then
+  pass "Default rendering: no 'gossipgrid-metadata-reader' Role/RoleBinding (app metadata RBAC disabled by default)"
+else
+  fail "Default rendering: found $APP_RBAC_DEFAULT 'gossipgrid-metadata-reader' identities (app metadata RBAC must be disabled by default)"
+fi
+
+# 13b. ENABLED rendering (lifecycle.metadataKubernetes.enabled: true) must
+# emit exactly a Role and a RoleBinding (no ServiceAccount — the app SA
+# already exists), grant get on the NAMED ConfigMap only, and have NO
+# update/create/delete/patch/list/watch permissions.
+APP_RBAC_ENABLED=$(helm template "$RELEASE" "$CHART_DIR" --namespace "$NAMESPACE" \
+  --set 'lifecycle.metadataKubernetes.enabled=true' 2>&1 || true)
+APP_ROLE_ENABLED=$(grep -c 'name: gossipgrid-metadata-reader$' <<< "$APP_RBAC_ENABLED" || true)
+APP_ROLEBINDING_ENABLED=$(grep -c 'kind: RoleBinding' <<< "$APP_RBAC_ENABLED" | grep -c 'gossipgrid-metadata-reader' || true)
+# Simpler: check for the Role kind and the RoleBinding kind.
+APP_ROLE_KIND=$(grep -c '^kind: Role$' <<< "$APP_RBAC_ENABLED" || true)
+APP_RB_BIND_KIND=$(grep -c '^kind: RoleBinding$' <<< "$APP_RBAC_ENABLED" || true)
+if [ "$APP_ROLE_KIND" -eq 1 ] && [ "$APP_RB_BIND_KIND" -eq 1 ]; then
+  pass "Enabled rendering: exactly one Role and one RoleBinding for the app metadata reader"
+else
+  fail "Enabled rendering: expected 1 Role and 1 RoleBinding, got Role=$APP_ROLE_KIND RoleBinding=$APP_RB_BIND_KIND"
+fi
+# The Role must grant get on configmaps with the named ConfigMap.
+if grep -q 'resourceNames: \["gossipgrid-cluster-metadata"\]' <<< "$APP_RBAC_ENABLED" && \
+   grep -q 'verbs: \["get"\]' <<< "$APP_RBAC_ENABLED"; then
+  pass "Enabled rendering: the app Role grants get on the named ConfigMap only"
+else
+  fail "Enabled rendering: the app Role does not grant get on the named ConfigMap (or the resourceNames/verbs are wrong)"
+fi
+# The Role must NOT grant update, create, delete, patch, list, or watch.
+for forbidden in update create delete patch list watch; do
+  if grep -q "verbs: \[.*\"$forbidden\".*\]" <<< "$APP_RBAC_ENABLED"; then
+    fail "Enabled rendering: the app Role grants '$forbidden' (it must be get-only)"
+  fi
+done
+pass "Enabled rendering: the app Role has NO forbidden permissions (no update/create/delete/patch/list/watch)"
+# The RoleBinding must reference the app ServiceAccount (serviceAccount.name).
+if grep -q "name: $NAMESPACE" <<< "$APP_RBAC_ENABLED" && \
+   grep -q 'kind: ServiceAccount' <<< "$APP_RBAC_ENABLED"; then
+  pass "Enabled rendering: the app RoleBinding references a ServiceAccount subject"
+else
+  fail "Enabled rendering: the app RoleBinding does not reference a ServiceAccount subject"
+fi
+# The RoleBinding must NOT reference the genesis or finalization ServiceAccounts.
+for forbidden_sa in gossipgrid-genesis gossipgrid-finalize; do
+  if grep -q "name: $forbidden_sa" <<< "$APP_RBAC_ENABLED"; then
+    fail "Enabled rendering: the app RoleBinding references '$forbidden_sa' (it must reference only the app SA)"
+  fi
+done
+pass "Enabled rendering: the app RoleBinding does NOT reference the genesis or finalization ServiceAccounts"
+# No ClusterRole or ClusterRoleBinding (namespaced only).
+if grep -q 'kind: ClusterRole' <<< "$APP_RBAC_ENABLED" || grep -q 'kind: ClusterRoleBinding' <<< "$APP_RBAC_ENABLED"; then
+  fail "Enabled rendering: a ClusterRole or ClusterRoleBinding is present (the app metadata RBAC must be namespaced only)"
+else
+  pass "Enabled rendering: no ClusterRole or ClusterRoleBinding (namespaced only)"
+fi
+# The StatefulSet env vars must be present when the provider is enabled.
+if grep -q 'GOSSIPGRID_LIFECYCLE_METADATA_KUBERNETES' <<< "$APP_RBAC_ENABLED" && \
+   grep -q 'GOSSIPGRID_LIFECYCLE_METADATA_CONFIGMAP_NAME' <<< "$APP_RBAC_ENABLED"; then
+  pass "Enabled rendering: the StatefulSet emits the metadata provider env vars"
+else
+  fail "Enabled rendering: the StatefulSet is missing the metadata provider env vars"
+fi
+# The env var value must be "true" and the ConfigMap name must match.
+if grep -q 'value: "true"' <<< "$APP_RBAC_ENABLED" && \
+   grep -q 'value: "gossipgrid-cluster-metadata"' <<< "$APP_RBAC_ENABLED"; then
+  pass "Enabled rendering: the env var values are correct (KUBERNETES=true, CONFIGMAP_NAME=gossipgrid-cluster-metadata)"
+else
+  fail "Enabled rendering: the env var values are incorrect"
+fi
+# The default rendering must NOT emit the env vars.
+if grep -q 'GOSSIPGRID_LIFECYCLE_METADATA_KUBERNETES' <<< "$RENDERED_OUTPUT"; then
+  fail "Default rendering: the metadata provider env vars are present (they must only be emitted when the provider is enabled)"
+else
+  pass "Default rendering: no metadata provider env vars (the provider is disabled)"
+fi
+
+# ---------------------------------------------------------------------------
+# 14. Genesis override configuration (Milestone 5B, Stage 1B)
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- 14. Genesis override configuration (runbook section 10) ---"
+
+# The runbook (docs/genesis-runbook.md, section 10) documents the EXACT
+# override values file the operator must set to enable lifecycle protection,
+# the Kubernetes cluster-metadata provider, the seed identity, and the
+# metadata namespace for a new genesis cluster. This check renders the chart
+# with THAT exact override configuration and verifies:
+#   a. the default (7A staging) rendering does NOT emit the seed-identity or
+#      metadata-namespace env vars (the default Helm output is unchanged);
+#   b. the override rendering emits the seed-identity env var (only when
+#      lifecycle.enabled AND lifecycle.seedIdentity are both set);
+#   c. the override rendering emits the metadata-namespace env var (only when
+#      lifecycle.metadataKubernetes.enabled AND metadataNamespace are both
+#      set);
+#   d. the app read-only metadata RBAC (Role + RoleBinding) is rendered (the
+#      app SA can read the ConfigMap);
+#   e. the genesis grant RBAC and the finalization RBAC are rendered (the
+#      operator Jobs can create/update the ConfigMap);
+#   f. the 7A staging values (values-staging.yaml) do NOT enable any of these
+#      settings (the existing 7A deployment is data-bearing and must not be
+#      treated as a fresh cluster).
+
+# 14a. The EXACT override configuration documented in the runbook section 10
+# (lifecycle.enabled=true, metadataKubernetes.enabled=true, configMapName,
+# metadataNamespace, seedIdentity; plus genesis.enabled and finalize.enabled
+# so the operator Jobs' RBAC is rendered). Render it.
+GENESIS_OVERRIDE_OUTPUT=$(helm template "$RELEASE" "$CHART_DIR" --namespace "$NAMESPACE" \
+  --set 'lifecycle.enabled=true' \
+  --set 'lifecycle.metadataKubernetes.enabled=true' \
+  --set 'lifecycle.metadataKubernetes.configMapName=gossipgrid-cluster-metadata' \
+  --set 'lifecycle.metadataKubernetes.metadataNamespace=gossipgrid' \
+  --set 'lifecycle.seedIdentity=gossipgrid-0' \
+  --set 'genesis.enabled=true' \
+  --set 'finalize.enabled=true' 2>&1 || true)
+
+# 14b. DEFAULT rendering (lifecycle.enabled: false, the 7A staging default)
+# must NOT emit the seed-identity env var (lifecycle.seedIdentity is empty
+# by default, and even if it were set, lifecycle.enabled is false so the
+# env var is not emitted). The grep uses the 'name:' prefix to exclude
+# comment lines in the template that mention the env var name.
+if grep -q 'name: GOSSIPGRID_GENESIS_SEED_IDENTITY' <<< "$RENDERED_OUTPUT"; then
+  fail "Default rendering: GOSSIPGRID_GENESIS_SEED_IDENTITY env var is present (it must only be emitted when lifecycle.enabled=true AND lifecycle.seedIdentity is nonempty)"
+else
+  pass "Default rendering: no GOSSIPGRID_GENESIS_SEED_IDENTITY env var (lifecycle is disabled by default)"
+fi
+
+# 14c. DEFAULT rendering must NOT emit the metadata-namespace env var
+# (lifecycle.metadataKubernetes.metadataNamespace is empty by default, and
+# lifecycle.metadataKubernetes.enabled is false). The grep uses the 'name:'
+# prefix to exclude comment lines in the template that mention the env var
+# name.
+if grep -q 'name: GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE' <<< "$RENDERED_OUTPUT"; then
+  fail "Default rendering: GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE env var is present (it must only be emitted when lifecycle.metadataKubernetes.enabled=true AND metadataNamespace is nonempty)"
+else
+  pass "Default rendering: no GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE env var (the metadata provider is disabled by default)"
+fi
+
+# 14d. The OVERRIDE rendering must emit the seed-identity env var with the
+# correct value (gossipgrid-0, the deterministic seed-identity convention).
+if grep -q 'name: GOSSIPGRID_GENESIS_SEED_IDENTITY' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'value: "gossipgrid-0"' <<< "$GENESIS_OVERRIDE_OUTPUT"; then
+  pass "Genesis override: GOSSIPGRID_GENESIS_SEED_IDENTITY is emitted with value gossipgrid-0"
+else
+  fail "Genesis override: GOSSIPGRID_GENESIS_SEED_IDENTITY is missing or has the wrong value (expected gossipgrid-0)"
+fi
+
+# 14e. The OVERRIDE rendering must emit the metadata-namespace env var with
+# the correct value (gossipgrid, the application namespace).
+if grep -q 'name: GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'value: "gossipgrid"' <<< "$GENESIS_OVERRIDE_OUTPUT"; then
+  pass "Genesis override: GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE is emitted with value gossipgrid"
+else
+  fail "Genesis override: GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE is missing or has the wrong value (expected gossipgrid)"
+fi
+
+# 14f. The OVERRIDE rendering must emit the metadata provider env vars
+# (KUBERNETES=true, CONFIGMAP_NAME=gossipgrid-cluster-metadata).
+if grep -q 'GOSSIPGRID_LIFECYCLE_METADATA_KUBERNETES' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'GOSSIPGRID_LIFECYCLE_METADATA_CONFIGMAP_NAME' <<< "$GENESIS_OVERRIDE_OUTPUT"; then
+  pass "Genesis override: the metadata provider env vars are emitted"
+else
+  fail "Genesis override: the metadata provider env vars are missing"
+fi
+
+# 14g. The OVERRIDE rendering must emit the lifecycle-enabled env var (true).
+if grep -q 'GOSSIPGRID_LIFECYCLE_ENABLED' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'value: "true"' <<< "$GENESIS_OVERRIDE_OUTPUT"; then
+  pass "Genesis override: GOSSIPGRID_LIFECYCLE_ENABLED is emitted with value true"
+else
+  fail "Genesis override: GOSSIPGRID_LIFECYCLE_ENABLED is missing or has the wrong value"
+fi
+
+# 14h. The OVERRIDE rendering must emit the app read-only metadata RBAC
+# (Role + RoleBinding for the app SA to read the ConfigMap).
+if grep -q 'kind: Role$' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'gossipgrid-metadata-reader' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'resourceNames: \["gossipgrid-cluster-metadata"\]' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'verbs: \["get"\]' <<< "$GENESIS_OVERRIDE_OUTPUT"; then
+  pass "Genesis override: the app read-only metadata RBAC (Role + RoleBinding, get on the named ConfigMap) is rendered"
+else
+  fail "Genesis override: the app read-only metadata RBAC is missing or has the wrong permissions"
+fi
+
+# 14i. The OVERRIDE rendering must emit the genesis grant RBAC (ServiceAccount
+# + Role + RoleBinding with create on configmaps and get on the named
+# ConfigMap).
+if grep -q 'gossipgrid-genesis' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'verbs: \["create"\]' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'verbs: \["get"\]' <<< "$GENESIS_OVERRIDE_OUTPUT"; then
+  pass "Genesis override: the genesis grant RBAC (create + get on configmaps) is rendered"
+else
+  fail "Genesis override: the genesis grant RBAC is missing or has the wrong permissions"
+fi
+
+# 14j. The OVERRIDE rendering must emit the finalization RBAC (ServiceAccount
+# + Role + RoleBinding with get and update on the named ConfigMap). The
+# finalization Role has two separate rules (one for get, one for update), so
+# the check verifies both verbs are present (in separate rules).
+FINALIZE_ROLE_PRESENT=0
+if grep -q 'gossipgrid-finalize' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'verbs: \["get"\]' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'verbs: \["update"\]' <<< "$GENESIS_OVERRIDE_OUTPUT" && \
+   grep -q 'resourceNames: \["gossipgrid-cluster-metadata"\]' <<< "$GENESIS_OVERRIDE_OUTPUT"; then
+  FINALIZE_ROLE_PRESENT=1
+fi
+if [ "$FINALIZE_ROLE_PRESENT" -eq 1 ]; then
+  pass "Genesis override: the finalization RBAC (get + update on the named ConfigMap) is rendered"
+else
+  fail "Genesis override: the finalization RBAC is missing or has the wrong permissions (expected get + update on the named ConfigMap)"
+fi
+
+# 14k. The 7A STAGING values (values-staging.yaml) must NOT enable any of
+# these settings (the existing 7A deployment is data-bearing and must not be
+# treated as a fresh cluster). The staging rendering (already rendered above
+# as STAGING_RENDERED_OUTPUT) must NOT contain the seed-identity or
+# metadata-namespace env vars. The grep uses the 'name:' prefix to exclude
+# comment lines in the template that mention the env var name.
+if grep -q 'name: GOSSIPGRID_GENESIS_SEED_IDENTITY' <<< "$STAGING_RENDERED_OUTPUT"; then
+  fail "7A staging values: GOSSIPGRID_GENESIS_SEED_IDENTITY env var is present (the 7A deployment must not enable the genesis seed identity)"
+else
+  pass "7A staging values: no GOSSIPGRID_GENESIS_SEED_IDENTITY env var (the 7A deployment does not enable genesis)"
+fi
+if grep -q 'name: GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE' <<< "$STAGING_RENDERED_OUTPUT"; then
+  fail "7A staging values: GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE env var is present (the 7A deployment must not enable the metadata provider namespace)"
+else
+  pass "7A staging values: no GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE env var (the 7A deployment does not enable the metadata provider)"
 fi
 
 # ---------------------------------------------------------------------------

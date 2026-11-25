@@ -234,6 +234,57 @@ spec:
             # -- Lifecycle (Milestone 5A). Disabled in 7A (see values.yaml).
             - name: GOSSIPGRID_LIFECYCLE_ENABLED
               value: {{ .Values.lifecycle.enabled | quote }}
+            # -- Kubernetes cluster-metadata provider (Milestone 5B, Stage
+            #    1B). When lifecycle.metadataKubernetes.enabled is true, the
+            #    application reads the authoritative cluster-metadata
+            #    ConfigMap (k8smetadata provider) as its lifecycle metadata
+            #    source. The application needs a read-only RBAC (get on the
+            #    named ConfigMap only) to perform the read: this is rendered
+            #    by app-rbac.yaml, gated on the same value. When disabled
+            #    (the default), no env vars are emitted and the existing
+            #    behavior is preserved (the application has no metadata
+            #    source and lifecycle enforcement is a no-op or disabled).
+            #
+            #    The env vars are emitted ONLY when the provider is
+            #    explicitly enabled. The application validates that
+            #    lifecycle.enabled is true when this is enabled (fail-closed
+            #    at load time); a missing lifecycle enables the provider to
+            #    be a misconfiguration.
+            {{- if .Values.lifecycle.metadataKubernetes.enabled }}
+            - name: GOSSIPGRID_LIFECYCLE_METADATA_KUBERNETES
+              value: "true"
+            - name: GOSSIPGRID_LIFECYCLE_METADATA_CONFIGMAP_NAME
+              value: {{ .Values.lifecycle.metadataKubernetes.configMapName | quote }}
+            {{- if .Values.lifecycle.metadataKubernetes.metadataNamespace }}
+            # The namespace of the authoritative cluster-metadata ConfigMap.
+            # Emitted ONLY when nonempty (the default is empty, in which case
+            # the application falls back to the in-cluster service
+            # account's mounted namespace file).
+            - name: GOSSIPGRID_LIFECYCLE_METADATA_NAMESPACE
+              value: {{ .Values.lifecycle.metadataKubernetes.metadataNamespace | quote }}
+            {{- end }}
+            {{- end }}
+            # -- Genesis seed identity (Milestone 5B, Stage 1B).
+            #
+            # When lifecycle.seedIdentity is nonempty AND lifecycle.enabled is
+            # true, the application emits the GOSSIPGRID_GENESIS_SEED_IDENTITY
+            # environment variable. The replica whose NodeID EXACTLY equals
+            # this value may take the genesis authorization path
+            # (AuthorizeGenesis); all other replicas are no-ops. The value
+            # must equal the deterministic seed-identity convention
+            # (lifecycle.DesignatedGenesisSeed, "gossipgrid-0"): the genesis
+            # finalization enforces this convention. When empty (the default)
+            # or when lifecycle.enabled is false, no env var is emitted and
+            # no replica may take the genesis path (the existing 7A behavior
+            # is preserved exactly).
+            #
+            # The application validates that lifecycle.enabled is true when
+            # a seed identity is configured (fail-closed at load time); a
+            # seed identity without lifecycle is a misconfiguration.
+            {{- if and .Values.lifecycle.enabled .Values.lifecycle.seedIdentity }}
+            - name: GOSSIPGRID_GENESIS_SEED_IDENTITY
+              value: {{ .Values.lifecycle.seedIdentity | quote }}
+            {{- end }}
             # -- Browser authentication (Milestone 6).
             #
             # The credential material is NEVER delivered through environment

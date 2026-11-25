@@ -1,0 +1,106 @@
+# Genesis finalization RBAC (Milestone 5B, Stage 1B).
+#
+# A SEPARATE, namespaced ServiceAccount, Role, and RoleBinding for the
+# operator-triggered genesis finalization Job. The finalization consumes the
+# one-time genesis authorization: it performs a single, atomic resourceVersion
+# compare-and-swap (CAS) update on the authoritative cluster-metadata
+# ConfigMap (gossipgrid-cluster-metadata) that sets, all together in one
+# update, Initialized=true, GenesisAuthorized=false, GenesisConsumer=<seed>,
+# and DataLossProtected=true. The Job is the only identity with the update
+# permission.
+#
+# Security properties (enforced here):
+#   - Namespaced only: NO ClusterRole, NO cluster-scoped bindings. The
+#     update permission is bounded to the application namespace.
+#   - get on the NAMED ConfigMap only (resourceNames IS honored for get, so
+#     this is correctly scoped to gossipgrid-cluster-metadata). The Job uses
+#     get to read the authoritative record before the CAS and to re-read it
+#     on an ambiguous result.
+#   - update on the NAMED ConfigMap only (resourceNames IS honored for update,
+#     so this is correctly scoped to gossipgrid-cluster-metadata). The Job
+#     performs ONLY a resourceVersion CAS update (it never creates, deletes,
+#     patches, lists, or watches).
+#   - NO create, delete, patch, list, or watch permissions. The finalization
+#     is a single update; it never creates or removes the ConfigMap. The
+#     create permission lives in the SEPARATE genesis grant RBAC
+#     (genesis-rbac.yaml), and the normal application ServiceAccount is
+#     read-only (no RBAC by default).
+#   - The Job's container is non-privileged (no privileged: true, no
+#     privilege escalation; the same securityContext as the application
+#     pods).
+#
+# This RBAC is DISABLED by default (finalize.enabled: false). It is rendered
+# only when an operator explicitly enables it (via an override values file,
+# NOT the 7A staging values) to prepare a cluster for a finalization. The
+# finalization Job itself is an operator-managed manifest
+# (deploy/genesis/finalize-job.yaml), NOT a chart template and NOT a Helm
+# hook: it is never created by Argo CD reconciliation or by the deployment,
+# and it is never run automatically.
+#
+# The application ServiceAccount (serviceAccount.name) is a SEPARATE identity
+# and does NOT inherit these privileges: it has no Role/RoleBinding in the
+# default configuration.
+{{- if .Values.finalize.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Values.finalize.serviceAccountName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: finalize
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Values.finalize.roleName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: finalize
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+rules:
+  # get on the NAMED ConfigMap only (resourceNames is honored for get). The
+  # Job reads the authoritative record before the CAS and re-reads it on an
+  # ambiguous result (a conflict, a transient unavailability, or a nil
+  # response). It never lists or watches.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ .Values.finalize.configMapName | quote }}]
+    verbs: ["get"]
+  # update on the NAMED ConfigMap only (resourceNames is honored for update).
+  # The Job performs ONLY a resourceVersion CAS update (it never creates,
+  # deletes, patches, or otherwise mutates the ConfigMap).
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ .Values.finalize.configMapName | quote }}]
+    verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Values.finalize.roleBindingName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: finalize
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "-" }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Values.finalize.roleName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.finalize.serviceAccountName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

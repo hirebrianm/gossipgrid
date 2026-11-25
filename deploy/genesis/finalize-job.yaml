@@ -1,0 +1,151 @@
+# Genesis finalization Job (Milestone 5B, Stage 1B) — operator-managed manifest.
+#
+# This Job performs the explicit, operator-authorized genesis finalization: it
+# consumes the one-time genesis authorization with a single, atomic
+# resourceVersion compare-and-swap (CAS) update on the authoritative
+# cluster-metadata ConfigMap (gossipgrid-cluster-metadata) that sets, all
+# together in one update, Initialized=true, GenesisAuthorized=false,
+# GenesisConsumer=<seed>, and DataLossProtected=true, preserving every other
+# field (ClusterID, EpochID, Generation, EverAcceptedMessages, LastReset). It
+# does NOT create a new cluster identity or epoch, and it does NOT delete or
+# recreate the ConfigMap. It runs as the finalization ServiceAccount (the only
+# identity with the update permission).
+#
+# CRITICAL: this manifest is NOT a Helm chart template and NOT a Helm hook.
+# It carries NO "helm.sh/hook" annotations, so it is never created by Argo CD
+# reconciliation or by a deployment. The operator applies it EXPLICITLY
+# (kubectl apply -f deploy/genesis/finalize-job.yaml, after verifying the
+# preconditions in docs/genesis-runbook.md) and it runs exactly once.
+#
+# The Job's container runs the `gossipgrid genesis finalize` subcommand (a
+# one-shot, operator-invoked finalization; see internal/lifecycle/genesis). It
+# performs a fail-closed preflight (the Kubernetes API must be readable and
+# the ConfigMap must be an outstanding, unconsumed authorization — or an
+# already-finalized record matching the expected identities) and then a single
+# CAS update. An ambiguous failure may occur after the ConfigMap was updated
+# (e.g., the API server updates the object but times out before returning the
+# response); the finalization NEVER infers success from an ambiguous error —
+# it re-reads the authoritative object and classifies it (already finalized /
+# mismatched / outstanding / corrupted). The operator must inspect the
+# authoritative ConfigMap before retrying.
+#
+# The Job uses backoffLimit 0 (no automatic retries) and restartPolicy Never:
+# a failure is surfaced to the operator, who verifies the state and re-applies
+# the Job if appropriate (an idempotent, safe retry — a retry against an
+# existing coherent finalized record reports "already finalized" and creates
+# nothing). The Job is not privileged (no privileged: true, no privilege
+# escalation).
+#
+# PREREQUISITES (verified by the operator, see docs/genesis-runbook.md):
+#   1. The finalization RBAC has been rendered (finalize.enabled=true in an
+#      override values file; Argo CD has reconciled the ServiceAccount,
+#      Role, and RoleBinding).
+#   2. The genesis grant has already been performed (the ConfigMap exists with
+#      an outstanding, unconsumed authorization: Initialized=false,
+#      GenesisAuthorized=true, GenesisConsumer="").
+#   3. The designated seed (gossipgrid-0) is DURABLY BOUND to the exact
+#      cluster/epoch (verified EXTERNALLY via the peer-status and lifecycle
+#      diagnostics). The command CANNOT read the seed's local SQLite (the
+#      seed's emptyDir is not accessible to the Job, and the Job's RBAC is
+#      scoped only to the ConfigMap); the --confirm-seed-bound flag is the
+#      operator's explicit attestation that this verification was performed.
+#   4. No other pod is bound to a conflicting epoch (verified EXTERNALLY; the
+#      command cannot read the other pods' local SQLite). The operator
+#      attests this via the same --confirm-seed-bound flag (the runbook
+#      documents the verification procedure).
+#   5. The gossipgrid image (with the `genesis finalize` subcommand) is
+#      available.
+#
+# OPERATOR ATTENTION: the --cluster-id, --epoch-id, and --genesis-consumer
+# values are placeholders below (set by the operator from the grant output).
+# The command verifies these against the authoritative ConfigMap before
+# performing the CAS; a mismatch fails closed (it is never overwritten).
+# The --confirm-seed-bound flag is required (a missing flag fails closed).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gossipgrid-genesis-finalize
+  namespace: gossipgrid
+  labels:
+    app.kubernetes.io/name: gossipgrid
+    app.kubernetes.io/component: finalize
+spec:
+  # No automatic retries: a failure is surfaced to the operator. The
+  # finalization is idempotent (a retry against an existing coherent finalized
+  # record matching the expected identities reports "already finalized" and
+  # creates nothing), so the operator may re-apply the Job safely.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gossipgrid
+        app.kubernetes.io/component: finalize
+    spec:
+      # The Job runs exactly once and does not restart on failure.
+      restartPolicy: Never
+      # The finalization ServiceAccount (the only identity with the update
+      # permission on the named ConfigMap in this namespace). Distinct from
+      # the application ServiceAccount (gossipgrid, read-only) and from the
+      # genesis grant ServiceAccount (gossipgrid-genesis, create-only).
+      serviceAccountName: gossipgrid-finalize
+      # No automatic execution: this Job has no hook annotations and is
+      # applied only by an explicit operator action.
+      containers:
+        - name: finalize
+          image: registry.gitlab.example.internal/gossipgrid:dev
+          imagePullPolicy: IfNotPresent
+          # The `genesis finalize` subcommand: the operator-authorized
+          # finalization. The namespace is the Job's namespace (the ConfigMap
+          # is updated in the Job's namespace; the operator must apply the Job
+          # in the application namespace). The --cluster-id, --epoch-id, and
+          # --genesis-consumer values are set by the operator from the grant
+          # output and verified against the authoritative ConfigMap before the
+          # CAS. The --confirm-seed-bound flag is the operator's explicit
+          # attestation that the seed is durably bound (verified externally).
+          command:
+            - /gossipgrid
+            - genesis
+            - finalize
+            - --namespace
+            - gossipgrid
+            - --configmap
+            - gossipgrid-cluster-metadata
+            - --cluster-id
+            - REPLACE_WITH_GRANT_CLUSTER_ID
+            - --epoch-id
+            - REPLACE_WITH_GRANT_EPOCH_ID
+            - --genesis-consumer
+            - gossipgrid-0
+            - --confirm-seed-bound
+          # Fail-closed preflight and single CAS update; the command exits 0
+          # on success (a fresh finalization or an idempotent "already
+          # finalized") and nonzero on any failure (a mismatched finalized
+          # record, no outstanding authorization, a corrupted record, an
+          # ambiguous result, a permission denial, or an API unavailability).
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+            # The finalization is a control-plane operation (it reads and
+            # updates a ConfigMap); it needs no writable filesystem.
+            # Read-only root filesystem is enforced (matching the
+            # application pods).
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      # The Job needs no volumes (the finalization is a pure API operation;
+      # no SQLite, no certificates, no credential files). No emptyDir, no
+      # projected Secret.
+      # The Job does not need to share the node with the application pods;
+      # it runs briefly and exits. No affinity or tolerations.
