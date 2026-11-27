@@ -271,6 +271,79 @@ type MetadataSource interface {
 	Read(ctx context.Context) (ClusterMetadata, error)
 }
 
+// BindingProvenance records the origin of a durable database binding.
+// It distinguishes how the binding was created, which is essential for
+// the seed-restart reconciliation: a genesis-created binding authorizes
+// the original seed's finalization promotion, while a join-created binding
+// must never satisfy that shortcut (a replacement seed that joined an
+// already-initialized epoch is not the original seed).
+type BindingProvenance int
+
+const (
+	// ProvenanceGenesis indicates the binding was created by the
+	// operator-authorized genesis entry (AuthorizeGenesis). The original
+	// seed's binding; the only provenance that authorizes the
+	// genesis-finalization restart promotion to READY.
+	ProvenanceGenesis BindingProvenance = iota
+
+	// ProvenanceJoin indicates the binding was created by the ordinary
+	// joining path (AuthorizeJoin). A replacement or additional replica
+	// that joined an already-initialized epoch; this binding must never
+	// satisfy the genesis-restart shortcut (no promotion to READY via the
+	// finalization path).
+	ProvenanceJoin
+
+	// ProvenanceLegacy indicates the binding has an EXPLICITLY UNKNOWN
+	// origin. It is never produced by any production binding-creation
+	// path (the ordinary Bind and AuthorizeJoin always record a
+	// definitive provenance), and it is accepted only as an explicit,
+	// fail-closed marker: it authorizes neither genesis entry/promotion
+	// nor ordinary joining, and may only follow a separately justified,
+	// operator-driven reconstruction policy.
+	//
+	// This is DISTINCT from the migration of supported pre-Stage-3A
+	// binding rows (which predates the provenance column and is mapped to
+	// ProvenanceGenesis at read time by the store's compatibility policy,
+	// not to this value — see store.GetBinding). A legacy-origin binding
+	// must never be silently inferred to be genesis-created from replica
+	// identity.
+	ProvenanceLegacy
+)
+
+// String returns a human-readable name for the provenance.
+func (p BindingProvenance) String() string {
+	switch p {
+	case ProvenanceGenesis:
+		return "genesis"
+	case ProvenanceJoin:
+		return "join"
+	case ProvenanceLegacy:
+		return "legacy"
+	default:
+		return fmt.Sprintf("UNKNOWN(%d)", int(p))
+	}
+}
+
+// IsGenesis reports whether the provenance positively establishes a genesis
+// origin. Only ProvenanceGenesis qualifies. ProvenanceJoin and
+// ProvenanceLegacy both fail closed: a join-created binding is never
+// repurposed as genesis, and an explicitly unknown (legacy) origin is never
+// inferred to be genesis from replica identity (no silent inference).
+func (p BindingProvenance) IsGenesis() bool {
+	return p == ProvenanceGenesis
+}
+
+// isRecognized reports whether the provenance is a positively recognized
+// production provenance (genesis or join). It is the admission allowlist: an
+// explicitly-unknown (legacy) marker or any out-of-range value is NOT
+// recognized and must fail closed for participation. Unlike IsGenesis, this
+// accepts join provenance (a join-origin replica may participate in an
+// already-initialized epoch; Stage 3D will promote a synchronized one to
+// READY) while still rejecting unknown values.
+func (p BindingProvenance) isRecognized() bool {
+	return p == ProvenanceGenesis || p == ProvenanceJoin
+}
+
 // DatabaseBinding is the durable local binding between a SQLite database and
 // a cluster epoch. It is stored in a separate table in the same SQLite file.
 //
@@ -290,6 +363,11 @@ type DatabaseBinding struct {
 
 	// CreatedAt is the time the binding was first established.
 	CreatedAt time.Time
+
+	// Provenance records how this binding was created (genesis, join, or
+	// legacy/unknown). It is immutable through ordinary bind operations and
+	// is never upgraded from join to genesis.
+	Provenance BindingProvenance
 }
 
 // Validate checks the binding for well-formedness.
@@ -299,6 +377,9 @@ func (b DatabaseBinding) Validate() error {
 	}
 	if b.EpochID == "" {
 		return errors.New("database binding: EpochID is empty")
+	}
+	if b.Provenance < ProvenanceGenesis || b.Provenance > ProvenanceLegacy {
+		return fmt.Errorf("database binding: invalid provenance %d (must be %d, %d, or %d)", b.Provenance, ProvenanceGenesis, ProvenanceJoin, ProvenanceLegacy)
 	}
 	return nil
 }

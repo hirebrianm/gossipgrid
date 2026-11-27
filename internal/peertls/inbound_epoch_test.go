@@ -239,7 +239,7 @@ func newInboundTestController(t *testing.T, state lifecycle.State, clusterID, ep
 	}
 
 	st := newInboundTestStore(t)
-	if _, err := st.Bind(clusterID, epochID, 1); err != nil {
+	if _, err := st.Bind(context.Background(), clusterID, epochID, 1, lifecycle.ProvenanceGenesis); err != nil {
 		t.Fatalf("binding test store: %v", err)
 	}
 

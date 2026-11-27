@@ -13,8 +13,12 @@ Stages 1A (Kubernetes genesis grant) and 1B (operator-authorized genesis finaliz
 Stage 2 (bootstrap replication admission, `FetchBootstrapBaseline` transport-and-commit mechanism)
 is implemented, committed (`209cec1`), and locally tested (not yet cluster-verified)
 (see [Bootstrap replication admission](#3-bootstrap-replication-admission)).
-Stage 3 (source discovery/selection, sweep scheduling, automatic `READY` promotion) is designed
-but not implemented.
+Stage 3A (durable binding provenance, `AuthorizeJoin` with final authorization guard,
+trusted source-observation boundary, context-aware binding, and seed-restart privilege
+isolation) is implemented and locally tested
+(see [Stage 3A — authorized joining and durable binding foundation](#stage-3a--authorized-joining-and-durable-binding-foundation));
+Stage 3B–3D (source discovery/selection, sweep scheduling, synchronization-completion
+`READY` promotion) are designed but not implemented.
 
 This document supersedes the `Milestone 5B` and `Milestone 5C` sections of
 [architecture.md](architecture.md) where the two disagree. For a learning-oriented walkthrough of
@@ -1036,3 +1040,259 @@ lifecycle protection, plus the Helm changes, belong to **7B**. Stage 0 delivers 
 
 These tests are deterministic and run under `go test` and `go test -race` as part of `make
 qa`.
+
+## Stage 3A — authorized joining and durable binding foundation
+
+**Status:** Implemented and locally tested. The stage is uncommitted at the time of writing
+(pending operator review). It is **not** cluster-verified.
+
+### What Stage 3A implements
+
+Stage 3A is the foundation for ordinary replica joining (a fresh or replacement pod that
+joins an already-initialized cluster epoch). It implements four things:
+
+1. **Durable binding provenance.** Every `local_metadata` binding row now carries a
+   `provenance` column that records *how* the binding was created. The three values are:
+   - `genesis` (0) — the binding was created by `AuthorizeGenesis` (the one-time,
+     operator-authorized first-epoch establishment by the designated seed).
+   - `join` (1) — the binding was created by `AuthorizeJoin` (an ordinary replica joining
+     an already-initialized epoch).
+   - `legacy` (2) — the binding pre-dates the provenance column (pre-Stage 3A). The
+     compatibility policy maps the zero-value (0) to `genesis` because the only production
+     code path that created bindings before Stage 3A was `AuthorizeGenesis`.
+
+   The provenance is persisted atomically with the binding (same SQLite row, same
+   transaction), is immutable (a re-bind with the same cluster/epoch returns the existing
+   binding unchanged, preserving its provenance), and is validated on read (an out-of-range
+   value returns `ErrBindingMalformed`, failing closed). The admission predicates
+   (`AuthorizationSnapshot.authorized` and `bootstrapAuthorized`) each carry a positive
+   provenance allowlist (only `genesis` or `join`): an explicitly-unknown (`legacy`) or
+   out-of-range provenance denies both ordinary participation and bootstrap fetch,
+   independent of the state or metadata checks — the state restriction alone is not
+   sufficient to fail closed an unrecognized provenance.
+
+2. **`AuthorizeJoin` controller operation with final authorization guard.** A narrow,
+   explicitly invoked operation for beginning an ordinary replica join. It is distinct
+   from `AuthorizeGenesis`:
+   - `AuthorizeGenesis` is for the one-time, operator-authorized first-epoch establishment
+     (the designated seed only, `GENESIS` state, genesis provenance).
+   - `AuthorizeJoin` is for ordinary replicas joining an already-initialized epoch (any
+     replica, `SYNCING` state, join provenance). A replacement canonical seed follows the
+     ordinary joining contract once the epoch has been initialized; its ordinal does not
+     confer genesis privileges.
+
+   The operation is fail-closed: it is permitted only when the lifecycle is enabled, the
+   metadata is fresh and reports an initialized epoch, the complete finalized-genesis
+   invariant is satisfied (for a genesis-managed configuration), the replica is in a
+   pre-join state (`STARTING` or `DISCOVERING`), the local database is empty or has a
+   matching join/legacy binding, and a trusted source observation (see below) validates
+   against the authoritative metadata.
+
+   **Final authorization guard.** After the SQLite `Bind` commits and *before* the
+   controller transitions to `SYNCING`, a second validation pass
+   (`authorizeJoinFinalGuard`) is evaluated while holding both `c.mu.Lock` and
+   `m.mu.Lock` (the established write-lock order) with no I/O inside the critical
+   section. It re-checks:
+   - the caller's context is live (checked under the held lock pair, so a
+     cancellation that linearizes before the guard is observed and the
+     operation is rejected),
+   - the lifecycle is still enabled,
+   - the controller is not stopped,
+   - the controller's context is still live (non-blocking check),
+   - the current accepted metadata is present, fresh, valid, and reports the
+     same epoch,
+   - the finalized-genesis invariant still holds,
+   - the current metadata matches the pinned join target,
+   - the current metadata matches the actual durable binding,
+   - the binding's provenance is `join` (genesis and legacy/unknown are
+     rejected),
+   - the source observation is valid, within its bounded lifetime, and
+     consistent with the current metadata — via the same single
+     controller-side validator used in the pre-binding guard, passing the
+     original pinned target and expected identity from `AuthorizeJoin` (the
+     final guard enforces the original request parameters, not an identity
+     compared against itself),
+   - the lifecycle state permits the transition into `SYNCING`.
+
+   **Committed bindings are never rolled back.** The SQLite transaction is the
+   linearization point: once it commits, the binding is durable and is never
+   deleted or modified on a guard rejection. If any guard check fails, the
+   operation returns an error and the durable binding is **preserved**. A
+   subsequent `AuthorizeJoin` call with a restored authorization will find
+   the matching join-provenance binding and succeed idempotently.
+   Additionally, a **post-Bind authoritative re-read** (a direct
+   `c.source.Read(ctx)` call, not the pre-guard snapshot) is performed
+   between the Bind and the final guard: the re-read observation is validated
+   (valid, complete, matching cluster/epoch, genesis invariant) to confirm
+   the authorization was not revoked between the pre-guard snapshot and the
+   Bind. The re-read does not overwrite newer controller-accepted metadata;
+   it is used only to confirm the authorization.
+
+3. **Trusted source-evidence boundary (authenticated observer).** `AuthorizeJoin` requires
+   a `BootstrapSourceObserver` — an interface through which a production or test
+   implementation performs an authenticated peer observation and returns a
+   `SourceObservationResult`. The production implementation
+   (`peertls.SourceObserver`) performs a real mTLS peer-status request with:
+   - TLS 1.3 mutual authentication (peer identity established by the mTLS certificate),
+   - response-envelope validation (cluster/epoch match, peer readiness),
+   - same-epoch requirement (the observed peer must report the target epoch),
+   - self-observation rejection (a node cannot validate itself as its own source),
+   - result freshness (stale results are rejected).
+
+   The result carries the observed peer's identity, its reported lifecycle state, and its
+   self-reported cluster/epoch (from the authenticated peer-status response), which the
+   controller validates against the authoritative metadata. The evidence is NOT a trusted
+   boolean: it must be obtained through an authenticated, same-epoch peer observation. The
+   controller validates the result's structure and metadata consistency but does not
+   itself perform peer network calls.
+
+4. **Seed-restart privilege isolation.** The critical regression: a replacement
+   `gossipgrid-0` (same ordinal as the original seed) that has a **join-provenance**
+   binding must **never** be promoted to `READY` through the genesis-restart reconciliation
+   path. This is enforced in three places:
+   - `reconcileSeedRestartLocked`: early return when the binding provenance is `join`.
+   - `validateGenesisPromotion`: rejection when the binding provenance is `join`.
+   - `promoteFromGenesisLocked`: rejection when the binding provenance is `join`.
+
+   The original seed (genesis-provenance binding) restarts to `READY` through the
+   genesis-restart path as before. A replacement seed with a join binding remains
+   `STARTING` (unready) after restart and must go through `AuthorizeJoin` to reach
+   `SYNCING`. The atomic `SetReady` guard additionally validates the binding
+   (`Binding.Validate`), the complete finalized-genesis invariant when a seed is
+   designated, and a positive provenance allowlist: an explicitly-unknown or
+   out-of-range provenance is rejected in ALL states (including `DEGRADED`
+   recovery), while a join-origin `SYNCING` replica cannot achieve initial `READY`
+   promotion during Stage 3A but a valid `DEGRADED` recovery remains allowed.
+
+5. **Context-aware binding operations.** The store `Bind` method accepts a `context.Context`
+   and uses `WithContext` for the SQLite transaction. A cancelled or stopped context
+   aborts the bind transaction, preventing a partial or orphaned binding row from being
+   committed. This is the store-level enforcement that complements the controller-level
+   final guard.
+
+### Migration policy
+
+Pre-Stage 3A databases (created before the `provenance` column existed) are migrated
+automatically by GORM's `AutoMigrate` when the store is first opened. The migration adds
+the `provenance INTEGER NOT NULL DEFAULT 0` column; existing rows (all of which were
+created by `AuthorizeGenesis`) receive the zero-value, which is interpreted as `genesis`
+provenance. This is safe because the only production code path that created bindings
+before Stage 3A was `AuthorizeGenesis`.
+
+**Explicit unknown provenance values fail closed.** If a `local_metadata` row carries a
+provenance value that is not 0, 1, or 2 (for example, 3 or 42), `GetBinding` returns
+`ErrBindingMalformed` and the node fails closed. The node does not interpret the value as
+any known provenance; it refuses to operate. This is verified by
+`TestBindingMigration_ExplicitUnknownProvenanceFailsClosed`.
+
+The migration is verified by `TestBindingMigration_PreStage3ASchema` (a pre-Stage 3A
+schema with only `id`, `cluster_id`, `epoch_id`, `generation`, `created_at` columns is
+migrated to include `provenance` with the correct default) and
+`TestBindingMigration_MessageTablePreserved` (the existing `message` table is preserved
+through the migration).
+
+### Restart behavior
+
+- **Genesis-provenance binding restart:** the original seed (genesis binding) restarts and
+  the genesis-restart reconciliation path promotes it to `READY` (via
+  `reconcileSeedRestartLocked` → `promoteFromGenesisLocked`). The binding is preserved and
+  idempotently re-validated.
+
+- **Join-provenance binding restart:** a replica with a join binding restarts and
+  remains unready. The genesis-restart path is blocked by the provenance gate (and
+  `SetReady` requires genesis provenance for non-DEGRADED states). The node must go
+  through `AuthorizeJoin` (re-observing an eligible source) to reach `SYNCING`.
+  This is verified by `TestOrdinaryJoin_RealTLS_JoinObservation` (an ordinary,
+  non-seed replica joining via the production `BootstrapSourceObserver` over real
+  mTLS, verifying join provenance preservation across a restart, not-READY state,
+  not-bootstrap-source) and by the distinct `TestReplacementSeed_JoinBinding_RestartRemainsUnready`
+  (the ACTUAL canonical replacement-seed restart regression: a replacement
+  `gossipgrid-0` with NodeID=SeedIdentity=`gossipgrid-0` and a join binding, the
+  original controller stopped and its store closed, the SAME database reopened, a
+  genuinely NEW Controller and Machine started through the real metadata
+  reconciliation path — not `SetAcceptedMetadataForTest`, not a forced state, not the
+  stopped controller — must NOT enter GENESIS/READY/DEGRADED, the reopened binding
+  remains join-provenance, and a resume through `AuthorizeJoin` with the production
+  observer reaches SYNCING with all admission restrictions and premature-READY
+  rejection repeated).
+
+- **Join binding idempotent resume:** if a node with a join binding restarts and the
+  metadata still reports the same epoch, `AuthorizeJoin` performs an idempotent
+  `Bind` (same values → no change) and transitions to `SYNCING`.
+
+### What Stage 3A does NOT implement
+
+- Automatic source discovery or selection (Stage 3B).
+- Periodic bootstrap sweep scheduling (Stage 3C).
+- Synchronization-completion `READY` promotion from `SYNCING` (Stage 3D).
+- Production orchestration worker.
+- M5C operator recovery.
+- K8s metadata-schema or RBAC changes.
+- Helm chart or CI changes.
+
+### Stage 3A tests
+
+- `internal/lifecycle/join_test.go`: controller-level tests for `AuthorizeJoin`
+  (authorization-contract tests for valid join, missing/stale/uninitialized metadata,
+  incomplete finalization, conflicting binding, nonempty unbound database, cancellation,
+  stop, wrong-epoch source evidence, non-eligible source, observer error, idempotent
+  resume, genesis binding on non-seed, duplicate concurrent joins, metadata change after
+  bind — plus post-commit race tests using a `postCommitBlockingBindingStore` that
+  commits the binding, signals via a channel, then blocks until the test changes state
+  and releases: stop race, context cancel race, metadata change race, state change race,
+  authority invalidation race, genesis invariant race — plus pre-bind rejection tests:
+  pre-bind context cancel, pre-bind conflicting epoch, pre-bind genesis provenance
+  rejects — plus restart/privilege-isolation tests).
+- `internal/store/binding_provenance_test.go`: real-SQLite tests for the provenance
+  column (join and genesis provenance survive restart, join not relabeled,
+  conflicting epoch cannot replace, malformed provenance fails closed, same-epoch binding
+  idempotent, concurrent bind no conflicting success).
+- `internal/store/binding_test.go`: 2 concurrent bind tests (competing epochs — one
+  winner, one `ErrBindingMismatch`; competing provenance — both succeed, DB preserves
+  winner's provenance).
+- `internal/store/binding_migration_test.go`: 3 migration tests (pre-Stage 3A schema
+  migrated correctly using the exact historical schema from cb213bf — no `provenance`
+  column, populated binding and messages preserved; explicit unknown/legacy provenance
+  inserted via raw SQLite fails closed for Bind but is readable for diagnosis;
+  out-of-range provenance (e.g. 99) returns `ErrBindingMalformed`).
+- `internal/peertls/source_observer_test.go`: 7 real-mTLS tests for the production
+  `BootstrapSourceObserver` (valid observation, wrong identity rejects, unready peer
+  rejects, self-observation rejects, stale result invalid, body/header epoch mismatch
+  rejects, body PodID mismatch with authenticated identity rejects) plus a table-driven
+  test for `validateStrictSourceEnvelope` (13 subtests: missing/duplicate headers, wrong
+  epoch in headers vs expected target, empty header values, missing/wrong
+  lifecycle-active header, incomplete expected target).
+- `cmd/gossipgrid/lifecycle_integration_test.go`: 3 real-mTLS integration tests.
+  `TestOrdinaryJoin_RealTLS_JoinObservation` — real mTLS peer server (TLS 1.3, mTLS
+  handshake), real SQLite store, production `BootstrapSourceObserver` (no static
+  epoch provider, no fake observer), verifying that a canonical seed (gossipgrid-0,
+  genesis binding, forced READY) serves as the bootstrap source for an ordinary
+  replica (gossipgrid-1, empty unbound DB) that joins via `AuthorizeJoin`; the join
+  binding is join-provenance with matching cluster/epoch; the replica transitions
+  to SYNCING; after restart the durable binding is preserved (provenance remains
+  join, cluster/epoch unchanged); the replica is not READY and not a bootstrap
+  source after restart. `TestReplacementSeed_JoinBinding_RestartRemainsUnready` —
+  the ACTUAL canonical replacement-seed restart regression: a replacement
+  gossipgrid-0 with NodeID=SeedIdentity=gossipgrid-0 and a join binding (a join
+  created via `AuthorizeJoin` through the production mTLS observer of source
+  gossipgrid-1 with fully finalized authoritative metadata whose GenesisConsumer is
+  gossipgrid-0); the original replacement controller and services are stopped, the
+  SQLite store is closed, the SAME database path is reopened, a genuinely NEW
+  Controller and Machine are constructed (NodeID=SeedIdentity=gossipgrid-0, a
+  deterministic authoritative metadata source), and `Start` is called on the NEW
+  controller — the real metadata reconciliation path executes (not
+  `SetAcceptedMetadataForTest`, not a forced state, not the stopped controller);
+  the NEW controller must NOT enter GENESIS/READY/DEGRADED; the reopened binding
+  remains join-provenance; resuming via `AuthorizeJoin` with the production observer
+  reaches SYNCING with all admission restrictions and premature-READY rejection
+  repeated; two distinct controller instances exist in the scenario.
+  `TestOriginalSeed_GenesisBinding_RestartPromotesReady` — the original genesis-seed
+  comparison: a real-SQLite regression that establishes genesis provenance through
+  the legitimate genesis authorization path (`AuthorizeGenesis` with a pending-grant
+  metadata), stops and closes the store, reopens the SAME database, starts a NEW
+  controller (canonical seed identity, finalized authoritative metadata), and
+  verifies ACTUAL READY restoration through production reconciliation (reading
+  provenance alone is insufficient; the binding must be valid, the finalization
+  invariant must hold, and the state must permit promotion).
+
+All tests are deterministic and run under `go test` and `go test -race` as part of `make qa`.

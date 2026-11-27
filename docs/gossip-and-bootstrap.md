@@ -8,12 +8,17 @@ binding, epoch fencing, and fail-closed admission (**implemented and locally tes
 implemented; Stage 1A (operator-controlled genesis authorization, Kubernetes genesis grant) is implemented;
 Stage 1B (operator-authorized genesis finalization, one-time idempotent) is implemented; Stage 2 (dedicated
 bootstrap replication admission and guarded `FetchBootstrapBaseline` installation, transport-and-commit
-mechanism) is implemented, committed, and locally tested (not yet cluster-verified); Stage 3 (reconstruction
-orchestration: source discovery/selection, sweep scheduling, controlled `READY` promotion) is designed but not
-implemented. Milestone 5C (operator recovery) is designed but not implemented. Milestone 5B overall is
-**incomplete and not yet cluster-verified**: the one-time genesis authorization and finalization (Stages 1A/1B)
-and the dedicated bootstrap admission and fail-closed authority handling (Stages 0, 2) are implemented; the
-reconstruction orchestration (Stage 3) and operator recovery (5C) remain planned.
+mechanism) is implemented, committed, and locally tested (not yet cluster-verified); Stage 3A (durable binding
+provenance, `AuthorizeJoin` with final authorization guard, trusted source-observation boundary,
+context-aware binding operations, and seed-restart privilege isolation) is implemented and locally tested (not yet
+cluster-verified, uncommitted pending operator review); Stage 3B–3D (reconstruction orchestration: source
+discovery/selection, sweep scheduling, synchronization-completion `READY` promotion) are designed but not
+implemented. Milestone 5C
+(operator recovery) is designed but not implemented. Milestone 5B overall is **incomplete and not yet
+cluster-verified**: the one-time genesis authorization and finalization (Stages 1A/1B), the dedicated bootstrap
+admission and fail-closed authority handling (Stages 0, 2), and the authorized joining and durable binding
+foundation with final guard (Stage 3A) are implemented; the reconstruction orchestration (Stages 3B–3D) and
+operator recovery (5C) remain planned.
 
 **Replication diagram:** The implemented distributed messaging mechanism (local persistence, gossip fanout,
 idempotent peer transfer, retries, and anti-entropy reconciliation toward eventual convergence) is illustrated
@@ -382,10 +387,10 @@ implements operator-authorized genesis finalization (the mechanism that atomical
 the ConfigMap via CAS, consumes the
 authorization, arms `DataLossProtected`, and promotes the seed to `READY` via seed-restart reconciliation). The 5A
 state machine's `GENESIS` state and transition are defined and used by these stages. **What remains planned:**
-Stage 3 implements reconstruction orchestration (source discovery/selection, sweep scheduling, controlled `READY`
-promotion for replacement replicas that join an already-initialized cluster — distinct from one-time genesis) and
-5C implements operator recovery. The full `SYNCING` → `READY` reconstruction path for replacement replicas is
-**not yet complete** (Milestone 5B, Stage 3; Milestone 5C).
+Stage 3 implements reconstruction orchestration (source discovery/selection, sweep scheduling,
+synchronization-completion `READY` promotion for replacement replicas that join an already-initialized cluster —
+distinct from one-time genesis) and 5C implements operator recovery. The full `SYNCING` → `READY` reconstruction
+path for replacement replicas is **not yet complete** (Milestone 5B, Stage 3; Milestone 5C).
 
 ## Milestone 5B — Authoritative metadata and initial synchronization (partially implemented)
 
@@ -441,7 +446,7 @@ boundary, and privilege. They are not interchangeable:
 | **Public-write authorization** | `AuthorizationSnapshot.authorized()` | Before `POST /api/messages` (`CheckWrite`) | Permits the replica to accept public API writes |
 | **Authoritative source eligibility** | `StateSnapshot.IsReady()` + `AuthorizationSnapshot.authorized()` | Before serving any sync data (`CheckBootstrapSourceInbound`) | Permits the replica to serve a bootstrap baseline **or** ordinary sync data to other replicas |
 | **Kubernetes readiness** | `AuthorizationSnapshot.authorized()` | `GET /readyz` and peer `/internal/status` | Controls whether the replica is admitted to the user-facing Service |
-| **Synchronization completion / READY promotion** | Full baseline installed + initial catch-up | `Controller.PromoteToReady` (Stage 3, not yet implemented) | Transitions `SYNCING` → `READY`, enabling all ordinary privileges |
+| **Synchronization completion / READY promotion** | Full baseline installed + initial catch-up | `Controller.PromoteToReady` (Stage 3D, not yet implemented) | Transitions `SYNCING` → `READY`, enabling all ordinary privileges |
 
 ### Bootstrap fetch authorization (requester side)
 
@@ -606,23 +611,90 @@ for a 7A cluster that has no authoritative epoch.
 
 ### Remaining Stage 3 requirements (not yet implemented)
 
-Milestone 5B, Stage 3 will implement the full bootstrap orchestration:
+Milestone 5B, Stage 3A (implemented, locally tested, uncommitted) provides the **authorized joining and
+durable binding foundation** with a final authorization guard:
 
-- **Source discovery and selection** — a `SYNCING` replica must discover eligible sources (peers in `READY` or
-  `DEGRADED` state with a matching epoch) and select one deterministically.
-- **Sweep scheduling** — the bootstrap baseline fetch is a single, bounded transfer (not the periodic
-  anti-entropy loop). Stage 3 defines when and how the sweep is scheduled (e.g., on transition to `SYNCING`,
+- **Durable binding provenance** — every `local_metadata` binding row carries a `provenance` column
+  (`genesis`, `join`, `legacy`) that records how the binding was created. The provenance is persisted
+  atomically with the binding, is immutable, and is validated on read (out-of-range values fail closed
+  with `ErrBindingMalformed`). Pre-Stage 3A databases are migrated by GORM `AutoMigrate` (the zero-value
+  is interpreted as `genesis`; explicit unknown values fail closed). The admission predicates
+  (`AuthorizationSnapshot.authorized` and `bootstrapAuthorized`) each carry a positive provenance
+  allowlist (only `genesis` or `join`): an explicitly-unknown (`legacy`) or out-of-range provenance
+  denies both ordinary participation and bootstrap fetch, independent of the state or metadata
+  checks — the state restriction alone is not sufficient to fail closed an unrecognized provenance.
+- **`AuthorizeJoin` with final authorization guard** — a narrow, explicitly invoked controller operation
+  for beginning an ordinary replica join to an already-initialized cluster epoch. It creates a
+  join-provenance binding and transitions the replica to `SYNCING`. The authorization sequence is:
+  (1) pre-binding validation (no I/O, no locks: caller context live, lifecycle enabled, not stopped,
+  metadata present/fresh/valid/initialized, finalization complete, state permits joining, no conflicting
+  binding); (2) source observation (network I/O, no locks: the trusted observer performs an
+  authenticated mTLS observation, the result is revalidated against the current metadata before any
+  durable write); (3) durable `Bind` (SQLite I/O, no locks: the transaction is the linearization
+  point); (4) post-Bind authoritative re-read (a direct `c.source.Read(ctx)` call validates the
+  re-read observation to confirm the authorization was not revoked between the pre-guard snapshot
+  and the Bind; the re-read does not overwrite newer controller-accepted metadata); (5) final
+  local guard (`c.mu.Lock` + `m.mu.Lock`, no I/O: 14 checks revalidated under the held lock pair,
+  including caller context live, not stopped, controller context live, metadata fresh/valid/matching,
+  the complete finalized-genesis invariant where applicable, binding provenance join, the source
+  observation valid and consistent (via the same single controller-side validator as the pre-binding
+  guard, passing the ORIGINAL pinned target and expected identity from `AuthorizeJoin`), and the
+  legal transition into SYNCING).
+  **Committed bindings are never rolled back**: the SQLite transaction is the linearization point;
+  once it commits, the binding is durable and is preserved on a guard rejection. A subsequent
+  `AuthorizeJoin` call with a restored authorization will find the matching binding and succeed
+  idempotently. It is distinct from `AuthorizeGenesis` (the one-time, operator-authorized first-epoch
+  establishment by the designated seed). A replacement canonical seed follows the ordinary joining
+  contract once the epoch is initialized; its ordinal does not confer genesis privileges.
+- **Trusted source-observation boundary** — `AuthorizeJoin` requires a `BootstrapSourceObserver`
+  (interface) that performs an authenticated mTLS peer-status observation and returns a
+  `SourceObservationResult`. The production implementation (`peertls.BootstrapSourceObserver`)
+  uses a purpose-specific transport path (`doStatusObservationRequest`) that does NOT require the
+  local `EpochProvider` to be configured (production-compatible pre-binding observation: the local
+  database is unbound, so the normal EpochProvider cannot establish an outbound context). It
+  validates: TLS 1.3 mutual authentication (peer identity from the certificate), strict response
+  envelope (unconditional header/body/expected-target triple agreement: both cluster and epoch
+  headers present, exactly one each, nonempty, bounded, matching the pinned expected target AND the
+  status body), lifecycle state READY or DEGRADED, `BootstrapSourceEligible=true`, readiness=true,
+  authenticated PodID matches the certificate identity (not the self-reported value), and
+  self-observation rejection. The result is valid for a bounded TTL (10 seconds, matching
+  `lifecycle.MaxSourceObservationTTL`). The result is not a trusted boolean; it must be obtained
+  through an authenticated, same-epoch peer observation.
+- **Context-aware binding operations** — the store `Bind` accepts a `context.Context` and uses
+  `WithContext` for the SQLite transaction. A cancelled or stopped context aborts the bind, preventing
+  a partial or orphaned binding row.
+- **Seed-restart privilege isolation** — a replacement `gossipgrid-0` with a join-provenance binding
+  must never be promoted to `READY` through the genesis-restart reconciliation path. This is enforced
+  in `reconcileSeedRestartLocked`, `validateGenesisPromotion`, and `promoteFromGenesisLocked`.
+  Additionally, `SetReady` is atomic under a single lock pair (`c.mu.Lock` + `m.mu.Lock`) and requires
+  genesis provenance for non-DEGRADED states; a join-provenance binding in a non-DEGRADED state (e.g.
+  `SYNCING`, where synchronization is not yet complete) is rejected. The guard also validates the
+  binding (`Binding.Validate`), the complete finalized-genesis invariant when a seed is designated,
+  and a positive provenance allowlist: an explicitly-unknown or out-of-range provenance is rejected
+  in ALL states, including `DEGRADED` recovery, while a recognized (`genesis` or `join`) binding is
+  permitted. A join-origin `SYNCING` replica therefore cannot achieve initial `READY` promotion during
+  Stage 3A, but a valid `DEGRADED` recovery remains allowed. `SetSyncingForTest` is a test-only
+  method (the production path for entering SYNCING is `AuthorizeJoin`).
+
+Milestone 5B, Stages 3B–3D will implement the full bootstrap orchestration:
+
+- **Source discovery and selection** (3B) — a `SYNCING` replica must discover eligible sources (peers in
+  `READY` or `DEGRADED` state with a matching epoch) and select one deterministically.
+- **Sweep scheduling** (3C) — the bootstrap baseline fetch is a single, bounded transfer (not the periodic
+  anti-entropy loop). Stage 3C defines when and how the sweep is scheduled (e.g., on transition to `SYNCING`,
   with a bounded retry budget).
-- **Automatic READY promotion** — when the baseline is fully installed and initial catch-up succeeds, the
-  `SYNCING` replica transitions to `READY` (via `Controller.PromoteToReady`). This is the only path to `READY`
-  for a `SYNCING` replica.
-- **Complete sweep accounting** — the bootstrap sweep must track progress (per-peer cursor, completed passes)
-  and handle partial sweeps (page-budget exhaustion) correctly.
+- **Synchronization-completion READY promotion** (3D) — when the baseline is fully installed and initial
+  catch-up succeeds, the `SYNCING` replica transitions to `READY` (via `Controller.PromoteToReady`). This
+  is the only path to `READY` for a `SYNCING` replica.
+- **Complete sweep accounting** (3D) — the bootstrap sweep must track progress (per-peer cursor, completed
+  passes) and handle partial sweeps (page-budget exhaustion) correctly.
 
-**Milestone 5B is NOT complete.** Stages 0, 1A, 1B, and 2 are implemented, committed, and locally tested
-(Stage 2 provides the admission and transport-and-commit mechanism); Stage 3 provides the orchestration
-(source discovery, sweep scheduling, automatic `READY` promotion) that uses it. The initial snapshot transfer
-orchestration (the `SYNCING` → `READY` promotion path) is the remaining work (Stage 3+).
+**Milestone 5B is NOT complete.** Stages 0, 1A, 1B, 2, and 3A are implemented and locally tested (Stage 2
+provides the admission and transport-and-commit mechanism; Stage 3A provides the authorized joining and
+durable binding foundation with final guard, trusted observation boundary, and context-aware binding);
+Stages 3B–3D provide the orchestration (source discovery, sweep scheduling, synchronization-completion
+`READY` promotion) that uses it. The initial snapshot transfer orchestration (the `SYNCING` → `READY`
+promotion path) is the remaining work (Stages 3B–3D).
 
 ### Visual example: the bootstrap admission sequence
 
@@ -635,7 +707,7 @@ predicate) and *pinned* cluster/epoch context, the source's *dedicated* admissio
 message batches*, the requester's *response-consumption* authorization and *envelope* validation,
 and the *guarded* *transactional* *install* (the guard is acquired and validated before the SQLite
 transaction and held through `COMMIT`). The requester *stays `SYNCING`*. The *Stage 3*
-orchestration (source discovery, sweep scheduling, automatic `READY` promotion) is *not
+orchestration (source discovery, sweep scheduling, synchronization-completion `READY` promotion) is *not
 implemented* and is *labeled as such* in the diagram; long method names, the `X-GossipGrid-Request-Purpose`
 header, the lock-ordering details, and the Stage 3 limitations are described in the prose below.
 
@@ -692,9 +764,12 @@ records (the source's eligibility is re-validated per request, not only for the 
 write access if retention is enabled, evaluate the injected retention clock, classify expired
 records, install retained records (`ON CONFLICT DO NOTHING`), check immutable-content conflicts,
 then `COMMIT` (the linearization point) with the guard still held; (7) the requester remains in
-`SYNCING`. Stage 3 (discovery, source selection, sweep scheduling, catch-up orchestration, `READY`
-promotion) is planned, not implemented. The bootstrap commit is not a promotion mechanism; there
-is no `PromoteToReady` method in the current code.
+`SYNCING`. Stage 3A (authorized joining and durable binding foundation: `AuthorizeJoin` with final
+authorization guard, trusted source-observation boundary, binding provenance, context-aware
+binding, seed-restart privilege isolation) is implemented and locally tested (uncommitted).
+Stages 3B–3D (discovery, source selection, sweep scheduling, catch-up orchestration,
+synchronization-completion `READY` promotion) are planned, not implemented. The bootstrap commit is
+not a promotion mechanism; there is no `PromoteToReady` method in the current code.
 
 The rendered diagram is available as
 [concept-bootstrap-admission.svg](diagrams/generated/concept-bootstrap-admission.svg) and
@@ -702,14 +777,91 @@ The rendered diagram is available as
 
 ## Joining an existing epoch
 
-1. Start, open local SQLite, obtain TLS credentials, report the current state.
-2. Learn expected membership and discover peer endpoints.
-3. Ask peers for identity, epoch, and readiness over mTLS.
-4. Select a peer matching the current metadata epoch and eligible to supply a snapshot.
-5. Transfer message IDs/records in bounded, deterministic pages. Preserve IDs, origin, timestamps; upsert
+**Stage 3A (implemented, locally tested, uncommitted):** The authorization is
+implemented by `Controller.AuthorizeJoin` in the following steps: (1) pre-binding
+validation (no I/O, no locks: caller context live, lifecycle enabled, not stopped,
+metadata present/fresh/valid/initialized, finalization complete, state permits
+joining, no conflicting binding); (2) source observation (network I/O, no locks:
+the production `peertls.BootstrapSourceObserver` performs a real mTLS peer-status
+request using a purpose-specific transport path that does NOT require the local
+`EpochProvider` — production-compatible pre-binding observation — and validates
+the strict response envelope with unconditional header/body/expected-target triple
+agreement); (3) pre-binding revalidation after the observation (a FRESH
+authorization snapshot is read; ctx live, not stopped, authority fresh/not stale,
+metadata initialized, finalized-genesis invariant, cluster/epoch match the pinned
+target, state permits joining, binding absent or suitable, and the observation
+revalidated against the current metadata, the pinned target, and the expected peer
+identity — a blocking-observer regression proves an authority change, invalidation,
+or state change accepted during the observation rejects the join BEFORE the
+durable Bind, with the database remaining unbound); (4) durable `Bind` (SQLite I/O,
+no locks: the transaction is the linearization point); (5) post-Bind authoritative
+re-read (a direct `c.source.Read(ctx)` validates the re-read to confirm the
+authorization was not revoked, explicitly requiring `Initialized=true` and the
+complete finalized-genesis invariant where applicable); (6)
+final local guard (`c.mu.Lock` + `m.mu.Lock`, no I/O: all checks revalidated under
+the held lock pair against the FRESH current metadata, with the source
+observation validated by the same single controller-side validator used in the
+pre-binding guard — passing the original pinned target and expected identity —
+and the binding provenance required to be join). Committed bindings are
+never rolled back: the SQLite transaction is the linearization point; once it
+commits, the binding is durable and is preserved on a guard rejection. On success
+the replica has a durable join-provenance binding and is in `SYNCING`. A
+replacement canonical seed follows this same path once the epoch is initialized;
+its ordinal does not confer genesis privileges, and a join-provenance binding is
+never eligible for the genesis-restart `READY` promotion.
+
+The completed Stage 3A integration regressions are in
+`cmd/gossipgrid/lifecycle_integration_test.go`:
+`TestOrdinaryJoin_RealTLS_JoinObservation` (an ordinary, non-seed replica joining
+via the production mTLS observer over a canonical seed, verifying join provenance,
+SYNCING, and not-READY after restart); `TestReplacementSeed_JoinBinding_RestartRemainsUnready`
+(the ACTUAL canonical replacement-seed restart: NodeID=SeedIdentity=gossipgrid-0
+with a join binding; before joining, the unbound requester is asserted to be denied
+both ordinary replication and bootstrap-fetch authorization; the initial join uses
+the normal lifecycle-enabled peer client (wired with the ordinary EpochProvider and
+the dedicated BootstrapEpochProvider) for the purpose-specific pre-binding status
+observation without weakening those boundaries; the original controller is stopped
+and its store closed; the SAME database is reopened; a genuinely NEW Controller and
+Machine are started through the real metadata reconciliation path — not
+`SetAcceptedMetadataForTest`, not a forced state, not the stopped controller — with
+the resumed observer client configured with the same normal providers referencing the
+new controller; the NEW controller does NOT enter GENESIS/READY/DEGRADED; the
+reopened binding remains join-provenance; resuming via `AuthorizeJoin` reaches SYNCING
+with all admission restrictions and premature-READY rejection repeated; two distinct
+controller instances exist in the scenario); and
+`TestOriginalSeed_GenesisBinding_RestartPromotesReady` (the original genesis-seed
+comparison: genesis provenance established through the legitimate `AuthorizeGenesis`
+path; stop/close/reopen the same database; a NEW controller with the canonical
+seed identity and finalized authoritative metadata enters ACTUAL READY through
+production reconciliation — reading provenance alone is insufficient; the binding
+must be valid, the finalization invariant must hold, and the state must permit
+promotion).
+
+The observation's temporal policy is enforced by a single consistent
+controller-side validator (no divergent locked/unlocked copies): a future
+observation timestamp, an invalid or expired lifetime, or a lifetime exceeding the
+maximum (clamped to `MaxSourceObservationTTL` by `NewSourceObservationResult`)
+rejects the joining operation; at both the pre-binding revalidation and the final
+authorization guard, the observation is validated by the SAME validator, passing
+the original pinned target and expected identity from `AuthorizeJoin`, and the
+reported cluster/epoch must match the current authoritative metadata. The
+expired-observation regression
+(`TestAuthorizeJoin_PostCommit_MetadataBarrierStaleObservation`) isolates this
+gate from the metadata-staleness gate: it uses a deterministic clock and a
+sufficiently long metadata poll interval so the authoritative metadata stays
+fresh and valid across a controlled clock advance past the observation's
+expiration; the committed binding is preserved, the replica does not acquire
+unauthorized participation, and the final guard rejects specifically because the
+source observation expired. A separate regression covers the metadata-staleness
+gate. The observer is an explicitly trusted in-process dependency; the Go type is
+an engineering control, not a security boundary against an in-process attacker.
+
+The remaining steps (sweep, catch-up, `READY` promotion) are Stages 3B–3D (designed, not implemented):
+
+1. Transfer message IDs/records in bounded, deterministic pages. Preserve IDs, origin, timestamps; upsert
    idempotently.
-6. Reconcile changes occurring during the transfer. Eventual periodic anti-entropy remains required even after ready.
-7. Mark locally ready when a consistent baseline is installed and initial catch-up succeeds; continue reconciliation
+2. Reconcile changes occurring during the transfer. Eventual periodic anti-entropy remains required even after ready.
+3. Mark locally ready when a consistent baseline is installed and initial catch-up succeeds; continue reconciliation
    in background.
 
 If no valid source can be found, do **not** silently initialize an empty epoch. Report `RECOVERY_REQUIRED` or a more

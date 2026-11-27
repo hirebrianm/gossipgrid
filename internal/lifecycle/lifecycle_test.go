@@ -569,7 +569,7 @@ func (s *memoryBindingStore) GetBinding() (*DatabaseBinding, error) {
 	b := *s.binding
 	return &b, nil
 }
-func (s *memoryBindingStore) Bind(clusterID, epochID string, generation int) (*DatabaseBinding, error) {
+func (s *memoryBindingStore) Bind(_ context.Context, clusterID, epochID string, generation int, provenance BindingProvenance) (*DatabaseBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.binding != nil {
@@ -579,7 +579,7 @@ func (s *memoryBindingStore) Bind(clusterID, epochID string, generation int) (*D
 		b := *s.binding
 		return &b, nil
 	}
-	b := &DatabaseBinding{ClusterID: clusterID, EpochID: epochID, Generation: generation}
+	b := &DatabaseBinding{ClusterID: clusterID, EpochID: epochID, Generation: generation, Provenance: provenance}
 	s.binding = b
 	cp := *b
 	return &cp, nil

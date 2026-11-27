@@ -43,7 +43,7 @@ func (s *realBindingStore) GetBinding() (*lifecycle.DatabaseBinding, error) {
 	return s.binding, nil
 }
 
-func (s *realBindingStore) Bind(clusterID, epochID string, generation int) (*lifecycle.DatabaseBinding, error) {
+func (s *realBindingStore) Bind(_ context.Context, clusterID, epochID string, generation int, provenance lifecycle.BindingProvenance) (*lifecycle.DatabaseBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b := &lifecycle.DatabaseBinding{
@@ -51,6 +51,7 @@ func (s *realBindingStore) Bind(clusterID, epochID string, generation int) (*lif
 		EpochID:    epochID,
 		Generation: generation,
 		CreatedAt:  time.Now(),
+		Provenance: provenance,
 	}
 	s.binding = b
 	return b, nil

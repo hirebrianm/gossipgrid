@@ -266,7 +266,7 @@ daemon.
 make build       # compile the binary into ./bin/gossipgrid (FIPS-enabled by default)
 make run         # build and run locally (default config: :8080, hostname node)
 make qa          # validation only: verify fmt, vet, lint, security, unit tests, race detection
-make all         # generate diagrams, build the application, and run QA (sequential)
+make all         # run QA, generate diagrams, and build the application (sequential)
 make lint        # run golangci-lint (fails on findings)
 make security    # run gosec security scan (fails on actionable findings)
 make test        # unit tests only
@@ -289,8 +289,8 @@ the repository:
   `.mmd` sources to a temporary directory to confirm they render without error; it never touches
   the committed outputs.
 - `make build` — explicit binary compilation into `./bin/gossipgrid`.
-- `make all` — the explicit aggregate workflow: `make architecture`, then `make build`, then
-  `make qa`, run sequentially (not concurrently under `make -j`). It does not include image
+- `make all` — the explicit aggregate workflow: `make qa`, then `make architecture`, then
+  `make build`, run sequentially (not concurrently under `make -j`). It does not include image
   publication, deployment, contact sheets, `fmt`, or `clean`.
 - `make clean` — explicit build-artifact removal (the persistent binary only).
 

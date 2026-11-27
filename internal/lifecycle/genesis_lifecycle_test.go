@@ -37,7 +37,7 @@ func (s *fakeBindingStoreWithMessages) GetBinding() (*DatabaseBinding, error) {
 	return s.binding, nil
 }
 
-func (s *fakeBindingStoreWithMessages) Bind(clusterID, epochID string, generation int) (*DatabaseBinding, error) {
+func (s *fakeBindingStoreWithMessages) Bind(_ context.Context, clusterID, epochID string, generation int, provenance BindingProvenance) (*DatabaseBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.bindErr != nil {
@@ -51,8 +51,14 @@ func (s *fakeBindingStoreWithMessages) Bind(clusterID, epochID string, generatio
 	if s.binding == nil && s.messageCount > 0 {
 		return nil, errors.New("database is nonempty without a binding")
 	}
-	// An empty, unbound database: create the binding.
-	b := &DatabaseBinding{ClusterID: clusterID, EpochID: epochID, Generation: generation, CreatedAt: time.Now()}
+	// Idempotent: a matching binding already exists (same cluster/epoch).
+	// Preserve the existing binding unchanged (no overwrite, no relabel).
+	// This mirrors the real Store.Bind idempotency contract.
+	if s.binding != nil {
+		return s.binding, nil
+	}
+	// An empty, unbound database: create the binding with the given provenance.
+	b := &DatabaseBinding{ClusterID: clusterID, EpochID: epochID, Generation: generation, CreatedAt: time.Now(), Provenance: provenance}
 	s.binding = b
 	return b, nil
 }

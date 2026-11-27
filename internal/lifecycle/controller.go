@@ -39,10 +39,13 @@ type BindingStore interface {
 	// binding exists.
 	GetBinding() (*DatabaseBinding, error)
 	// Bind atomically and idempotently binds the database to the given
-	// cluster and epoch. It returns an error when the database is already
-	// bound to a different cluster or epoch, or when the database is
-	// nonempty without a binding.
-	Bind(clusterID, epochID string, generation int) (*DatabaseBinding, error)
+	// cluster and epoch with the given provenance. It returns an error when
+	// the database is already bound to a different cluster or epoch, or when
+	// the database is nonempty without a binding. The provenance is stored
+	// atomically with the binding and is immutable through subsequent binds
+	// (an idempotent re-bind to the same values preserves the existing
+	// provenance; a conflicting bind fails with ErrBindingMismatch).
+	Bind(ctx context.Context, clusterID, epochID string, generation int, provenance BindingProvenance) (*DatabaseBinding, error)
 	// CountMessages returns the total number of messages in the local store.
 	CountMessages() (int64, error)
 }
@@ -492,6 +495,25 @@ func reconcileSeedRestartLocked(c *Controller, newMeta *ClusterMetadata) {
 		return
 	}
 
+	// Stage 3A: binding provenance check. Only a positive genesis
+	// provenance may satisfy the genesis-restart shortcut. A
+	// join-provenance binding (the ordinary replica joining path) or an
+	// explicitly-unknown (legacy) binding must NEVER authorize the
+	// genesis-restart reconciliation: the reconciliation (which can
+	// promote to READY or re-establish GENESIS) requires the one-time,
+	// operator-authorized genesis origin, not a matching
+	// NodeID/SeedIdentity/GenesisConsumer alone.
+	if binding != nil && binding.Provenance != ProvenanceGenesis {
+		// The binding is not genesis-provenance: this is a replacement or
+		// additional replica (join provenance) or a historical unknown-
+		// provenance binding (legacy). The genesis-restart reconciliation
+		// (which can promote to READY) must NOT apply. The replica is left
+		// in its current state (STARTING or SYNCING); the metadata worker's
+		// reevaluateState will handle the matching binding case (the
+		// "state is maintained" path — not auto-promoted).
+		return
+	}
+
 	// Temporary metadata API failure: the authority is not "fresh" or the
 	// observation is stale. The seed is left unchanged (no
 	// RECOVERY_REQUIRED) so a later fresh observation can restore the
@@ -646,6 +668,14 @@ func (c *Controller) promoteFromGenesisLocked(m *Machine, meta *ClusterMetadata,
 	if !binding.MatchesMetadata(*meta) {
 		return fmt.Errorf("cannot promote from GENESIS: local binding (%s/%s) does not match authoritative metadata (%s/%s)",
 			binding.ClusterID, binding.EpochID, meta.ClusterID, meta.EpochID)
+	}
+	// Stage 3A: only a positive genesis provenance may authorize the
+	// genesis-promotion path. A join-provenance binding (the ordinary
+	// replica joining path) or an explicitly-unknown (legacy) binding must
+	// never satisfy the genesis-restart promotion: the promotion requires
+	// the one-time, operator-authorized genesis origin.
+	if binding.Provenance != ProvenanceGenesis {
+		return fmt.Errorf("cannot promote from GENESIS: local binding has provenance %s (only genesis provenance may authorize genesis promotion; join and explicitly-unknown bindings fail closed)", binding.Provenance)
 	}
 	state := m.state
 	if state != GENESIS && state != DISCOVERING {
@@ -855,6 +885,15 @@ func (c *Controller) validateGenesisPromotion() error {
 			binding.ClusterID, binding.EpochID,
 			meta.ClusterID, meta.EpochID)
 	}
+	// Stage 3A: only a positive genesis provenance may authorize the
+	// genesis-promotion path. A join-provenance binding (the ordinary
+	// replica joining path) or an explicitly-unknown (legacy) binding must
+	// never satisfy the genesis-restart promotion: the promotion requires
+	// the one-time, operator-authorized genesis origin, not a matching
+	// NodeID/SeedIdentity/GenesisConsumer alone.
+	if binding.Provenance != ProvenanceGenesis {
+		return fmt.Errorf("cannot promote from GENESIS: local binding has provenance %s (only genesis provenance may authorize genesis promotion; join and explicitly-unknown bindings fail closed)", binding.Provenance)
+	}
 	return nil
 }
 
@@ -931,6 +970,17 @@ func (c *Controller) genesisEntryGuarded(b *DatabaseBinding) genesisEntryOutcome
 		return genesisEntryRevoked
 	}
 	if !meta.MatchesBinding(b) {
+		return genesisEntryRevoked
+	}
+	// The binding must have POSITIVE GENESIS PROVENANCE (Stage 3A
+	// provenance gate). A join-provenance binding (the ordinary replica
+	// joining path) or an explicitly-unknown (legacy) binding must NOT
+	// authorize GENESIS entry: only the one-time, operator-authorized
+	// genesis operation (ProvenanceGenesis) positively establishes the
+	// genesis origin. A binding with a mismatched or unknown provenance
+	// fails closed: the seed must not enter GENESIS based solely on a
+	// matching NodeID/SeedIdentity/GenesisConsumer.
+	if b.Provenance != ProvenanceGenesis {
 		return genesisEntryRevoked
 	}
 	// The state must permit a transition to GENESIS.
@@ -1067,37 +1117,103 @@ func (c *Controller) transitionTo(to State, reason string) error {
 // alone does not prove baseline synchronization completed; that policy is
 // Milestone 5B's job. SetReady therefore never silently binds a database.
 //
-// Lock-order contract: c.mu RLock → m.mu Lock (via transitionTo). The
-// authorization snapshot read (c.mu RLock + m.mu RLock) is followed by the
-// transition (c.mu RLock + m.mu Lock), both following the same lock order.
+// Lock-order contract: c.mu.Lock → m.mu.Lock (the established write-lock
+// order). The entire authorization check and the READY transition are
+// evaluated atomically under a single pair of locks, so a concurrent
+// metadata update (which takes c.mu.Lock) cannot interleave between the
+// check and the transition.
 func (c *Controller) SetReady(reason string) error {
-	snap := c.authorization()
-	if snap.Stopped {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.machine
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 1. Controller not stopped.
+	if c.stopped {
 		return fmt.Errorf("cannot set READY: controller is stopped")
 	}
-	if snap.Metadata == nil {
+	// 2. Current accepted metadata exists.
+	if c.accepted == nil {
 		return fmt.Errorf("cannot set READY: no authoritative metadata observation")
 	}
-	if !snap.Metadata.Initialized {
+	// 3. Metadata initialized.
+	if !c.accepted.Initialized {
 		return fmt.Errorf("cannot set READY: authoritative metadata reports Initialized=false (the cluster must be initialized before promotion)")
 	}
-	if snap.AuthorityState != "fresh" || snap.Stale {
-		return fmt.Errorf("cannot set READY: authoritative metadata is not fresh (authority=%s, stale=%v)", snap.AuthorityState, snap.Stale)
+	// 4. Authority fresh, not stale.
+	stale := false
+	if !c.freshAt.IsZero() {
+		stale = c.now().After(c.freshAt.Add(c.cfg.MetadataPollInterval * 2))
 	}
-	if snap.Binding == nil {
-		// A missing binding is NOT a signal to silently create one. The
-		// database must be explicitly bound to the authorized epoch by an
-		// operator action (Milestone 5B) before the replica can become
-		// READY. Rejecting here prevents a legacy or uninitialized database
-		// from being silently bound and promoted.
+	if c.authorityState != "fresh" || stale {
+		return fmt.Errorf("cannot set READY: authoritative metadata is not fresh (authority=%s, stale=%v)", c.authorityState, stale)
+	}
+	// 5. Valid metadata.
+	if vErr := c.accepted.Validate(); vErr != nil {
+		return fmt.Errorf("cannot set READY: authoritative metadata is malformed: %w", vErr)
+	}
+	// 6. Binding exists.
+	binding := c.bindingVal
+	if binding == nil && c.binding != nil {
+		b, err := c.binding.GetBinding()
+		if err != nil {
+			c.logger.Warn("reading local database binding failed",
+				slog.Any("error", err),
+			)
+		} else {
+			binding = b
+		}
+	}
+	if binding == nil {
+		// A missing binding is NOT a signal to silently create one.
 		return fmt.Errorf("cannot set READY: no local database binding (the database must be explicitly bound to the authorized epoch)")
 	}
-	if !snap.Binding.MatchesMetadata(*snap.Metadata) {
-		return fmt.Errorf("cannot set READY: local binding (%s/%s) does not match authoritative metadata (%s/%s)",
-			snap.Binding.ClusterID, snap.Binding.EpochID,
-			snap.Metadata.ClusterID, snap.Metadata.EpochID)
+	// 7a. The binding must be structurally valid (nonempty cluster/epoch,
+	// recognized provenance). A malformed binding must not authorize
+	// promotion.
+	if vErr := binding.Validate(); vErr != nil {
+		return fmt.Errorf("cannot set READY: local binding is malformed: %w", vErr)
 	}
-	return c.transitionTo(READY, reason)
+	// 7b. Binding matches metadata.
+	if !binding.MatchesMetadata(*c.accepted) {
+		return fmt.Errorf("cannot set READY: local binding (%s/%s) does not match authoritative metadata (%s/%s)",
+			binding.ClusterID, binding.EpochID,
+			c.accepted.ClusterID, c.accepted.EpochID)
+	}
+	// 7c. Positive provenance allowlist (Stage 3A): the binding's provenance
+	// must be explicitly recognized as genesis or join. An explicitly-
+	// unknown (legacy) marker or any out-of-range value is rejected in ALL
+	// states, including DEGRADED: an unknown provenance authorizes neither
+	// an initial promotion nor a recovery, and must fail closed.
+	if !binding.Provenance.isRecognized() {
+		return fmt.Errorf("cannot set READY: local binding provenance %s is not a recognized value (only genesis or join provenance may authorize READY; unknown or out-of-range provenance is rejected in all states, including DEGRADED recovery)", binding.Provenance)
+	}
+	// 7d. Complete finalized-genesis invariant when a seed is designated.
+	// A join-origin replica (or any replica) must not be promoted to READY
+	// while the authoritative record is only initialized but not completely
+	// finalized for the designated seed.
+	if c.cfg.SeedIdentity != "" && !c.finalizationComplete(c.accepted) {
+		return fmt.Errorf("cannot set READY: authoritative metadata is not a completely finalized record for the designated seed (Initialized=%v GenesisAuthorized=%v GenesisConsumer=%q DataLossProtected=%v)",
+			c.accepted.Initialized, c.accepted.GenesisAuthorized, c.accepted.GenesisConsumer, c.accepted.DataLossProtected)
+	}
+	// 8. Binding provenance must be genesis for initial READY promotion.
+	// A join-provenance or explicitly-unknown (legacy) binding must NOT
+	// permit initial READY promotion: the joining operation places the
+	// replica in SYNCING and baseline synchronization is not yet complete.
+	// Only a genesis-provenance binding may authorize initial READY
+	// promotion. A DEGRADED → READY recovery transition does NOT require
+	// genesis provenance (the binding was already established and the
+	// replica was previously READY; this is a recovery, not an initial
+	// promotion).
+	if m.state != DEGRADED && binding.Provenance != ProvenanceGenesis {
+		return fmt.Errorf("cannot set READY: local binding has provenance %s (initial READY promotion requires genesis provenance; join provenance is rejected because synchronization is not yet complete; unknown/legacy provenance is rejected in all states)", binding.Provenance)
+	}
+	// 9. Legal transition to READY (the transition table is enforced).
+	if err := m.transitionLocked(READY, reason); err != nil {
+		return fmt.Errorf("cannot set READY: lifecycle state %s does not permit transition to READY: %w", m.state, err)
+	}
+	return nil
 }
 
 // SetReadyForTest is an exported test-only method that promotes the
@@ -1273,6 +1389,21 @@ func (c *Controller) AuthorizeGenesis(ctx context.Context) error {
 			return fmt.Errorf("cannot authorize genesis: existing local binding (%s/%s) conflicts with the authorized epoch (%s/%s); fail-closed, the binding is preserved",
 				binding.ClusterID, binding.EpochID, meta.ClusterID, meta.EpochID)
 		}
+		// Stage 3A: an existing join-provenance or explicitly-unknown
+		// (legacy) binding must be REJECTED before the genesis operation.
+		// Only a positive genesis provenance (or a nil binding, which is
+		// the first-time case) may authorize genesis entry. A
+		// join-provenance binding (the ordinary replica joining path) or
+		// an explicitly-unknown binding must never be repurposed as
+		// genesis: the genesis operation requires the one-time,
+		// operator-authorized genesis origin, not a matching
+		// NodeID/SeedIdentity/GenesisConsumer alone.
+		if binding.Provenance == ProvenanceJoin {
+			return fmt.Errorf("cannot authorize genesis: existing local binding has join provenance (the replica joined an already-initialized epoch); a join binding cannot be repurposed as genesis (fail-closed, the binding is preserved)")
+		}
+		if binding.Provenance == ProvenanceLegacy {
+			return fmt.Errorf("cannot authorize genesis: existing local binding has explicitly-unknown (legacy) provenance (a fail-closed historical binding does not positively establish genesis origin; the binding is preserved)")
+		}
 	}
 
 	// Perform the atomic, idempotent SQLite Bind. This is the single
@@ -1296,10 +1427,29 @@ func (c *Controller) AuthorizeGenesis(ctx context.Context) error {
 		// reuse it unchanged.
 		b = binding
 	} else {
-		b, bindErr = c.binding.Bind(meta.ClusterID, meta.EpochID, meta.Generation)
+		b, bindErr = c.binding.Bind(ctx, meta.ClusterID, meta.EpochID, meta.Generation, ProvenanceGenesis)
 	}
 	if bindErr != nil {
 		return fmt.Errorf("cannot authorize genesis: binding local database to authorized epoch: %w", bindErr)
+	}
+	if b == nil {
+		return errors.New("cannot authorize genesis: binding transaction returned a nil result (fail-closed; the database is unchanged)")
+	}
+	// Validate the actual returned binding (an idempotent Bind can return
+	// the winner of a concurrent binding operation with different provenance).
+	if vErr := b.Validate(); vErr != nil {
+		return fmt.Errorf("cannot authorize genesis: returned binding is malformed: %w", vErr)
+	}
+	if b.ClusterID != meta.ClusterID || b.EpochID != meta.EpochID {
+		return fmt.Errorf("cannot authorize genesis: returned binding (%s/%s) does not match the authorized epoch (%s/%s); fail-closed",
+			b.ClusterID, b.EpochID, meta.ClusterID, meta.EpochID)
+	}
+	// Stage 3A: the returned binding must have positive genesis provenance.
+	// An idempotent Bind can return the winner of a concurrent binding
+	// operation with different provenance; a join or legacy-provenance
+	// winner must not be consumed as a genesis binding.
+	if b.Provenance != ProvenanceGenesis {
+		return fmt.Errorf("cannot authorize genesis: returned binding has provenance %s (expected genesis; a concurrent binding operation may have created a different-provenance binding); fail-closed, the binding is preserved", b.Provenance)
 	}
 
 	// Re-read the authoritative metadata after the durable Bind. The
@@ -1460,9 +1610,21 @@ func (c *Controller) SetDiscovering(reason string) error {
 	return c.transitionTo(DISCOVERING, reason)
 }
 
-// SetSyncing transitions the controller to SYNCING.
+// SetSyncingForTest is an exported test-only method that transitions the
+// controller to SYNCING, bypassing the AuthorizeJoin source-observation
+// contract. It exists SOLELY to support tests that need a SYNCING controller
+// without the full AuthorizeJoin flow. Production code MUST NOT call this:
+// the production path to SYNCING for an ordinary joining replica is
+// AuthorizeJoin (which performs the complete pre-binding validation, the
+// authenticated source observation, the durable Bind, the post-Bind
+// authoritative re-read, and the final local guard). A SYNCING state without
+// the complete source-observation contract would allow a joining replica to
+// bypass the required authenticated peer evidence.
+//
+// It still enforces the transition table (the current state must permit a
+// transition to SYNCING) so it cannot force an arbitrary state.
 // Lock-order contract: c.mu RLock → m.mu Lock (via transitionTo).
-func (c *Controller) SetSyncing(reason string) error {
+func (c *Controller) SetSyncingForTest(reason string) error {
 	return c.transitionTo(SYNCING, reason)
 }
 
@@ -1647,6 +1809,16 @@ func (s AuthorizationSnapshot) authorized() bool {
 	if s.Binding == nil {
 		return false
 	}
+	// Stage 3A: positive provenance allowlist. A binding whose provenance is
+	// not explicitly genesis or join (an unknown, out-of-range, or otherwise
+	// unrecognised value) must NOT authorize participation, independent of
+	// state or metadata validity. This is a mandatory architectural gate:
+	// the state restriction alone is not sufficient (a matching, valid,
+	// fresh, ready-state binding with an unknown provenance must still fail
+	// closed).
+	if !s.Binding.Provenance.isRecognized() {
+		return false
+	}
 	if !s.Binding.MatchesMetadata(*s.Metadata) {
 		return false
 	}
@@ -1705,6 +1877,12 @@ func (s AuthorizationSnapshot) bootstrapAuthorized() bool {
 	if s.Binding == nil {
 		return false
 	}
+	// Stage 3A: positive provenance allowlist (same as authorized()). A
+	// binding whose provenance is not explicitly genesis or join must NOT
+	// authorize a bootstrap fetch, independent of state or metadata validity.
+	if !s.Binding.Provenance.isRecognized() {
+		return false
+	}
 	if !s.Binding.MatchesMetadata(*s.Metadata) {
 		return false
 	}
@@ -1737,6 +1915,11 @@ func (s AuthorizationSnapshot) bootstrapAuthorizationReason() string {
 	}
 	if s.Binding == nil {
 		return "no local database binding (the replica must be bound before fetching a baseline)"
+	}
+	if !s.Binding.Provenance.isRecognized() {
+		return "local binding provenance is not a recognized value (" +
+			s.Binding.Provenance.String() +
+			"; only genesis or join provenance authorizes a bootstrap fetch)"
 	}
 	if !s.Binding.MatchesMetadata(*s.Metadata) {
 		return "local binding does not match authoritative epoch (binding=" +
@@ -1804,6 +1987,11 @@ func (s AuthorizationSnapshot) authorizationReason() string {
 	}
 	if s.Binding == nil {
 		return "no local database binding"
+	}
+	if !s.Binding.Provenance.isRecognized() {
+		return "local binding provenance is not a recognized value (" +
+			s.Binding.Provenance.String() +
+			"; only genesis or join provenance authorizes ordinary participation)"
 	}
 	if !s.Binding.MatchesMetadata(*s.Metadata) {
 		return "local binding does not match authoritative epoch (binding=" +

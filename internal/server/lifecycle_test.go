@@ -93,7 +93,7 @@ func makeControllerWithMetadata(t *testing.T, state lifecycle.State, meta *lifec
 	st := newTestStore(t)
 	// Bind the store to the metadata so the controller can be authorized.
 	// The bind is done while the database is empty.
-	if _, err := st.Bind(meta.ClusterID, meta.EpochID, meta.Generation); err != nil {
+	if _, err := st.Bind(context.Background(), meta.ClusterID, meta.EpochID, meta.Generation, lifecycle.ProvenanceGenesis); err != nil {
 		t.Fatalf("binding test store: %v", err)
 	}
 

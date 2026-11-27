@@ -64,7 +64,7 @@ func (s *blockingBindingStore) GetBinding() (*DatabaseBinding, error) {
 	return s.binding, nil
 }
 
-func (s *blockingBindingStore) Bind(clusterID, epochID string, generation int) (*DatabaseBinding, error) {
+func (s *blockingBindingStore) Bind(_ context.Context, clusterID, epochID string, generation int, provenance BindingProvenance) (*DatabaseBinding, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b := &DatabaseBinding{
@@ -72,6 +72,7 @@ func (s *blockingBindingStore) Bind(clusterID, epochID string, generation int) (
 		EpochID:    epochID,
 		Generation: generation,
 		CreatedAt:  time.Now(),
+		Provenance: provenance,
 	}
 	s.binding = b
 	return b, nil

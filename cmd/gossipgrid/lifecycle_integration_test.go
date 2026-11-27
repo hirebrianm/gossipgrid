@@ -61,6 +61,7 @@ type lifecycleTestNode struct {
 	peerAddr   string
 	publicAddr string
 	podID      string
+	dbPath     string // absolute path to the node's SQLite database file
 }
 
 // synchronizedPeerHandler is a test-only http.Handler wrapper that holds an
@@ -110,6 +111,14 @@ type nodeTestOpts struct {
 	// to match the peer client's RequestTimeout so the regression is caught
 	// if an engine-level shared deadline is reintroduced.
 	aEngineRequestTimeout time.Duration
+	// seedIdentity, when non-empty, configures the controller's designated
+	// seed identity (Config.SeedIdentity). The default is empty (no seed
+	// designated — the ordinary 5A/5B behavior). A test that exercises the
+	// genesis-managed lifecycle (AuthorizeGenesis, the seed-restart
+	// reconciliation, the genesis-finalization invariant) sets this to the
+	// node's own pod ID (e.g. "gossipgrid-0") so the node is the designated
+	// seed.
+	seedIdentity string
 }
 
 // newLifecycleTestNode creates and starts a controller-driven lifecycle test
@@ -148,12 +157,13 @@ func newLifecycleTestNode(t *testing.T, ca *testCA, podID string, opts nodeTestO
 		mgr.Shutdown()
 		t.Fatalf("%s: store: %v", podID, err)
 	}
+	dbPath := filepath.Join(dir, "gossipgrid.db")
 
 	// Bind the store to the given cluster/epoch BEFORE startup when requested.
 	// A nonempty database without a binding cannot be bound, so the bind is
 	// done while the database is empty.
 	if opts.bindTo != nil {
-		if _, err := st.Bind(opts.bindTo.ClusterID, opts.bindTo.EpochID, opts.bindTo.Generation); err != nil {
+		if _, err := st.Bind(context.Background(), opts.bindTo.ClusterID, opts.bindTo.EpochID, opts.bindTo.Generation, lifecycle.ProvenanceGenesis); err != nil {
 			mgr.Shutdown()
 			_ = st.Close()
 			t.Fatalf("%s: binding store: %v", podID, err)
@@ -167,6 +177,7 @@ func newLifecycleTestNode(t *testing.T, ca *testCA, podID string, opts nodeTestO
 	ctrl := lifecycle.NewController(lifecycle.Config{
 		MetadataPollInterval: time.Second,
 		NodeID:               podID,
+		SeedIdentity:         opts.seedIdentity,
 		Enabled:              true,
 	}, machine, src, st, nil)
 
@@ -325,6 +336,7 @@ func newLifecycleTestNode(t *testing.T, ca *testCA, podID string, opts nodeTestO
 		peerAddr:   peerAddr,
 		publicAddr: publicAddr,
 		podID:      podID,
+		dbPath:     dbPath,
 	}
 
 	// Serve through the retained listeners (do NOT call ListenAndServe,
@@ -460,6 +472,27 @@ func (n *lifecycleTestNode) setMetadata(meta lifecycle.ClusterMetadata) {
 		// RECOVERY_REQUIRED for a mismatch).
 		return s.Metadata != nil && s.Metadata.ClusterID == meta.ClusterID && s.Metadata.EpochID == meta.EpochID
 	})
+}
+
+// stop shuts down the node's controller, peer server, public server, and
+// manager, and closes the store. It is idempotent-safe for tests that need
+// to stop a node mid-test (the t.Cleanup in newLifecycleTestNode will
+// re-invoke these; double-stop/shutdown/close are no-ops on the underlying
+// components).
+func (n *lifecycleTestNode) stop() {
+	n.t.Helper()
+	ctx := context.Background()
+	if n.gEngine != nil {
+		n.gEngine.Stop(ctx)
+	}
+	if n.aEngine != nil {
+		n.aEngine.Stop(ctx)
+	}
+	_ = n.publicSrv.Shutdown(ctx)
+	_ = n.peerSrv.Shutdown(ctx)
+	n.ctrl.Stop(ctx)
+	n.mgr.Shutdown()
+	_ = n.store.Close()
 }
 
 // waitForAuthorization polls the controller's authorization snapshot until the
@@ -1327,7 +1360,7 @@ func TestControllerDrivenRestartMatchingBindingSafe(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	// Bind and seed while "running" the first time.
-	if _, err := st.Bind(meta.ClusterID, meta.EpochID, meta.Generation); err != nil {
+	if _, err := st.Bind(context.Background(), meta.ClusterID, meta.EpochID, meta.Generation, lifecycle.ProvenanceGenesis); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	if _, err := st.CreateLocalMessage("gossipgrid-0", "pre-restart"); err != nil {
@@ -1400,7 +1433,7 @@ func TestControllerDrivenRestartConflictingBindingLockedOut(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	// Bind to epoch A.
-	if _, err := st.Bind(metaA.ClusterID, metaA.EpochID, metaA.Generation); err != nil {
+	if _, err := st.Bind(context.Background(), metaA.ClusterID, metaA.EpochID, metaA.Generation, lifecycle.ProvenanceGenesis); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	_ = st.Close()
@@ -1810,6 +1843,555 @@ func waitForCounter(t *testing.T, name string, pred func() bool, deadline time.D
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("%s: condition not met within %v", name, deadline)
+}
+
+// TestOrdinaryJoin_RealTLS_JoinObservation is the real-mTLS regression test
+// for the ordinary joining scenario: a canonical seed (gossipgrid-0) with a
+// genesis binding serves as the bootstrap source for an ordinary replica
+// (gossipgrid-1, NodeID != SeedIdentity) that joins the already-initialized
+// epoch through AuthorizeJoin. The join uses the production source
+// observation path (peertls.BootstrapSourceObserver over real mTLS) — NOT a
+// static epoch provider or a fake observer.
+//
+// Steps:
+//  1. Start the canonical seed (gossipgrid-0) with a genesis binding
+//     (real SQLite) and force it to READY. Set its metadata to the
+//     initialized epoch.
+//  2. Start the joining replica (gossipgrid-1) with an empty, unbound
+//     database (real SQLite). Set its metadata to the same initialized
+//     epoch.
+//  3. The joining replica performs a REAL mTLS observation of the seed
+//     through peertls.BootstrapSourceObserver (production observer, real
+//     TLS 1.3 mTLS, GET /internal/status over mTLS).
+//  4. The joining replica calls AuthorizeJoin with the production
+//     observer. The join succeeds: a join-provenance durable binding is
+//     created and the replica transitions to SYNCING.
+//  5. Verify the join binding: cluster/epoch match the authoritative
+//     metadata, provenance is join (not genesis).
+//  6. Restart the joining replica (stop controller, close store, reopen
+//     store, start new controller with the same database). The durable
+//     binding is preserved: provenance remains join, cluster/epoch
+//     unchanged. The replica does NOT transition to READY through the
+//     join path (SetReady rejects join provenance for a non-DEGRADED
+//     state).
+//
+// This test verifies the production join path end-to-end: real mTLS
+// observation, real SQLite binding, legal state transition, and durable
+// binding preservation across restart. It is the ORDINARY joining test
+// (a non-seed replica); the replacement-seed restart regression
+// (TestReplacementSeed_JoinBinding_RestartRemainsUnready) is a distinct,
+// separate test.
+func TestOrdinaryJoin_RealTLS_JoinObservation(t *testing.T) {
+	ctx := context.Background()
+	ca := newTestCA(t, "cs-1")
+	meta := lifecycle.ClusterMetadata{
+		ClusterID:         "c-canonical",
+		EpochID:           "e-canonical",
+		Generation:        1,
+		Initialized:       true,
+		GenesisConsumer:   "gossipgrid-0",
+		DataLossProtected: true,
+	}
+
+	// Step 1: Start the canonical seed (gossipgrid-0) with a genesis
+	// binding (real SQLite) and force it to READY. The seed's peer server
+	// serves /internal/status over real mTLS, reporting READY and
+	// BootstrapSourceEligible=true.
+	seedNode := newLifecycleTestNode(t, ca, "gossipgrid-0", nodeTestOpts{
+		bindTo:     &meta,
+		forceState: lifecycle.READY,
+	})
+	seedNode.setMetadata(meta)
+
+	// Step 2: Start the joining replica (gossipgrid-1) with an empty,
+	// unbound database (real SQLite). Its state is STARTING (no forced
+	// state). Set its metadata to the same initialized epoch.
+	joinNode := newLifecycleTestNode(t, ca, "gossipgrid-1", nodeTestOpts{})
+	joinNode.setMetadata(meta)
+
+	// Step 3: The joining replica performs a REAL mTLS observation of the
+	// seed through peertls.BootstrapSourceObserver. The production observer
+	// uses doStatusObservationRequest (a purpose-specific request that does
+	// NOT depend on the local binding state or an EpochProvider), performs
+	// the TLS 1.3 mTLS handshake, and validates the strict source envelope
+	// (header/body/expected-target agreement, authenticated identity).
+	obsClient := peertls.NewClient(joinNode.mgr)
+	obs := peertls.NewBootstrapSourceObserver(obsClient)
+
+	// Step 4: The joining replica calls AuthorizeJoin with the production
+	// observer. The join succeeds: a join-provenance durable binding is
+	// created and the replica transitions to SYNCING through the legal
+	// state-machine path (STARTING→DISCOVERING→SYNCING).
+	err := joinNode.ctrl.AuthorizeJoin(ctx, obs, seedNode.peerAddr, "gossipgrid-0."+intSuffix)
+	if err != nil {
+		t.Fatalf("step 4: AuthorizeJoin: %v", err)
+	}
+
+	// Step 5: Verify the join binding: cluster/epoch match the
+	// authoritative metadata, provenance is join (not genesis).
+	joinBinding, err := joinNode.store.GetBinding()
+	if err != nil {
+		t.Fatalf("step 5: GetBinding on join node: %v", err)
+	}
+	if joinBinding == nil {
+		t.Fatal("step 5: expected a binding on join node; got nil")
+	}
+	if joinBinding.ClusterID != meta.ClusterID {
+		t.Fatalf("step 5: cluster ID: expected %s, got %s", meta.ClusterID, joinBinding.ClusterID)
+	}
+	if joinBinding.EpochID != meta.EpochID {
+		t.Fatalf("step 5: epoch ID: expected %s, got %s", meta.EpochID, joinBinding.EpochID)
+	}
+	if joinBinding.Provenance != lifecycle.ProvenanceJoin {
+		t.Fatalf("step 5: expected join provenance; got %s", joinBinding.Provenance)
+	}
+
+	// Verify the replica transitioned to SYNCING.
+	if joinNode.ctrl.State() != lifecycle.SYNCING {
+		t.Fatalf("step 5: expected SYNCING state after join; got %s", joinNode.ctrl.State())
+	}
+
+	// Step 6: Restart the joining replica. Stop the controller, close the
+	// store, reopen the store (the durable binding is preserved in the
+	// SQLite file), and start a new controller with the same database.
+	joinNode.ctrl.Stop(ctx)
+	_ = joinNode.store.Close()
+
+	reopenStore, err := store.New(joinNode.dbPath)
+	if err != nil {
+		t.Fatalf("step 6: reopening join store: %v", err)
+	}
+	defer func() { _ = reopenStore.Close() }()
+
+	reopenBinding, err := reopenStore.GetBinding()
+	if err != nil {
+		t.Fatalf("step 6: GetBinding after restart: %v", err)
+	}
+	if reopenBinding == nil {
+		t.Fatal("step 6: binding lost after restart")
+	}
+	if reopenBinding.ClusterID != meta.ClusterID || reopenBinding.EpochID != meta.EpochID {
+		t.Fatalf("step 6: cluster/epoch changed after restart: got %s/%s", reopenBinding.ClusterID, reopenBinding.EpochID)
+	}
+	if reopenBinding.Provenance != lifecycle.ProvenanceJoin {
+		t.Fatalf("step 6: CRITICAL: provenance changed after restart: expected join, got %s", reopenBinding.Provenance)
+	}
+
+	// The restarted replica is NOT in READY and is NOT a bootstrap source
+	// (a join-provenance binding in a non-DEGRADED state cannot be
+	// promoted to READY through the join path).
+	if joinNode.ctrl.State() == lifecycle.READY {
+		t.Fatal("step 6: join replica must NOT be in READY after restart")
+	}
+	if joinNode.ctrl.State().IsBootstrapSourceEligible() {
+		t.Fatal("step 6: join replica must NOT be a bootstrap source after restart")
+	}
+
+	joinNode.stop()
+}
+
+// TestReplacementSeed_JoinBinding_RestartRemainsUnready is the ACTUAL
+// canonical replacement-seed restart integration regression (Milestone 5B,
+// Stage 3A, requirement 4). It exercises the exact failure scenario:
+//
+//  1. The cluster completes operator-controlled genesis (GenesisConsumer =
+//     gossipgrid-0, DataLossProtected=true, Initialized=true).
+//  2. The original gossipgrid-0 database is lost.
+//  3. A replacement gossipgrid-0 (NodeID=SeedIdentity="gossipgrid-0") starts
+//     with a FRESH, empty, unbound SQLite database.
+//  4. The replacement obtains an ordinary joining binding (join provenance)
+//     through the production mTLS observer and AuthorizeJoin.
+//  5. The replacement's process RESTARTS: the original controller and its
+//     services are stopped, its SQLite store is closed, the SAME database
+//     path is reopened, and a genuinely NEW Controller and Machine are
+//     constructed and started with the deterministic authoritative metadata
+//     source. The real metadata reconciliation path executes (NOT
+//     SetAcceptedMetadataForTest, NOT a forced state, NOT checking the
+//     stopped controller).
+//  6. The NEW controller must NOT enter GENESIS, READY, or DEGRADED (the
+//     join provenance gate blocks the genesis-restart reconciliation and the
+//     join path places it in SYNCING, not READY).
+//  7. The reopened binding still has join provenance.
+//  8. Resume through AuthorizeJoin using the production observer; verify
+//     SYNCING and repeat all admission restrictions and premature READY
+//     rejection.
+//
+// This test is DISTINCT from TestOrdinaryJoin_RealTLS_JoinObservation (an
+// ordinary, non-seed joining test). The mandatory identities are:
+//
+//	Source NodeID: gossipgrid-1
+//	Replacement NodeID: gossipgrid-0
+//	Replacement SeedIdentity: gossipgrid-0
+//
+// The source (gossipgrid-1) is deliberately initialized using a test fixture
+// (forced READY) because Stage 3D is not implemented; its actual
+// source-admission predicate (IsReady && Authorized) must succeed for it to be
+// an eligible bootstrap source. The replacement's lifecycle state is NOT
+// forced: the real Start reconciliation path is the subject under test.
+func TestReplacementSeed_JoinBinding_RestartRemainsUnready(t *testing.T) {
+	ctx := context.Background()
+	ca := newTestCA(t, "rs-1")
+	// Fully finalized authoritative metadata: the canonical seed
+	// (gossipgrid-0) consumed the one-time genesis authorization.
+	meta := lifecycle.ClusterMetadata{
+		ClusterID:            "c-replace",
+		EpochID:              "e-replace",
+		Generation:           1,
+		Initialized:          true,
+		GenesisAuthorized:    false,
+		GenesisConsumer:      "gossipgrid-0",
+		EverAcceptedMessages: true,
+		DataLossProtected:    true,
+	}
+
+	// Step 1: The source (gossipgrid-1) is a fully initialized, authorized
+	// bootstrap source. It is deliberately initialized using a test fixture
+	// (forced READY + matching metadata + matching binding) because Stage 3D
+	// (synchronization-completion READY promotion) is not implemented; its
+	// source-admission predicate (IsReady && Authorized) must succeed.
+	sourceNode := newLifecycleTestNode(t, ca, "gossipgrid-1", nodeTestOpts{
+		bindTo:     &meta,
+		forceState: lifecycle.READY,
+	})
+	sourceNode.setMetadata(meta)
+
+	// Step 2: The replacement (gossipgrid-0) starts with a FRESH, empty,
+	// unbound database (real SQLite). NodeID=SeedIdentity="gossipgrid-0"
+	// (the replacement has the same identity as the original seed).
+	replNode := newLifecycleTestNode(t, ca, "gossipgrid-0", nodeTestOpts{
+		seedIdentity: "gossipgrid-0",
+	})
+	replNode.setMetadata(meta)
+
+	// Step 3: BEFORE joining, verify the requester (the replacement) cannot
+	// use ordinary replication or bootstrap retrieval: it is unbound and
+	// STARTING, so the core authorized predicate (ready state) and the
+	// bootstrap predicate (SYNCING state + matching binding) both fail. This
+	// asserts the unbound requester cannot obtain ordinary replication
+	// authorization OR bootstrap-fetch authorization, while the purpose-
+	// specific pre-binding status observation (Step 4) is the only permitted
+	// path — the other boundaries remain intact.
+	if d := replNode.ctrl.Admission().CheckReplicationOutbound(ctx); d.Allowed {
+		t.Fatal("before join: the replacement must not be able to replicate outbound (unbound, STARTING)")
+	}
+	if d := replNode.ctrl.Admission().CheckReplicationInbound(ctx, lifecycle.RequestContext{ClusterID: meta.ClusterID, EpochID: meta.EpochID}); d.Allowed {
+		t.Fatal("before join: the replacement must not be able to replicate inbound (unbound, STARTING)")
+	}
+	if d := replNode.ctrl.Admission().CheckWrite(ctx); d.Allowed {
+		t.Fatal("before join: the replacement must not accept public writes (unbound, STARTING)")
+	}
+	if d := replNode.ctrl.Admission().CheckBootstrapFetch(ctx, lifecycle.RequestContext{ClusterID: meta.ClusterID, EpochID: meta.EpochID}); d.Allowed {
+		t.Fatal("before join: the replacement must not obtain bootstrap-fetch authorization (unbound, STARTING, no matching binding)")
+	}
+
+	// Step 4: Execute AuthorizeJoin through the production mTLS observer
+	// built from replNode.client — the normal lifecycle-enabled peer client
+	// already configured by the integration helper with BOTH the ordinary
+	// EpochProvider (newControllerEpochProvider) and the dedicated
+	// BootstrapEpochProvider (controllerBootstrapProvider), referenced to the
+	// replacement's own controller. The status-observation transport path
+	// (doStatusObservationRequest) does NOT consult the EpochProvider, so the
+	// unbound replacement can perform the purpose-specific pre-binding status
+	// observation; the providers remain configured for the other (ordinary
+	// and bootstrap) transport paths and are not weakened here.
+	obs := peertls.NewBootstrapSourceObserver(replNode.client)
+	if err := replNode.ctrl.AuthorizeJoin(ctx, obs, sourceNode.peerAddr, "gossipgrid-1."+intSuffix); err != nil {
+		t.Fatalf("step 4: AuthorizeJoin (initial join): %v", err)
+	}
+
+	// Step 5: Verify the initial join assertions.
+	if s := replNode.ctrl.State(); s != lifecycle.SYNCING {
+		t.Fatalf("step 5: expected SYNCING after the initial join; got %s", s)
+	}
+	b, err := replNode.store.GetBinding()
+	if err != nil {
+		t.Fatalf("step 5: GetBinding: %v", err)
+	}
+	if b == nil {
+		t.Fatal("step 5: expected a binding after the initial join; got nil")
+	}
+	if b.ClusterID != meta.ClusterID || b.EpochID != meta.EpochID {
+		t.Fatalf("step 5: binding cluster/epoch mismatch: got %s/%s, expected %s/%s", b.ClusterID, b.EpochID, meta.ClusterID, meta.EpochID)
+	}
+	if b.Provenance != lifecycle.ProvenanceJoin {
+		t.Fatalf("step 5: expected join provenance; got %s", b.Provenance)
+	}
+	// Admission restrictions after the initial join (SYNCING, unready):
+	admission := replNode.ctrl.Admission()
+	target := lifecycle.RequestContext{ClusterID: meta.ClusterID, EpochID: meta.EpochID}
+	if d := admission.CheckWrite(ctx); d.Allowed {
+		t.Fatal("step 5: public writes must be denied after the join (SYNCING, unready)")
+	}
+	if d := admission.CheckReplicationOutbound(ctx); d.Allowed {
+		t.Fatal("step 5: outbound replication must be denied after the join (SYNCING, unready)")
+	}
+	if d := admission.CheckReplicationInbound(ctx, target); d.Allowed {
+		t.Fatal("step 5: inbound replication must be denied after the join (SYNCING, unready)")
+	}
+	if d := admission.CheckBootstrapSourceInbound(ctx, target); d.Allowed {
+		t.Fatal("step 5: bootstrap source inbound must be denied after the join (SYNCING, not a source)")
+	}
+	// The matching bootstrap FETCH context is permitted (a bound, epoch-bound
+	// SYNCING replica with fresh, finalized, matching metadata).
+	if d := admission.CheckBootstrapFetch(ctx, target); !d.Allowed {
+		t.Fatalf("step 5: bootstrap fetch must be permitted after the join (matching context): %s", d.Reason)
+	}
+	// Premature READY promotion is rejected (SetReady requires genesis
+	// provenance for non-DEGRADED states; the join binding is join-provenance).
+	if err := replNode.ctrl.SetReady("premature promotion"); err == nil {
+		t.Fatal("step 5: premature SetReady must be rejected (join provenance, SYNCING); got nil")
+	}
+
+	// Step 6: ACTUAL RESTART. Stop the original replacement controller and
+	// its applicable services, close its SQLite store, reopen the SAME
+	// database path, and construct a genuinely NEW Controller and Machine.
+	replNode.stop()
+	// The original controller (replNode.ctrl) and the original store are now
+	// stopped/closed. Two different controller instances will exist: the
+	// original (replNode.ctrl, stopped) and the new (newCtrl, started).
+
+	// Reopen the SAME database path.
+	reopenStore, err := store.New(replNode.dbPath)
+	if err != nil {
+		t.Fatalf("step 6: reopening store: %v", err)
+	}
+	defer func() { _ = reopenStore.Close() }()
+
+	// The reopened binding still has join provenance (the durable binding
+	// survived the restart; it is not relabeled).
+	reopenBinding, err := reopenStore.GetBinding()
+	if err != nil {
+		t.Fatalf("step 6: GetBinding after restart: %v", err)
+	}
+	if reopenBinding == nil {
+		t.Fatal("step 6: binding lost after restart")
+	}
+	if reopenBinding.Provenance != lifecycle.ProvenanceJoin {
+		t.Fatalf("step 6: CRITICAL: provenance changed after restart: expected join, got %s", reopenBinding.Provenance)
+	}
+	if reopenBinding.ClusterID != meta.ClusterID || reopenBinding.EpochID != meta.EpochID {
+		t.Fatalf("step 6: cluster/epoch changed after restart: got %s/%s", reopenBinding.ClusterID, reopenBinding.EpochID)
+	}
+
+	// Construct a GENUINELY NEW Controller and Machine, configured with
+	// NodeID=SeedIdentity="gossipgrid-0", using the deterministic
+	// authoritative metadata source. The real metadata reconciliation path
+	// must execute (NOT SetAcceptedMetadataForTest, NOT a forced state).
+	newMachine := lifecycle.NewMachine(nil)
+	newCtrl := lifecycle.NewController(lifecycle.Config{
+		MetadataPollInterval: time.Second,
+		NodeID:               "gossipgrid-0",
+		SeedIdentity:         "gossipgrid-0",
+		Enabled:              true,
+	}, newMachine, lifecycle.NewFakeMetadataSource(meta, true), reopenStore, nil)
+	if err := newCtrl.Start(ctx); err != nil {
+		t.Fatalf("step 6: NEW controller Start: %v", err)
+	}
+	defer newCtrl.Stop(ctx)
+
+	// Step 7: Assert the NEW controller does not enter GENESIS, READY, or
+	// DEGRADED (the real reconciliation path: the join provenance gate blocks
+	// the genesis-restart promotion; a non-... the replacement is the
+	// designated seed but its binding is join-provenance, so it is not
+	// promoted; it remains STARTING or DISCOVERING, not READY).
+	if s := newCtrl.State(); s == lifecycle.GENESIS || s == lifecycle.READY || s == lifecycle.DEGRADED {
+		t.Fatalf("step 7: CRITICAL: NEW replacement-seed controller entered %s after restart; it must remain unready (join provenance blocks the genesis-restart path)", s)
+	}
+	// The binding is still join-provenance on the new controller.
+	if nb := newCtrl.LocalBinding(); nb == nil || nb.Provenance != lifecycle.ProvenanceJoin {
+		t.Fatalf("step 7: expected join provenance on the new controller's binding; got %+v", nb)
+	}
+
+	// Step 8: Resume through AuthorizeJoin using the production observer.
+	// The replacement is not serving (its server was shut down in stop()),
+	// but the source (gossipgrid-1) is still serving, so the observation of
+	// the source is valid. The observer client is configured with the SAME
+	// normal providers as the helper, but referencing the NEW controller
+	// (newCtrl) rather than the stopped original (replNode.ctrl): the
+	// ordinary EpochProvider (newControllerEpochProvider) and the dedicated
+	// BootstrapEpochProvider (controllerBootstrapProvider) both delegate to
+	// the controller that owns the current authorization decision. The
+	// status-observation transport path does not consult these providers, so
+	// they are configured for the other transport paths without weakening the
+	// pre-binding observation.
+	newObsClient := peertls.NewClient(replNode.mgr)
+	newObsClient.SetEpochProvider(newControllerEpochProvider(newCtrl))
+	newObsClient.SetBootstrapEpochProvider(&controllerBootstrapProvider{ctrl: newCtrl})
+	newObs := peertls.NewBootstrapSourceObserver(newObsClient)
+	if err := newCtrl.AuthorizeJoin(ctx, newObs, sourceNode.peerAddr, "gossipgrid-1."+intSuffix); err != nil {
+		t.Fatalf("step 8: AuthorizeJoin (resume after restart): %v", err)
+	}
+	if s := newCtrl.State(); s != lifecycle.SYNCING {
+		t.Fatalf("step 8: expected SYNCING after the resume; got %s", s)
+	}
+	// Repeat all admission restrictions and the premature READY rejection.
+	newAdmission := newCtrl.Admission()
+	if d := newAdmission.CheckWrite(ctx); d.Allowed {
+		t.Fatal("step 8: public writes must be denied after the resume (SYNCING, unready)")
+	}
+	if d := newAdmission.CheckReplicationOutbound(ctx); d.Allowed {
+		t.Fatal("step 8: outbound replication must be denied after the resume (SYNCING, unready)")
+	}
+	if d := newAdmission.CheckReplicationInbound(ctx, target); d.Allowed {
+		t.Fatal("step 8: inbound replication must be denied after the resume (SYNCING, unready)")
+	}
+	if d := newAdmission.CheckBootstrapSourceInbound(ctx, target); d.Allowed {
+		t.Fatal("step 8: bootstrap source inbound must be denied after the resume (SYNCING, not a source)")
+	}
+	if d := newAdmission.CheckBootstrapFetch(ctx, target); !d.Allowed {
+		t.Fatalf("step 8: bootstrap fetch must be permitted after the resume (matching context): %s", d.Reason)
+	}
+	if err := newCtrl.SetReady("premature promotion after resume"); err == nil {
+		t.Fatal("step 8: premature SetReady must be rejected after the resume (join provenance, SYNCING); got nil")
+	}
+
+	// Verify two different controller instances actually exist in this
+	// restart scenario: the original (replNode.ctrl, stopped) and the new
+	// (newCtrl, started) are distinct pointers.
+	if replNode.ctrl == newCtrl {
+		t.Fatal("CRITICAL: the original and new controllers are the SAME instance; the test must exercise a genuine restart (two distinct controllers)")
+	}
+}
+
+// TestOriginalSeed_GenesisBinding_RestartPromotesReady is the original
+// genesis-seed READY restoration regression (requirement 4, comparison). It
+// verifies that a seed with a GENESIS-provenance binding (established
+// through the legitimate genesis authorization path, not a raw insert) and
+// fully finalized authoritative metadata, when restarted (stop, close,
+// reopen the SAME database, start a NEW controller), is actually restored
+// to READY through production reconciliation (the seed-restart
+// reconciliation path, NOT a forced state, NOT SetReadyForTest).
+//
+// This is the COMPARISON to the replacement-seed test: the original seed
+// (genesis provenance) IS promoted to READY on restart; the replacement
+// seed (join provenance) is NOT. Reading the provenance field alone is
+// insufficient — this test verifies the actual READY restoration through
+// the production reconciliation path.
+func TestOriginalSeed_GenesisBinding_RestartPromotesReady(t *testing.T) {
+	ctx := context.Background()
+	ca := newTestCA(t, "os-1")
+	// Fully finalized authoritative metadata: the original seed
+	// (gossipgrid-0) consumed the one-time genesis authorization.
+	meta := lifecycle.ClusterMetadata{
+		ClusterID:            "c-orig",
+		EpochID:              "e-orig",
+		Generation:           1,
+		Initialized:          true,
+		GenesisAuthorized:    false,
+		GenesisConsumer:      "gossipgrid-0",
+		EverAcceptedMessages: true,
+		DataLossProtected:    true,
+	}
+
+	// Step 1: The original seed (gossipgrid-0) establishes a genesis
+	// provenance binding through the LEGITIMATE genesis authorization path
+	// (AuthorizeGenesis), not a raw insert. Start it with pending-grant
+	// metadata (Initialized=false, GenesisAuthorized=true, GenesisConsumer=
+	// "", DataLossProtected=false), an empty unbound database, and
+	// NodeID=SeedIdentity="gossipgrid-0".
+	origNode := newLifecycleTestNode(t, ca, "gossipgrid-0", nodeTestOpts{
+		seedIdentity: "gossipgrid-0",
+	})
+	// The pending-grant metadata: Initialized=false, GenesisAuthorized=true
+	// (the one-time token is present and unspent), GenesisConsumer="",
+	// DataLossProtected=false. This is the legitimate pending-grant state
+	// that AuthorizeGenesis requires.
+	pendingMeta := lifecycle.ClusterMetadata{
+		ClusterID:         "c-orig",
+		EpochID:           "e-orig",
+		Generation:        1,
+		Initialized:       false,
+		GenesisAuthorized: true,
+	}
+	origNode.setMetadata(pendingMeta)
+	// AuthorizeGenesis: the seed is the designated seed, the metadata is a
+	// pending grant, the database is empty/unbound. The binding is created
+	// with GENESIS provenance and the seed enters GENESIS.
+	if err := origNode.ctrl.AuthorizeGenesis(ctx); err != nil {
+		t.Fatalf("step 1: AuthorizeGenesis: %v", err)
+	}
+	if s := origNode.ctrl.State(); s != lifecycle.GENESIS {
+		t.Fatalf("step 1: expected GENESIS after AuthorizeGenesis; got %s", s)
+	}
+	// Verify the binding is genesis-provenance (established through the
+	// legitimate genesis authorization path).
+	gb, err := origNode.store.GetBinding()
+	if err != nil {
+		t.Fatalf("step 1: GetBinding: %v", err)
+	}
+	if gb == nil {
+		t.Fatal("step 1: expected a genesis binding; got nil")
+	}
+	if gb.Provenance != lifecycle.ProvenanceGenesis {
+		t.Fatalf("step 1: expected genesis provenance from the legitimate genesis path; got %s", gb.Provenance)
+	}
+	if gb.ClusterID != meta.ClusterID || gb.EpochID != meta.EpochID {
+		t.Fatalf("step 1: binding cluster/epoch mismatch: got %s/%s", gb.ClusterID, gb.EpochID)
+	}
+
+	// Step 2: RESTART. Stop the original controller and services, close its
+	// SQLite store, reopen the SAME database path, and construct a NEW
+	// controller.
+	origNode.stop()
+
+	reopenStore, err := store.New(origNode.dbPath)
+	if err != nil {
+		t.Fatalf("step 2: reopening store: %v", err)
+	}
+	defer func() { _ = reopenStore.Close() }()
+
+	// The reopened binding is genesis-provenance (preserved).
+	rb, err := reopenStore.GetBinding()
+	if err != nil {
+		t.Fatalf("step 2: GetBinding after restart: %v", err)
+	}
+	if rb == nil {
+		t.Fatal("step 2: binding lost after restart")
+	}
+	if rb.Provenance != lifecycle.ProvenanceGenesis {
+		t.Fatalf("step 2: CRITICAL: provenance changed after restart: expected genesis, got %s", rb.Provenance)
+	}
+
+	// Construct a GENUINELY NEW Controller and Machine, configured with
+	// NodeID=SeedIdentity="gossipgrid-0" and the FULLY FINALIZED
+	// authoritative metadata (the legitimate finalization state). The real
+	// metadata reconciliation path must execute (NOT SetAcceptedMetadataForTest,
+	// NOT a forced state, NOT SetReadyForTest).
+	newMachine := lifecycle.NewMachine(nil)
+	newCtrl := lifecycle.NewController(lifecycle.Config{
+		MetadataPollInterval: time.Second,
+		NodeID:               "gossipgrid-0",
+		SeedIdentity:         "gossipgrid-0",
+		Enabled:              true,
+	}, newMachine, lifecycle.NewFakeMetadataSource(meta, true), reopenStore, nil)
+	if err := newCtrl.Start(ctx); err != nil {
+		t.Fatalf("step 2: NEW controller Start: %v", err)
+	}
+	defer newCtrl.Stop(ctx)
+
+	// Step 3: Verify ACTUAL READY restoration through production
+	// reconciliation. The seed-restart reconciliation (reconcileSeedRestartLocked
+	// → promoteFromGenesisLocked) observes the matching genesis-provenance
+	// binding and the fully finalized metadata and promotes STARTING →
+	// DISCOVERING → READY. The state must be READY, and the binding must
+	// still be genesis-provenance.
+	if s := newCtrl.State(); s != lifecycle.READY {
+		t.Fatalf("step 3: REGRESSION: original seed with genesis binding was NOT restored to READY on restart; got %s (reason=%s)", s, newCtrl.Snapshot().Reason)
+	}
+	if nb := newCtrl.LocalBinding(); nb == nil || nb.Provenance != lifecycle.ProvenanceGenesis {
+		t.Fatalf("step 3: expected genesis provenance on the restored binding; got %+v", nb)
+	}
+	// Public writes are now allowed (the original seed is READY, authorized).
+	if d := newCtrl.Admission().CheckWrite(ctx); !d.Allowed {
+		t.Fatalf("step 3: public writes must be allowed after the original seed is restored to READY: %s", d.Reason)
+	}
+
+	// Verify two different controller instances actually exist: the original
+	// (origNode.ctrl, stopped) and the new (newCtrl, started) are distinct
+	// pointers.
+	if origNode.ctrl == newCtrl {
+		t.Fatal("CRITICAL: the original and new controllers are the SAME instance; the test must exercise a genuine restart (two distinct controllers)")
+	}
 }
 
 // itoa is a small int-to-string helper for test IDs (avoids importing strconv

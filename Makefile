@@ -21,8 +21,9 @@
 #   - `make qa`             validation only; it never regenerates diagram assets,
 #                            never compiles the persistent binary, never builds a
 #                            container image, and never rewrites tracked sources.
-#   - `make all`            explicit aggregate: generate diagrams, build, then run
-#                            qa, sequentially (not in parallel under -j).
+#   - `make all`            explicit aggregate: run QA, generate diagrams,
+#                            then build the application, sequentially (not in
+#                            parallel under -j).
 #   - `make clean`          removes build outputs (the persistent binary only).
 
 BIN_DIR    := bin
@@ -389,19 +390,19 @@ deploy-checks: ## Run the GossipGrid Helm chart regression checks (read-only, no
 	$(call check_tool,python3,install with: apk add python3 py3-yaml (Alpine) or apt-get install python3 python3-yaml (Debian))
 	bash $(DEPLOY_CHECKS)
 
-# all is the explicit aggregate workflow: generate the diagram assets, compile
-# the application binary, then run the validation suite. The recipe is
-# sequential (each line is a separate recursive Make invocation) so that `make
-# -j all` does not run qa concurrently with artifact generation. It does NOT
-# include image publication, deployment, contact sheets, fmt, or clean; those
-# remain their own explicit targets. The FIPS and version-injection behavior of
-# build is unchanged (build is invoked as-is; the qa suite carries the version
-# regression tests).
+# all is the explicit aggregate workflow: run the validation suite (QA),
+# generate the diagram assets (architecture), then compile the application
+# binary (build). The recipe is sequential (each line is a separate recursive
+# Make invocation) so that `make -j all` does not run the steps concurrently.
+# It does NOT include image publication, deployment, contact sheets, fmt, or
+# clean; those remain their own explicit targets. The FIPS and
+# version-injection behavior of build is unchanged (build is invoked as-is;
+# the qa suite carries the version regression tests).
 .PHONY: all
-all: ## Generate diagrams, build the application, and run QA
+all: ## Run QA, generate diagrams and build the application
+	$(MAKE) qa
 	$(MAKE) architecture
 	$(MAKE) build
-	$(MAKE) qa
 
 # qa is verification only: it must not modify any tracked file. diagram
 # generation (make architecture) writes the committed SVG/PNG outputs and is

@@ -945,7 +945,7 @@ func TestBoundedInsert_LifecycleAuthLockReleaseOnCancellation(t *testing.T) {
 
 	st := newBoundedInsertTestStore(t)
 	meta := lifecycle.ClusterMetadata{ClusterID: "c1", EpochID: "e1", Generation: 1, Initialized: true}
-	if _, err := st.Bind("c1", "e1", 1); err != nil {
+	if _, err := st.Bind(context.Background(), "c1", "e1", 1, lifecycle.ProvenanceGenesis); err != nil {
 		t.Fatalf("binding store: %v", err)
 	}
 

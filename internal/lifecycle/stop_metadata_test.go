@@ -436,7 +436,7 @@ func TestNoAuthorizationAfterTerminalStop(t *testing.T) {
 		Initialized: true,
 	}, true)
 	binding := &fakeBindingStore{}
-	if _, err := binding.Bind("c1", "e1", 1); err != nil {
+	if _, err := binding.Bind(context.Background(), "c1", "e1", 1, ProvenanceGenesis); err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	ctrl := NewController(Config{
