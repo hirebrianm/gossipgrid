@@ -2094,13 +2094,14 @@ func (c *Controller) CommitUnderAuthorization(fn func() error) error {
 	return fn()
 }
 
-// CommitUnderBootstrapAuthorization executes a short, nonblocking commit
-// callback (installing a fetched bootstrap baseline into the local store)
-// while holding the controller's authorization read lock (c.mu RLock) and the
-// lifecycle state machine's read lock (m.mu RLock). It is the commit-boundary
-// counterpart to CheckBootstrapFetch: a successful bootstrap HTTP request does
-// NOT by itself authorize installing its response; the installation is
-// revalidated at the actual local write boundary.
+// CommitUnderBootstrapAuthorization executes a commit callback (installing a
+// fetched bootstrap baseline into the local store) while holding the
+// controller's authorization read lock (c.mu RLock) and the lifecycle state
+// machine's read lock (m.mu RLock), and retains both for the duration of the
+// callback. It is the commit-boundary counterpart to CheckBootstrapFetch: a
+// successful bootstrap HTTP request does NOT by itself authorize installing
+// its response; the installation is revalidated at the actual local write
+// boundary.
 //
 // The callback runs only when the bootstrap authorization is STILL valid at
 // commit time: the requester remains a bound, epoch-bound SYNCING replica
@@ -2114,21 +2115,27 @@ func (c *Controller) CommitUnderAuthorization(fn func() error) error {
 // valid data and the durable binding are preserved (this method never deletes
 // or resets the store).
 //
-// It is the same lock-order and non-recursive contract as
-// CommitUnderAuthorization (Controller.mu RLock → Machine.mu RLock →
-// callback may take Engine.mu Lock): the callback must NOT re-read any
+// The callback runs under the same lock order as CommitUnderAuthorization
+// (Controller.mu RLock → Machine.mu RLock → callback) and must NOT re-read any
 // method that acquires Controller.mu or Machine.mu (both RWMutexes are
-// non-reentrant), perform network I/O, or execute a multi-row or blocking
-// SQLite query. The callback performs the idempotent local insert of the
-// fetched baseline records.
+// non-reentrant) or perform network I/O. The callback executes the bounded,
+// context-aware bootstrap SQLite transaction (BEGIN, write access, retention
+// evaluation, install, conflict check, COMMIT): it is a single transaction on
+// one pooled connection, not a "multi-row or blocking query" in the forbidden
+// sense. The SQLite busy timeout (the bounded wait for a contended write lock)
+// is a known limitation of this contract — it is best-effort contention
+// resolution, not a linearizability guarantee — and is accepted as such.
 //
 // The predicate is the dedicated bootstrap decision (bootstrapAuthorized),
 // NOT the broad ordinary-replication decision (authorized): a SYNCING replica
 // that was authorized to fetch may install the fetched baseline, but this
 // guard does not authorize public writes, gossip, or acting as a source
 // (those use CommitUnderAuthorization / authorized, which require a ready
-// state). When lifecycle protection is disabled, the callback is executed
-// directly (legacy behavior preserved).
+// state). Ordinary anti-entropy is a separate path: it uses its own admission
+// decision (which requires a ready state) and its own insert path, and does
+// not go through this guard or the InsertReplicatedMessagesBounded bootstrap
+// transaction. When lifecycle protection is disabled, the callback is
+// executed directly (disabled-mode passthrough, legacy behavior preserved).
 //
 // The callback returns a non-nil error when the commit is rejected. This
 // method propagates that error. When the bootstrap authorization is not
@@ -2142,9 +2149,11 @@ func (c *Controller) CommitUnderAuthorization(fn func() error) error {
 // change, stop, stale/invalid observation, binding change) rejects the commit,
 // and a cluster/epoch mismatch between expected and the current snapshot's
 // metadata rejects the commit (an old response fetched under epoch A is never
-// installed under newly acquired epoch-B authorization). A zero expected
-// context (lifecycle protection disabled or no pin) is not validated (only the
-// predicate is checked).
+// installed under newly acquired epoch-B authorization). When lifecycle
+// protection is enabled, the expected context MUST be complete (both ClusterID
+// and EpochID non-empty): an empty or incomplete expected context is rejected
+// fail-closed. The disabled-mode passthrough (above) is the only path where no
+// pin is present, and it performs no expected-context validation.
 func (c *Controller) CommitUnderBootstrapAuthorization(expected RequestContext, fn func() error) error {
 	if !c.cfg.Enabled {
 		return fn()

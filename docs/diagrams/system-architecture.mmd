@@ -1,64 +1,67 @@
 flowchart TB
-  subgraph EXT["External systems (cluster prerequisites, owned by the cluster operations track)"]
-    direction LR
-    VAULT["Vault - browser CA + workload CA PKI, KV v2 credential authority"]
-    GLCI["GitLab CI - QA, build, publish (M8 delivery)"]
-  end
+  B("Browser")
+  VAULT("Vault PKI + KV v2")
 
-  B["Browser - internal CA HTTPS"]
+  subgraph EXT["External delivery"]
+    direction TB
+    GLCI("GitLab CI: QA + build")
+    MPUB("Manual publish")
+    REG[("Registry")]
+    GOREPO("k8s-gitops")
+
+    GLCI ~~~ MPUB
+    MPUB --> REG
+    REG -->|"Manual digest update"| GOREPO
+  end
 
   subgraph K8S["Kubernetes cluster"]
     direction TB
-    GW["Shared Cilium Gateway - existing, gateway.enabled=false in GossipGrid chart; HTTPRoutes managed in k8s-gitops"]
-    WEB["ClusterIP web Service - ready pods only"]
+    GW("Cilium Gateway")
+    WSVC("Web Service")
 
-    subgraph SS["StatefulSet gossipgrid - 5 replicas, Parallel, no PVCs"]
+    subgraph SS["GossipGrid StatefulSet - five replicas"]
       direction LR
-      APP["Replicas gossipgrid-0..4 - API :8080, peer :8443"]
-      SYNC["Peer discovery, gossip fanout, anti-entropy (implemented, opt-in)"]
-      DB[("Independent SQLite on emptyDir - pod-lifetime")]
+      subgraph R1["gossipgrid-0"]
+        direction TB
+        A1("Replica") --- D1[("SQLite")]
+      end
+      subgraph R5["gossipgrid-4"]
+        direction TB
+        A5("Replica") --- D5[("SQLite")]
+      end
+      R1 <-->|peer mTLS| R5
     end
 
-    B -->|HTTPS| GW
-    GW --> WEB
-    WEB --> APP
-    APP --- SYNC
-    APP --- DB
-
-    subgraph PKI["Peer PKI - separate workload trust domain (M3B implemented)"]
-      direction LR
-      WCA["Vault workload CA"]
-      CM["cert-manager - CSI driver, per-pod mTLS certs + browser TLS Secret"]
-    end
-    WCA --> CM
-    CM -. per-pod mTLS certs .-> APP
-    CM -. browser TLS Secret .-> GW
-
-    subgraph CRED["Browser auth credentials (M6 implemented locally; in-cluster delivery via VSO in M7A)"]
-      direction LR
-      VKV["Vault KV v2 - versioned credential: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key"]
-      VSO["Vault Secrets Operator"]
-      KSEC["Kubernetes Secret - full volume, never subPath, mounted read-only"]
-      VKV --> VSO --> KSEC
-    end
-    KSEC -. mounted credential file .-> APP
-
-    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B: Stages 0, 1A, 1B implemented; Stage 2 under independent review; Stage 3 pending; M5C planned)"]
-      direction LR
-      CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
-      RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]
-    end
-    CMETA --- RRBAC
-    CMETA -. metadata watch .-> APP
+    PEERSVC("Headless Service")
+    CMETA("Lifecycle ConfigMap")
+    CMCMD("cert-manager")
+    VSO("VSO")
+    KSEC("K8s Secret")
+    ARGO("Argo CD")
   end
 
-  subgraph GITOPS["GitOps delivery (M8 partial: immutable image + Argo CD work; automation incomplete)"]
-    direction LR
-    REG["Container registry - immutable image by digest"]
-    GOREPO["k8s-gitops repository - environment-specific Helm values + Argo CD application"]
-    ARGO["Argo CD - reconciles the cluster"]
-    GLCI -->|publish by digest| REG
-    REG -->|record digest| GOREPO
-    GOREPO -->|watch and reconcile| ARGO
-  end
-  ARGO -. deploys GossipGrid .-> SS
+  B -->|HTTPS| GW
+  GW --> WSVC
+  WSVC -->|route| SS
+  PEERSVC -. "discovery" .-> SS
+  CMCMD -. "per-pod certs" .-> SS
+  CMCMD -. "browser TLS" .-> GW
+  VSO --> KSEC
+  KSEC -. "mounted" .-> SS
+  CMETA -. "metadata" .-> SS
+
+  VAULT -->|issue certs| CMCMD
+  VAULT -->|sync secrets| VSO
+  GOREPO -. "desired state" .-> ARGO
+  ARGO -->|reconcile| SS
+
+  class B new
+  class GW,WSVC,PEERSVC push
+  class A1,A5 new
+  class D1,D5 sqlite
+  class CMETA,VSO,KSEC metadata
+  class VAULT,CMCMD metadata
+  class GLCI,MPUB new
+  class REG new
+  class GOREPO,ARGO metadata
+  linkStyle default stroke-width:1.8px

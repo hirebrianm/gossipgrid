@@ -1,0 +1,22 @@
+flowchart TB
+  subgraph PUSH["1. Gossip - push"]
+    direction LR
+    W("Writer: m1") --> A("A: m1")
+    W --> B("B: m1")
+    W -. "missed delivery" .-> C("C: empty")
+  end
+
+  subgraph PULL["2. Anti-entropy - pull"]
+    direction LR
+    D("C: empty") --> I("Compare inventory")
+    I --> F("Fetch m1")
+    F --> R("C: m1")
+  end
+
+  PUSH --> PULL
+
+  class W,A,B push
+  class C,D missed
+  class I,F bootstrap
+  class R hasm1
+  linkStyle default stroke-width:1.8px

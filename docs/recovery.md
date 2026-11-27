@@ -1,11 +1,16 @@
 # Data loss, recovery, and cluster epochs
 
+For a learning-oriented walkthrough of the epoch-fencing and recovery concepts that underpin this
+document, see the [concept library](concepts/README.md).
+
 **Status:** This document describes the recovery model and the cluster epoch protocol. Milestone 5A
 (2026-11-21, `v0.1.0-alpha.5`) is **implemented and locally tested** (the lifecycle state machine, durable
-epoch binding, epoch fencing, and fail-closed admission). Milestone 5B is **partially implemented**: Stage 0
-(read-only Kubernetes metadata provider) and Stage 2 (bootstrap replication admission, `FetchBootstrapBaseline`
-transport-and-commit) are implemented and locally tested but not yet committed or cluster-verified; Stage 3
-(source discovery/selection, sweep scheduling, automatic `READY` promotion) is designed but not implemented.
+epoch binding, epoch fencing, and fail-closed admission). Milestone 5B is **partially implemented**: Stages 0
+(read-only Kubernetes metadata provider), 1A (Kubernetes genesis grant), 1B (operator-authorized genesis
+finalization), and 2 (bootstrap replication admission,
+`FetchBootstrapBaseline` transport-and-commit) are implemented, committed, and locally tested (not yet
+cluster-verified); Stage 3 (source discovery/selection, sweep scheduling, automatic `READY` promotion) is
+designed but not implemented.
 Milestone 5C (operator recovery/reset authorization, catastrophic data-loss handling) is **designed but not
 implemented**. The recovery protocol described below is the **target design** that 5B Stage 3 and 5C will
 implement.
@@ -18,16 +23,20 @@ Recovery of *availability* is not recovery of *lost data*.
 
 Milestone 5A (implemented 2026-11-21) adds the lifecycle state machine, durable epoch binding, epoch fencing, and
 fail-closed admission that underpin the recovery model described below. The Kubernetes metadata provider (5B
-Stage 0) is implemented and inactive; the bootstrap replication admission (5B Stage 2) is implemented and
-locally tested but not yet committed; initial snapshot transfer orchestration and operator-controlled one-time
-genesis (5B Stage 3) and operator recovery/reset (5C) are designed but not yet implemented.
+Stage 0) is implemented and inactive; the bootstrap replication admission (5B Stage 2) is implemented, committed,
+and locally tested; initial snapshot transfer orchestration (5B Stage 3) and operator recovery/reset (5C) are
+designed but not yet implemented. A replaced pod does **not** automatically bind its local metadata or
+reconstruct from a peer: with no durable binding, fresh initialized metadata only moves the replica to
+`DISCOVERING` (no binding is created), and a metadata read failure invalidates authority and fails closed without
+necessarily changing the lifecycle state.
 
 ## Lifecycle state machine (Milestone 5A, implemented)
 
 The lifecycle controller's state machine — the transitions, the fail-closed boundaries, and the readiness
 implication of each state — is shown below (the authoritative `lifecycle-recovery.mmd` source embedded
-natively). The [SVG](diagrams/generated/lifecycle-recovery.svg) and
-[PNG](diagrams/generated/lifecycle-recovery.png) links are fallbacks.
+natively).
+
+[View full-size SVG](diagrams/generated/lifecycle-recovery.svg) · [View PNG](diagrams/generated/lifecycle-recovery.png)
 
 <!-- DIAGRAM:lifecycle-recovery -->
 ```mermaid
@@ -165,38 +174,74 @@ A database that predates the lifecycle feature (no `local_metadata` row) is hand
 
 ## Lifecycle recovery sequence (Milestone 5B/5C, designed)
 
-The end-to-end recovery sequence — a replaced pod reading authoritative metadata, selecting an eligible source,
-ingesting a baseline, and fencing out an old-epoch peer — is shown below (the authoritative
-`lifecycle-recovery-sequence.mmd` source embedded natively). The [SVG](diagrams/generated/lifecycle-recovery-sequence.svg)
-and [PNG](diagrams/generated/lifecycle-recovery-sequence.png) links are fallbacks.
+The recovery sequence — a replaced pod reading authoritative metadata, the independent Stage 2 baseline
+retrieval example, and the two admission outcomes — is shown below (the authoritative
+`lifecycle-recovery-sequence.mmd` source embedded natively). It is **not** a single implemented end-to-end
+reconstruction workflow: the three parts are independent examples.
+
+- **New pod, no binding (implemented).** A metadata read failure (missing or invalid) invalidates the
+  authoritative observation and fails closed; it does **not** necessarily change the lifecycle machine state.
+  `RECOVERY_REQUIRED` is an authorization lockout that can result from a confirmed local-binding/metadata
+  mismatch or a confirmed same-epoch genesis authorization revocation. Neither condition establishes
+  authoritative-data loss; the local database and durable binding are preserved. With fresh initialized
+  metadata and no durable binding, the replica enters `DISCOVERING` — no binding is created, no source is
+  selected, no READY promotion. A matching authoritative observation can permit re-evaluation to
+  `DISCOVERING`; an unchanged, revoked genesis-authorization observation does not. The authorized join and
+  reconstruction orchestration is **Stage 3 (planned)**.
+- **Independent Stage 2 example (implemented, explicit prerequisites).** This assumes a caller-supplied
+  eligible source and all required authorization prerequisites: the requester is already durably bound and
+  `SYNCING`, the source is `READY` or `DEGRADED`, and the cluster and epoch match. The two private bootstrap
+  retrieval endpoints are the inventory endpoint `GET /internal/sync/ids` and the bounded message-fetch
+  endpoint `POST /internal/sync/messages`. The guarded installation leaves the replica in `SYNCING` (no
+  automatic source selection, no automatic binding, no automatic READY promotion).
+- **Independent admission examples (implemented; not a temporal transition).** For well-formed epoch
+  headers, a `SYNCING` (unready) receiver rejects ordinary replication with **503** and an
+  otherwise-authorized receiver with a mismatched epoch rejects with **409** (the epoch-fencing mechanism,
+  M5A). Both preserve the no-merge guarantee: the peer's data is not merged into the receiver.
+
+Operator-controlled M5C recovery remains **planned**.
+
+[View full-size SVG](diagrams/generated/lifecycle-recovery-sequence.svg) · [View PNG](diagrams/generated/lifecycle-recovery-sequence.png)
 
 <!-- DIAGRAM:lifecycle-recovery-sequence -->
 ```mermaid
 sequenceDiagram
-  participant NEW as Replaced pod gossipgrid-2
-  participant CM as ConfigMap metadata 5B Stage 0 implemented
-  participant SRC as Eligible source
-  participant OLD as Stale epoch peer
+  participant N as Replica
+  participant M as ConfigMap
+  participant P as Peer
 
-  Note over NEW: pod replaced, local SQLite is empty (emptyDir lost)
-  NEW->>CM: read authoritative metadata (cluster ID, epoch, Initialized)
-  alt 5A only, no 5B provider
-    NEW->>NEW: metadata unavailable, stays DISCOVERING or RECOVERY_REQUIRED (fail closed)
-  else 5B implemented
-    CM-->>NEW: fresh metadata (Initialized=true, epoch E)
-    NEW->>NEW: bind local_metadata to epoch E
+  Note over N,M: New pod, no binding
+  N->>M: Read metadata
+  alt Missing or invalid metadata
+    M-->>N: Invalid observation
+    N->>N: Invalidate authority
+    Note over N: Fail closed
+  else Fresh initialized metadata
+    M-->>N: Cluster and epoch
+    N->>N: Enter DISCOVERING
+    Note over N: No automatic binding
   end
-  NEW->>SRC: select eligible source (READY or DEGRADED, matching epoch)
-  alt source eligible (5B)
-    NEW->>SRC: GET /internal/sync/ids then POST /internal/sync/messages
-    SRC-->>NEW: baseline records
-    NEW->>NEW: install baseline and initial catch-up, SYNCING then READY
-  else no eligible source (5A only)
-    NEW->>NEW: RECOVERY_REQUIRED (no silent empty-epoch genesis)
+
+  Note over N,M: Authorized join - Stage 3 planned
+
+  Note over N,P: Independent Stage 2 example
+  Note over N: Bound, SYNCING
+  Note over P: READY or DEGRADED
+  Note over N,P: Matching cluster and epoch
+  N->>P: Fetch inventory (mTLS)
+  P-->>N: IDs
+  N->>P: Fetch batch (mTLS)
+  P-->>N: Records
+  N->>N: Guarded installation
+  Note over N: Remains SYNCING
+
+  Note over N,P: Independent admission examples
+  P->>N: Ordinary replication
+  alt Receiver SYNCING
+    N-->>P: 503 - no merge
+  else Authorized, wrong epoch
+    N-->>P: 409 - no merge
   end
-  OLD->>NEW: attempt to gossip old-epoch data
-  NEW-->>OLD: 409 epoch mismatch (permanent, no retry, data not merged)
-  Note over OLD: old-epoch peer quarantined, 5C operator recovery required to rejoin
 ```
 
 ## Why mTLS alone is not sufficient for epoch membership
@@ -241,22 +286,31 @@ testbed intentionally provides.
 
 - **Corrected failure-model boundary (2026-11-23).** A transient metadata/peer unavailability marks authority
   `invalid` and fails closed (503) but does **not** enter `RECOVERY_REQUIRED` and records **no** data-loss
-  incident. `RECOVERY_REQUIRED` is entered **only** on a proven local-binding/metadata mismatch (a lockout, not
-  a data-loss event), and a matching epoch restored later returns the replica to `DISCOVERING` automatically.
-  The epoch is never silently reset. Confirmed catastrophic loss is handled **only** by 5C. See
+  incident. `RECOVERY_REQUIRED` is an authorization lockout that can result from a confirmed local-binding/
+  metadata mismatch or a confirmed same-epoch genesis authorization revocation. Neither condition establishes
+  authoritative-data loss; the local database and durable binding are preserved. A matching authoritative
+  observation restored later returns the replica to `DISCOVERING` automatically, **unless** the restored
+  observation is a confirmed same-epoch genesis revocation: while that unchanged, revoked genesis-authorization
+  observation persists, the seed remains locked out in `RECOVERY_REQUIRED` (no automatic reinstatement; the
+  operator must perform an authorized recovery — the implementation recognizes both the establishment of a new
+  epoch and the legitimate restoration of the pending grant). The epoch is never silently reset. Confirmed
+  catastrophic loss is handled **only** by 5C. See
   [lifecycle-metadata-and-genesis.md](lifecycle-metadata-and-genesis.md#4-transient-versus-catastrophic-metadata-failure).
-- No production Kubernetes metadata provider wired into the running application: the controller uses a no-op
-  source that always reports metadata unavailable. In production, replicas with lifecycle enabled will stay
-  unready until the 5B provider is deployed and lifecycle enforcement is enabled. *(5B Stage 0 implements the
-  read-only ConfigMap-backed provider; it is not active in the default build.)*
+- The production Kubernetes metadata provider is implemented and wired into the application. It is opt-in and
+  requires both lifecycle enforcement and Kubernetes metadata configuration to be enabled
+  (`GOSSIPGRID_LIFECYCLE_ENABLED=true` and `GOSSIPGRID_LIFECYCLE_METADATA_KUBERNETES=true`); the default
+  configuration does not activate it, in which case the controller uses a no-op source that always reports
+  metadata unavailable. When lifecycle enforcement is enabled without an authoritative metadata source,
+  admission fails closed. The provider is not yet cluster-verified.
 - No automatic genesis: a fresh replica with no binding cannot automatically initialize an empty epoch.
-  *(5B Stage 3+ adds operator-controlled one-time genesis.)*
+  *(5B Stages 1A and 1B already implement operator-controlled genesis authorization and finalization.
+  Stage 3 adds reconstruction orchestration and controlled READY promotion; 5C adds operator recovery.)*
 - No automatic epoch reset: a `RECOVERY_REQUIRED` replica cannot automatically return to `READY`; operator
   intervention is required. *(5C adds the explicit operator recovery procedure.)*
 - No snapshot transfer orchestration: the initial data baseline (the path from `SYNCING` to `READY`) is not yet
   implemented as a scheduled sweep; `SetReady` is provided for test purposes. The transport-and-commit mechanism
-  (`FetchBootstrapBaseline`) is implemented in 5B Stage 2 (under independent review). *(5B Stage 3 adds source
-  discovery, sweep scheduling, and automatic `READY` promotion.)*
+  (`FetchBootstrapBaseline`) is implemented, committed, and locally tested in 5B Stage 2. *(5B Stage 3 adds
+  source discovery, sweep scheduling, and automatic `READY` promotion.)*
 - 5A alone does **not** make GossipGrid safe for catastrophic cluster recovery. It provides the fencing and
   admission framework; the full recovery protocol requires the 5B metadata provider (wired into the running
   application), snapshot transfer orchestration, and the 5C operator recovery procedures.

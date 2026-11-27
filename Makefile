@@ -14,6 +14,16 @@
 #
 # `qa` *verifies* formatting (fails on a diff) rather than rewriting sources;
 # `fmt` is the target that actually modifies files.
+#
+# Artifact generation is deliberately separated from validation:
+#   - `make architecture`    generates the committed SVG/PNG diagram outputs.
+#   - `make build`          compiles the persistent application binary into ./bin.
+#   - `make qa`             validation only; it never regenerates diagram assets,
+#                            never compiles the persistent binary, never builds a
+#                            container image, and never rewrites tracked sources.
+#   - `make all`            explicit aggregate: generate diagrams, build, then run
+#                            qa, sequentially (not in parallel under -j).
+#   - `make clean`          removes build outputs (the persistent binary only).
 
 BIN_DIR    := bin
 BIN        := $(BIN_DIR)/gossipgrid
@@ -196,7 +206,12 @@ DIAGRAM_GEN    := $(DIAGRAM_DIR)/generated
 # The set of rendered diagram bases. system-architecture is the main diagram
 # embedded in the README; the rest are linked from the documentation pages.
 DIAGRAM_BASES  := system-architecture gossip-replication lifecycle-recovery \
-                  lifecycle-recovery-sequence lifecycle-5a security-credentials gitops-delivery
+                  lifecycle-recovery-sequence lifecycle-5a security-credentials \
+                  security-credential-rotation gitops-delivery \
+                  concept-gossip-propagation concept-eventual-consistency concept-gossip-vs-antientropy \
+                  concept-epoch-fencing concept-operator-genesis concept-bootstrap-admission \
+                  concept-bootstrap-privilege-isolation concept-transactional-install \
+                  concept-revocation-linearization concept-ephemeral-recovery concept-gitops-rollback
 
 .PHONY: docs-lint
 docs-lint: ## Lint repository Markdown documents (fails on violations; does not modify files)
@@ -213,8 +228,11 @@ docs-fix-preview: ## Show Markdown fixes --fix would apply (does not modify file
 # cached in the npm cache; no global install is required. A puppeteer config
 # is passed so mmdc can run in a headless environment.
 #
-# The -b option sets the background to white so the PNG is not transparent.
-# The -w option sets the PNG width for a readable raster image.
+# The -b white option sets the PNG canvas to opaque white, matching the
+# light-background "base" theme used by mermaid-config.json (so the SVG and
+# PNG share a coherent light canvas and text contrast). The -w option sets the
+# PNG width for a readable raster image. The light canvas is the supported
+# baseline; native inline Mermaid separately supports the host's adaptive theme.
 #
 # Regenerate all diagrams:   make architecture
 # Regenerate one:            make architecture DIAGRAM=system-architecture
@@ -274,11 +292,24 @@ DIAGRAM_DOC_MAP := \
   lifecycle-recovery-sequence:docs/recovery.md \
   lifecycle-5a:docs/gossip-and-bootstrap.md \
   security-credentials:docs/security.md \
-  gitops-delivery:docs/kubernetes-deployment.md
+  security-credential-rotation:docs/security.md \
+  gitops-delivery:docs/kubernetes-deployment.md \
+  concept-gossip-propagation:docs/concepts/gossip-protocols.md \
+  concept-eventual-consistency:docs/concepts/eventual-consistency.md \
+  concept-gossip-vs-antientropy:docs/concepts/anti-entropy.md \
+  concept-epoch-fencing:docs/concepts/epoch-fencing.md \
+  concept-operator-genesis:docs/lifecycle-metadata-and-genesis.md \
+  concept-bootstrap-admission:docs/gossip-and-bootstrap.md \
+  concept-bootstrap-privilege-isolation:docs/concepts/distributed-authority.md \
+  concept-transactional-install:docs/concepts/concurrency-and-linearization.md \
+  concept-revocation-linearization:docs/concepts/concurrency-and-linearization.md \
+  concept-ephemeral-recovery:docs/concepts/ephemeral-state-and-recovery.md \
+  concept-gitops-rollback:docs/concepts/ephemeral-state-and-recovery.md
 
 .PHONY: diagrams-check
-diagrams-check: ## LEVEL 1: Verify embedded Mermaid blocks in docs match the .mmd sources AND no malformed note patterns (fails on mismatch)
+diagrams-check: ## LEVEL 1: Verify embedded Mermaid blocks in docs match .mmd sources, no malformed note patterns, adjacent artifact links resolve, and self-test fixtures pass
 	@bash scripts/diagrams_check.sh $(DIAGRAM_DOC_MAP)
+	@bash scripts/diagrams_check.sh --self-test
 
 # LEVEL 2 (render validation): render every canonical .mmd source using the
 # pinned Mermaid CLI (mmdc) to SVG and PNG in a TEMPORARY directory, and verify
@@ -357,6 +388,20 @@ deploy-checks: ## Run the GossipGrid Helm chart regression checks (read-only, no
 	$(call check_tool,helm,see https://helm.sh/docs/intro/install/)
 	$(call check_tool,python3,install with: apk add python3 py3-yaml (Alpine) or apt-get install python3 python3-yaml (Debian))
 	bash $(DEPLOY_CHECKS)
+
+# all is the explicit aggregate workflow: generate the diagram assets, compile
+# the application binary, then run the validation suite. The recipe is
+# sequential (each line is a separate recursive Make invocation) so that `make
+# -j all` does not run qa concurrently with artifact generation. It does NOT
+# include image publication, deployment, contact sheets, fmt, or clean; those
+# remain their own explicit targets. The FIPS and version-injection behavior of
+# build is unchanged (build is invoked as-is; the qa suite carries the version
+# regression tests).
+.PHONY: all
+all: ## Generate diagrams, build the application, and run QA
+	$(MAKE) architecture
+	$(MAKE) build
+	$(MAKE) qa
 
 # qa is verification only: it must not modify any tracked file. diagram
 # generation (make architecture) writes the committed SVG/PNG outputs and is

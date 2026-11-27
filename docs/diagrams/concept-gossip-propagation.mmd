@@ -1,0 +1,29 @@
+flowchart TB
+  subgraph PATH["One possible dissemination path (fanout=2, rounds=3, illustrative)"]
+    direction TB
+    O("gossipgrid-0 (commits m1)")
+    A("gossipgrid-1 {m1}")
+    B("gossipgrid-2 {m1}")
+    C("gossipgrid-3 {m1}")
+    D("gossipgrid-4 {m1}")
+    M("peer X { } (missed m1)")
+    O -->|"Event 1 (origin): fanout to A, B"| A
+    O -->|same event| B
+    A -->|"Event 2 (A's propagation): fanout to C"| C
+    B -->|"Event 3 (B's propagation): fanout to D"| D
+    A -. "peer X partitioned during A's propagation" .-> M
+  end
+
+  subgraph REPAIR["Anti-entropy closes the gap (cold path, implemented)"]
+    direction TB
+    M2("peer X (timer fires)")
+    M3("m1 discovered missing, fetched, inserted (idempotent)")
+    M2 --> M3
+  end
+
+  PATH -->|"gossip is best-effort; gaps are closed by anti-entropy"| REPAIR
+
+  class O origin
+  class A,B,C,D hop
+  class M,M2,M3 missed
+  linkStyle default stroke-width:1.8px

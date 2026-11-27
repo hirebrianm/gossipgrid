@@ -1,0 +1,27 @@
+sequenceDiagram
+  autonumber
+  participant REQ as Requester
+  participant SRC as Source
+  participant GUARD as Guard
+  participant DB as SQLite
+
+  Note over REQ: SYNCING, pinned context
+  REQ ->> REQ: Authorize bootstrap
+  REQ ->> SRC: Fetch inventory (mTLS)
+  SRC ->> SRC: Check source admission
+  SRC -->> REQ: Inventory page
+  REQ ->> REQ: Recheck and validate
+  REQ ->> REQ: Authorize fetch
+  REQ ->> SRC: Fetch batch (mTLS)
+  SRC ->> SRC: Check source admission
+  SRC -->> REQ: Message records
+  REQ ->> REQ: Recheck and validate
+
+  REQ ->> GUARD: Guarded install (acquire guard before BEGIN)
+  GUARD ->> DB: BEGIN
+  Note over DB: write, retention, install, conflict
+  DB -->> GUARD: COMMIT (guard held through COMMIT)
+  GUARD -->> REQ: Committed
+
+  Note over REQ: Remains SYNCING
+  Note over SRC: READY or DEGRADED

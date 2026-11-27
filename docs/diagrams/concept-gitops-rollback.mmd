@@ -1,0 +1,22 @@
+flowchart TB
+  RB("Rollback workload configuration (M9, planned, not performed)")
+  POD("Replaced pod: fresh emptyDir")
+  DATA{"Authoritative-data availability<br/>independently determined?"}
+  RB --> POD --> DATA
+  DATA -->|Surviving source| SURV(["Retained records survive"])
+  DATA -->|Unknown| UNKNOWN("Investigate availability")
+  DATA -->|"Confirmed loss (verified)"| LOST(["Complete authoritative loss"])
+  SURV -.->|Stage 3, planned| REBUILD("Reconstruction (Stage 3, planned)")
+  UNKNOWN --> WAIT("No loss conclusion")
+  LOST -.->|M5C, planned| RECOVERY("Operator recovery (M5C, planned)")
+
+  class RB planned
+  class POD new
+  class DATA state
+  class SURV recover
+  class UNKNOWN new
+  class LOST lost
+  class REBUILD planned
+  class WAIT new
+  class RECOVERY planned
+  linkStyle default stroke-width:1.8px

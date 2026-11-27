@@ -2,7 +2,8 @@
 
 **Scope separation:** application source and Helm packaging are developed here; cluster-wide prerequisites (Vault
 issuer, cert-manager, trust-manager, Cilium Gateway/LB configuration, DNS, GitLab Agent access) are handled in a
-separate cluster operations track.
+separate cluster operations track. For a learning-oriented walkthrough of the distributed-systems concepts that
+underpin the deployment and delivery model, see the [concept library](concepts/README.md).
 
 **Status:** This document describes the **target design** for the Kubernetes deployment (Milestones 7A and 7B)
 and the GitOps delivery pipeline (Milestone 8). Milestone 7A (initial Kubernetes staging) is **deployed and
@@ -537,54 +538,56 @@ The full GitOps delivery pipeline — the ownership boundary between CI (build/p
 (deployment reconciliation), the promotion/rollback/validation boundary, and the StatefulSet rollout — is
 shown below (the authoritative `gitops-delivery.mmd` source embedded natively).
 
+[View full-size SVG](diagrams/generated/gitops-delivery.svg) · [View PNG](diagrams/generated/gitops-delivery.png)
+
 <!-- DIAGRAM:gitops-delivery -->
 ```mermaid
-flowchart LR
-  DEV["Developer commit / tag (v0.1.0-alpha.N)"]
-  DEV --> CI
-
-  subgraph CILAB["GitLab CI (implemented)"]
-    direction TB
-    CI["QA + security checks (make qa: fmt, vet, golangci-lint, gosec, docs-lint, tests, race, version-injection)"]
-    IMG["Container image build (multistage static musl, scratch, non-root 65534) - currently manual: make image"]
-    PUBLISH["Publish immutable image by commit SHA / digest - currently manual push"]
-    CI --> IMG --> PUBLISH
+flowchart TB
+  subgraph S1["1. Development and validation"]
+    direction LR
+    DEV("Commit or tag") --> CI("GitLab CI") --> QA("QA and security")
   end
 
-  subgraph M8["GitOps delivery (M8, partial)"]
-    direction TB
-    REG["Container registry - private GitLab, immutable image by SHA256 digest (operational)"]
-    GOREPO["GitOps repository - Helm values + Argo CD application manifest (digest updated manually today)"]
-    ARGO["Argo CD - reconciles the cluster to the recorded revision (operational)"]
-    PUBLISH -->|manual publish by digest| REG
-    REG -->|manual digest update| GOREPO
-    GOREPO -->|watch and reconcile| ARGO
+  subgraph S2["2. Publish and record"]
+    direction LR
+    PUB("Manual publish") --> REG[("Image digest")]
+    REG --> DIG("Manual digest update")
+    DIG --> REPO("k8s-gitops")
   end
 
-  ARGO --> K8S["StatefulSet gossipgrid rollout (5 replicas, Parallel)"]
-
-  subgraph PLANNED["Still planned (M8 automation)"]
-    direction TB
-    AUTO["Automated image publishing - CI commits digest to k8s-gitops"]
-    AUTOREV["Automated GitOps revision updates"]
-    PROMOTE["Automated promotion and delivery workflows"]
-    AUTO --- AUTOREV --- PROMOTE
+  subgraph S3["3. Kubernetes reconciliation"]
+    direction LR
+    ARGO("Argo CD") --> STS("StatefulSet")
+    STS --> PODS("Five replicas")
   end
 
-  subgraph BOUND["Promotion / rollback / validation boundaries (target)"]
-    direction TB
-    PROMO["Promotion = tag push: a full pipeline (QA, build, publish, GitOps update)"]
-    ROLLBACK["Rollback = revert of the GitOps revision; Argo CD reconciles back to the previous digest"]
-    VALIDATE["Validation = on-cluster tests (M7A/M7B); a failed Argo CD sync is observable and reversible"]
-    PROMO --- ROLLBACK --- VALIDATE
+  subgraph S4["M8 automation - planned"]
+    direction LR
+    AUTO("CI build and publish") --> UPDATE("Update GitOps")
+    UPDATE --> PROMOTE("Release promotion")
   end
-  GOREPO -.-> BOUND
-  GOREPO -.-> PLANNED
 
-  NOTE["Ownership boundary: GitLab CI builds and publishes only - it NEVER deploys directly to the cluster. Argo CD owns deployment reconciliation. No overlapping deployment ownership."]
-  CI -.-> NOTE
-  ARGO -.-> NOTE
+  S1 --> S2
+  S2 --> S3
+  S3 -.-> S4
+
+  class DEV,CI,STS,PODS,REG new
+  class QA new
+  class PUB,DIG missed
+  class REPO,ARGO metadata
+  class AUTO,UPDATE,PROMOTE planned
+  linkStyle default stroke-width:1.8px
 ```
+
+**Ownership boundary.** GitLab CI owns build and publish automation; Argo CD owns deployment
+reconciliation. Current image publication and digest update are manual. CI does not directly deploy
+to Kubernetes. The three implemented stages are stacked vertically: development and validation,
+publish and record, and Kubernetes reconciliation. The dashed edge from the reconciliation stage
+to the "M8 automation - planned" stage indicates a **future automation** that would close the
+manual publish and digest-update steps into the CI pipeline; it is **not** an additional
+implemented deployment step. Release promotion (a tag push triggers the full pipeline), rollback
+(a revert of the GitOps revision), and validation (on-cluster tests) are target-state semantics
+documented here, not automated workflows.
 
 ## Tests to demonstrate
 
@@ -600,7 +603,7 @@ tests pending:**
 7. Go FIPS module v1.0.0 enabled in the running application. ✅
 8. An immutable container image deployed from a private GitLab registry through Argo CD. ✅
 9. Five pods gossip to convergence under normal operation. 🔜 Pending
-10. A pod replacement loses local SQLite and is re-reconciled by anti-entropy (a best-effort test; **not** an
+10. A pod replacement loses local SQLite and recovers messages through anti-entropy (a best-effort test; **not** an
     authoritative initial-snapshot, safe-genesis, or readiness-gating guarantee — those are 5B/7B). 🔜 Pending
 11. A temporary partition causes missing/unreachable status, then heals via anti-entropy. 🔜 Pending
 12. Reload pod mTLS credentials as cert-manager rotates them. 🔜 Pending

@@ -4,72 +4,138 @@
 leader. Milestones 4A–4C implement the gossip and anti-entropy wire protocols (all **implemented and locally
 tested**); Milestone 5A (implemented 2026-11-21, `v0.1.0-alpha.5`) adds the lifecycle state machine, durable epoch
 binding, epoch fencing, and fail-closed admission (**implemented and locally tested**). Milestone 5B is
-**partially implemented**: Stage 0 (read-only Kubernetes metadata provider) and Stage 2 (bootstrap replication
-admission, `FetchBootstrapBaseline` transport-and-commit mechanism) are implemented and locally tested but not
-yet committed or cluster-verified; Stage 3 (source discovery/selection, sweep scheduling, automatic `READY`
-promotion) is designed but not implemented. The Kubernetes metadata authority (ConfigMap-backed, schema v1),
-operator-controlled one-time genesis, and full initial snapshot transfer (SYNCING → READY) are **not yet
-complete** (Milestone 5B, Stages 3+).
+**partially implemented**: Stage 0 (read-only Kubernetes metadata authority, ConfigMap-backed, schema v1) is
+implemented; Stage 1A (operator-controlled genesis authorization, Kubernetes genesis grant) is implemented;
+Stage 1B (operator-authorized genesis finalization, one-time idempotent) is implemented; Stage 2 (dedicated
+bootstrap replication admission and guarded `FetchBootstrapBaseline` installation, transport-and-commit
+mechanism) is implemented, committed, and locally tested (not yet cluster-verified); Stage 3 (reconstruction
+orchestration: source discovery/selection, sweep scheduling, controlled `READY` promotion) is designed but not
+implemented. Milestone 5C (operator recovery) is designed but not implemented. Milestone 5B overall is
+**incomplete and not yet cluster-verified**: the one-time genesis authorization and finalization (Stages 1A/1B)
+and the dedicated bootstrap admission and fail-closed authority handling (Stages 0, 2) are implemented; the
+reconstruction orchestration (Stage 3) and operator recovery (5C) remain planned.
 
 **Replication diagram:** The implemented distributed messaging mechanism (local persistence, gossip fanout,
 idempotent peer transfer, retries, and anti-entropy reconciliation toward eventual convergence) is illustrated
 in [gossip-replication](diagrams/generated/gossip-replication.svg)
 ([PNG](diagrams/generated/gossip-replication.png)). The lifecycle state machine and the replacement-pod/recovery
 sequence are in [lifecycle-recovery](diagrams/generated/lifecycle-recovery.svg) and
-[lifecycle-recovery-sequence](diagrams/generated/lifecycle-recovery-sequence.svg).
+[lifecycle-recovery-sequence](diagrams/generated/lifecycle-recovery-sequence.svg). For a
+learning-oriented walkthrough of the gossip, anti-entropy, and bootstrap concepts that underpin
+this protocol, see the [concept library](concepts/README.md).
 
 ## Replication mechanism (gossip and anti-entropy)
 
 The implemented distributed messaging mechanism — local persistence, gossip fanout, idempotent peer transfer,
 retries, and anti-entropy reconciliation toward eventual convergence — is shown below (the authoritative
-`gossip-replication.mmd` source embedded natively). The [SVG](diagrams/generated/gossip-replication.svg) and
-[PNG](diagrams/generated/gossip-replication.png) links are fallbacks.
+`gossip-replication.mmd` source embedded natively). The detailed anti-entropy reconciliation cycle
+(inventory diff, bounded fetch, cursor advancement, admission re-check) is in the
+[anti-entropy concept diagram](concepts/anti-entropy.md).
+
+[View full-size SVG](diagrams/generated/gossip-replication.svg) · [View PNG](diagrams/generated/gossip-replication.png)
 
 <!-- DIAGRAM:gossip-replication -->
 ```mermaid
 flowchart TB
-  C["Client / browser"]
-  C -->|"POST /api/messages"| API["Public API (m6)"]
-
-  subgraph REPL["Replica (one of gossipgrid-0..4) - implemented, opt-in"]
-    direction TB
-    API -->|"local commit (idempotent UUIDv7)"| DB1[("Local SQLite")]
-    DB1 -->|"insert callback enqueues"| Q["Gossip work queue (bounded, non-blocking)"]
-    Q --> W["Gossip workers (bounded count)"]
-    W --> SEL["Peer selection (fanout per round, up to rounds; excludes self, sender, contacted; filters exhausted + permanently rejected)"]
-    SEL -->|"admission re-check before send (5A)"| ADMIT{"Authorized?"}
-    ADMIT -->|no| BLOCK["Block outbound (no retry)"]
-    ADMIT -->|yes| DLV["Deliver POST /internal/messages over peer mTLS 1.3 (RealDelivery)"]
-    DLV --> ACK["Peer ack: inserted / duplicate no-op / 409 conflict"]
-    ACK -->|409, 400, 413, invalid ack = permanent| PERM["Mark peer permanently rejected (no retry)"]
-    ACK -->|network / timeout / 5xx / 429 = transient| RETRY["Exponential-backoff retry (bounded attempts per peer)"]
-    RETRY --> DLV
-    ACK -->|inserted, on the peer side| ONNEW["onNewMessage callback re-enqueues fanout (deduped by pending-ID set)"]
+  subgraph S1["1. Sender - commit and enqueue"]
+    direction LR
+    C("Client") --> API("Public API")
+    API --> DB1[("SQLite")]
+    DB1 --> Q("Gossip queue")
   end
 
-  DLV -. "peer mTLS 1.3, identity-verified" .-> PEER["Peer replica (gossipgrid-x)"]
-  PEER -->|"POST /internal/messages (idempotent insert)"| PDB[("Peer SQLite")]
-
-  subgraph AE["Anti-entropy (M4C, implemented, opt-in) - periodic, PULL-based"]
-    direction TB
-    T["Scheduler (interval)"] --> CYC["Per-cycle sweep of eligible peers (from discovery snapshot)"]
-    CYC --> INV["GET /internal/sync/ids - bounded keyset-paginated ID inventory"]
-    INV --> DIFF["Diff against local store (WHERE id IN ...; bounded)"]
-    DIFF --> FETCH["POST /internal/sync/messages - fetch missing records in bounded batches"]
-    FETCH --> INS["Insert via ON CONFLICT DO NOTHING (idempotent, no overwrite)"]
-    INS --> CUR["Advance per-peer cursor only after full page (completed only on has_more=false)"]
-    CUR -->|"next cycle / full sweep resets cursor"| CYC
-    CYC -->|"admission re-check (5A); 409 epoch mismatch = permanent"| AEBLOCK["Block / do not merge"]
+  subgraph S2["2. Sender - delivery attempt"]
+    direction LR
+    W("Select peer") --> ADMIT{"Authorized?"}
+    ADMIT -->|yes| SEND("Send over mTLS")
+    ADMIT -->|no| BLOCK("Block")
   end
 
-  T -. "same replica's own scheduler" .-> T
-  PEER -. "replica runs the same anti-entropy loop" .-> T
+  subgraph S3["3. Receiver - validate and insert"]
+    direction LR
+    IN{"Admitted?"}
+    IN -->|yes| PDB[("Idempotent insert")]
+    IN -->|no| REJECT("Reject")
+    PDB -->|success| ACK("Respond")
+    PDB -->|new only| PQ("Forwarding queue")
+  end
 
-  CONVERGE["Eventual convergence - no global guarantee; finite fanout + periodic anti-entropy"]
-  DB1 -.-> CONVERGE
-  PDB -.-> CONVERGE
-  INS -.-> CONVERGE
+  subgraph S4["4. Sender - delivery outcomes"]
+    direction LR
+    RESULT{"Result"}
+    RESULT -->|Valid ack| MARK("Acknowledged")
+    RESULT -->|Permanent| PERM("Stop retries")
+    RESULT -->|Epoch mismatch| FENCE("No retry")
+    RESULT -->|Transient| RETRY("Bounded retry")
+  end
+
+  subgraph AE["Independent periodic anti-entropy"]
+    direction LR
+    TIMER("Scheduled sweep") --> AADM{"Authorized?"}
+    AADM -->|yes| INV("Inventory")
+    INV --> FETCH("Fetch missing")
+    FETCH --> INSTALL("Install")
+    AADM -->|no| SKIP("Skip")
+  end
+
+  S1 --> S2
+  S2 -->|"If request reaches peer"| S3
+  S3 ~~~ S4
+  S4 ~~~ AE
+
+  class C,API,SEND,INV,FETCH,INSTALL push
+  class DB1,PDB sqlite
+  class Q,W,PQ new
+  class ADMIT,IN,RESULT,AADM guard
+  class MARK,ACK ready
+  class BLOCK,REJECT,PERM,FENCE,SKIP failure
+  class RETRY,TIMER missed
+  linkStyle default stroke-width:1.8px
 ```
+
+**Reading the panels.** Panel 4 ("Sender — delivery outcomes") describes any sender delivery
+attempt, including attempts that never reach the receiver (a transient network failure, for example).
+A successful receiver insertion **or** an already-present identical record can produce a successful
+response. Newly inserted records may enqueue independent receiver-side forwarding when gossip is
+enabled; that asynchronous forwarding is **not** triggered by the sender's acknowledgment. Transient
+failures can produce another bounded delivery attempt; the backward retry edge is intentionally
+omitted to preserve diagram readability. A timeout after a remote insertion remains an ambiguous
+transient result (idempotency makes the bounded retry safe), **not** a successful delivery.
+
+**Delivery outcome classification (verify against `classifyError` in
+`internal/gossip/gossip.go`).** Panel 4 distinguishes four distinct results, not just success and
+failure:
+
+- **Successful validated acknowledgment** (HTTP 200 with a valid response envelope): the peer is
+  added to the excluded set (never contacted again for this message) and counted as an
+  acknowledged delivery.
+- **Permanent rejection** (HTTP 400/404/409/413/415, or an invalid acknowledgment that is not an
+  epoch mismatch): the peer is marked permanently rejected for this message; no further attempts
+  are made to it. The peer is excluded from all subsequent fanout rounds.
+- **Epoch mismatch** (HTTP 409 with a body containing "epoch", or a `PeerAckError` mentioning
+  "epoch"/"cluster"): treated as a permanent, non-retried rejection. The peer belongs to a
+  different epoch and will not accept messages until the local epoch is corrected. Retrying
+  indefinitely would be wasteful and could mask a configuration error.
+- **Transient failure** (HTTP 429, 5xx, network errors, timeouts, ambiguous transport errors): a
+  targeted retry is scheduled with exponential backoff (capped at `RetryMax`), within the
+  per-peer `MaxAttempts` budget. The receiver's idempotent insert makes a bounded retry safe
+  (a timeout after a remote insert is not a failure).
+
+The receiver's successful idempotent insert can produce **two separate consequences**: a
+successful response to the sender (the 200 acknowledgment) and, **only if the record was newly
+inserted** (not already present), a new local propagation event via the `onNewMsg` callback.
+An already-present record does **not** trigger the new-message callback. The diagram does
+**not** imply a fixed ordering between the queued asynchronous forwarding (the "new only →
+forwarding queue" edge) and the acknowledgment receipt — they are independent side effects of the
+insert.
+
+The anti-entropy path (the "Independent periodic anti-entropy" panel) is a **separate, independently
+scheduled** replication path with its own admission requirements; it is not triggered by gossip
+completion and is not part of the gossip delivery outcome classification above. When lifecycle
+protection is enabled, the anti-entropy sweep is subject to the lifecycle admission check
+(`CheckReplicationOutbound`): a replica in `SYNCING` or another unready state is not authorized to
+perform anti-entropy sweeps, regardless of whether its database exists. The inventory endpoint is
+`GET /internal/sync/ids`; the bounded message-fetch endpoint is `POST /internal/sync/messages`.
 
 ## Milestone 5A — what is enforced vs. deferred to 5B
 
@@ -126,8 +192,9 @@ the **procedures** for safe bootstrap and recovery, which are reserved for Miles
 
 The `internal/lifecycle` package implements the state machine defined below. It is **opt-in** via
 `GOSSIPGRID_LIFECYCLE_ENABLED=true` (requires `GOSSIPGRID_PEER_TLS_ENABLED=true`). When disabled (the default), all
-existing Milestone 4 behavior is preserved. The [SVG](diagrams/generated/lifecycle-5a.svg) and
-[PNG](diagrams/generated/lifecycle-5a.png) links are fallbacks.
+existing Milestone 4 behavior is preserved.
+
+[View full-size SVG](diagrams/generated/lifecycle-5a.svg) · [View PNG](diagrams/generated/lifecycle-5a.png)
 
 <!-- DIAGRAM:lifecycle-5a -->
 ```mermaid
@@ -306,10 +373,19 @@ designated initial seed and becomes ready with an empty message set, then others
 narrow API-backed record holds **only metadata**, never messages. This should not be inferred from 'no peers
 answered'.
 
-**Status:** The genesis protocol is **designed but not implemented** (Milestone 5B, Stages 3+). The 5A state
-machine has the `GENESIS` state and the transition to it is defined, but the control-plane-coordinated genesis
-procedure (the mechanism that atomically sets the `Initialized` flag in the ConfigMap and designates the seed
-pod) is deferred to 5B.
+**Status:** The one-time genesis authorization and finalization are **implemented** (Milestone 5B, Stages 1A and
+1B). Stage 1A implements operator-controlled genesis authorization through a dedicated, restricted-RBAC genesis
+grant Job (namespace-scoped ConfigMap create permission and get permission restricted to the named metadata
+ConfigMap; among GossipGrid's dedicated ServiceAccounts, only the genesis grant identity has create permission).
+The application ServiceAccount remains read-only and cannot grant or consume its own genesis authorization. Stage 1B
+implements operator-authorized genesis finalization (the mechanism that atomically sets the `Initialized` flag in
+the ConfigMap via CAS, consumes the
+authorization, arms `DataLossProtected`, and promotes the seed to `READY` via seed-restart reconciliation). The 5A
+state machine's `GENESIS` state and transition are defined and used by these stages. **What remains planned:**
+Stage 3 implements reconstruction orchestration (source discovery/selection, sweep scheduling, controlled `READY`
+promotion for replacement replicas that join an already-initialized cluster — distinct from one-time genesis) and
+5C implements operator recovery. The full `SYNCING` → `READY` reconstruction path for replacement replicas is
+**not yet complete** (Milestone 5B, Stage 3; Milestone 5C).
 
 ## Milestone 5B — Authoritative metadata and initial synchronization (partially implemented)
 
@@ -339,14 +415,14 @@ eligibility rules that complete the bootstrap protocol.
   epoch. The `MetadataSource` interface (defined in 5A) is implemented with the ConfigMap-backed provider in
   5B.
 
-## Milestone 5B, Stage 2 — Bootstrap replication admission (implemented 2026-11-24; under independent review)
+## Milestone 5B, Stage 2 — Bootstrap replication admission (implemented 2026-11-24, committed `209cec1`)
 
 Milestone 5B, Stage 2 implements the **narrowly scoped bootstrap baseline fetch authorization** that enables an
 authenticated, epoch-bound `SYNCING` replica to retrieve an initial data baseline from an eligible authoritative
 source **without** granting ordinary replication, public-write, or source privileges to an incompletely
-synchronized replica. The implementation is complete and locally tested (unit tests, race-enabled tests, real
-SQLite store tests, and per-package integration tests) but **not yet committed** — it is under independent
-architecture review. The production wiring in `cmd/gossipgrid/main.go` connects the bootstrap admission
+synchronized replica. The implementation is complete, committed (`209cec1`), and locally tested (unit tests,
+race-enabled tests, real SQLite store tests, and per-package integration tests; not yet cluster-verified). The
+production wiring in `cmd/gossipgrid/main.go` connects the bootstrap admission
 (`CheckBootstrapFetch`), authorization source (`BootstrapAuthorizationSnapshot`), and commit guard
 (`CommitUnderBootstrapAuthorization`) to the lifecycle controller. The mechanism is **only active** when
 lifecycle protection is enabled (`GOSSIPGRID_LIFECYCLE_ENABLED=true`); the default build has lifecycle disabled,
@@ -543,10 +619,86 @@ Milestone 5B, Stage 3 will implement the full bootstrap orchestration:
 - **Complete sweep accounting** — the bootstrap sweep must track progress (per-peer cursor, completed passes)
   and handle partial sweeps (page-budget exhaustion) correctly.
 
-**Milestone 5B is NOT complete.** Stage 2 provides the admission and transport-and-commit mechanism (implemented,
-under independent review); Stage 3 provides the orchestration (source discovery, sweep scheduling, automatic
-`READY` promotion) that uses it. The Kubernetes metadata authority (ConfigMap-backed schema v1 document) and
-operator-controlled one-time genesis remain unimplemented (Stage 3+).
+**Milestone 5B is NOT complete.** Stages 0, 1A, 1B, and 2 are implemented, committed, and locally tested
+(Stage 2 provides the admission and transport-and-commit mechanism); Stage 3 provides the orchestration
+(source discovery, sweep scheduling, automatic `READY` promotion) that uses it. The initial snapshot transfer
+orchestration (the `SYNCING` → `READY` promotion path) is the remaining work (Stage 3+).
+
+### Visual example: the bootstrap admission sequence
+
+The diagram below shows the *focused* bootstrap admission sequence with four concise
+participants: the `SYNCING` *requester*, the *source*, the *commit guard*, and the *local SQLite*
+store. Local admission checks are drawn as self-messages and notes rather than as separate
+lifelines: the requester's *dedicated* bootstrap authorization (the `CheckBootstrapFetch`
+predicate) and *pinned* cluster/epoch context, the source's *dedicated* admission
+(`CheckBootstrapSourceInbound`) applied per request for both the *inventory* page and the *bounded
+message batches*, the requester's *response-consumption* authorization and *envelope* validation,
+and the *guarded* *transactional* *install* (the guard is acquired and validated before the SQLite
+transaction and held through `COMMIT`). The requester *stays `SYNCING`*. The *Stage 3*
+orchestration (source discovery, sweep scheduling, automatic `READY` promotion) is *not
+implemented* and is *labeled as such* in the diagram; long method names, the `X-GossipGrid-Request-Purpose`
+header, the lock-ordering details, and the Stage 3 limitations are described in the prose below.
+
+[View full-size SVG](diagrams/generated/concept-bootstrap-admission.svg) · [View PNG](diagrams/generated/concept-bootstrap-admission.png)
+
+<!-- DIAGRAM:concept-bootstrap-admission -->
+```mermaid
+sequenceDiagram
+  autonumber
+  participant REQ as Requester
+  participant SRC as Source
+  participant GUARD as Guard
+  participant DB as SQLite
+
+  Note over REQ: SYNCING, pinned context
+  REQ ->> REQ: Authorize bootstrap
+  REQ ->> SRC: Fetch inventory (mTLS)
+  SRC ->> SRC: Check source admission
+  SRC -->> REQ: Inventory page
+  REQ ->> REQ: Recheck and validate
+  REQ ->> REQ: Authorize fetch
+  REQ ->> SRC: Fetch batch (mTLS)
+  SRC ->> SRC: Check source admission
+  SRC -->> REQ: Message records
+  REQ ->> REQ: Recheck and validate
+
+  REQ ->> GUARD: Guarded install (acquire guard before BEGIN)
+  GUARD ->> DB: BEGIN
+  Note over DB: write, retention, install, conflict
+  DB -->> GUARD: COMMIT (guard held through COMMIT)
+  GUARD -->> REQ: Committed
+
+  Note over REQ: Remains SYNCING
+  Note over SRC: READY or DEGRADED
+```
+
+**Reading the diagram.** The *sequence* shows the *focused* bootstrap admission: (1) the
+*requester* (exactly `SYNCING`, epoch-bound, fresh valid initialized metadata, durable binding)
+checks the *dedicated* bootstrap authorization (the `bootstrapAuthorized()` predicate; lifecycle
+enforcement enabled); (2) the requester sends the *bootstrap fetch* (a `GET /internal/sync/ids`
+with the `X-GossipGrid-Request-Purpose: bootstrap-baseline` header and the *pinned* cluster/epoch
+context headers); (3) the *source* validates the request-purpose header (untrusted; selects the
+serving-side check) and applies `CheckBootstrapSourceInbound` (state is `READY` or `DEGRADED`,
+full `authorized()`, epoch match); (4) the source serves a bounded inventory page (keyset
+pagination; the response envelope is set from the original admission snapshot); (5) the
+requester validates the response envelope (the source's cluster/epoch must match the pinned
+context; a legacy peer without the envelope is rejected) and fetches the missing records in
+bounded batches (the batch size is bounded, default 8); the source applies the same
+`CheckBootstrapSourceInbound` for the bounded message-fetch request before serving the message
+records (the source's eligibility is re-validated per request, not only for the inventory page);
+(6) the commit guard
+(`CommitUnderBootstrapAuthorization`) is acquired and validated BEFORE the SQLite transaction
+(holding `c.mu RLock` and `m.mu RLock` through the callback); inside the transaction: acquire
+write access if retention is enabled, evaluate the injected retention clock, classify expired
+records, install retained records (`ON CONFLICT DO NOTHING`), check immutable-content conflicts,
+then `COMMIT` (the linearization point) with the guard still held; (7) the requester remains in
+`SYNCING`. Stage 3 (discovery, source selection, sweep scheduling, catch-up orchestration, `READY`
+promotion) is planned, not implemented. The bootstrap commit is not a promotion mechanism; there
+is no `PromoteToReady` method in the current code.
+
+The rendered diagram is available as
+[concept-bootstrap-admission.svg](diagrams/generated/concept-bootstrap-admission.svg) and
+[concept-bootstrap-admission.png](diagrams/generated/concept-bootstrap-admission.png).
 
 ## Joining an existing epoch
 

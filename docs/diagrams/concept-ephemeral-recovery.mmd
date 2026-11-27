@@ -1,0 +1,33 @@
+flowchart TB
+  LOSS("Pod replaced: emptyDir lost")
+  NEW("New pod: fresh SQLite")
+  DATA{"Authoritative data availability?"}
+
+  LOSS --> NEW --> DATA
+
+  DATA -->|"Eligible source survives"| SURV("Retained records available")
+  DATA -->|"Unknown"| UNKNOWN("Investigate availability")
+  DATA -->|"Independently confirmed loss"| LOST("Authoritative records lost")
+
+  subgraph BOOT["Bootstrap mechanism - Stage 2"]
+    direction TB
+    FETCH("Authorized baseline fetch")
+    INSTALL("Guarded installation")
+    SYNC(["Remains SYNCING"])
+    FETCH --> INSTALL --> SYNC
+  end
+
+  SURV -. "Stage 3 orchestration planned" .-> BOOT
+  BOOT -.-> READY(["Controlled READY promotion - planned"])
+  UNKNOWN --> WAIT("No loss conclusion")
+  LOST -.-> RECOVERY("Operator recovery - M5C planned")
+
+  class LOSS,LOST lost
+  class NEW new
+  class DATA guard
+  class SURV hasm1
+  class FETCH,INSTALL bootstrap
+  class SYNC state
+  class UNKNOWN,WAIT missed
+  class READY,RECOVERY planned
+  linkStyle default stroke-width:1.8px

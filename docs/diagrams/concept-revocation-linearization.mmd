@@ -1,0 +1,29 @@
+sequenceDiagram
+  autonumber
+  participant CM as Commit
+  participant CTRL as c.mu RWMutex
+  participant MACH as m.mu RWMutex
+  participant DB as SQLite
+  participant RV as Revocation
+
+  Note over CM,RV: Commit: c.mu RLock → m.mu RLock → callback (SQLite tx)
+  Note over CM,RV: Revocation: c.mu RLock → m.mu Lock (write)
+
+  Note over CM,RV: Ordering 1: revocation first
+  RV ->> CTRL: acquire c.mu RLock
+  RV ->> MACH: acquire m.mu Lock
+  Note over RV: state → RECOVERY_REQUIRED
+  RV ->> CTRL: release
+  CM ->> CTRL: c.mu RLock
+  CM ->> MACH: m.mu RLock
+  Note over CM: bootstrapAuthorized() = false, rejected
+
+  Note over CM,RV: Ordering 2: commit first
+  CM ->> CTRL: c.mu RLock
+  CM ->> MACH: m.mu RLock
+  CM ->> DB: BEGIN, install, COMMIT
+  CM ->> CTRL: release RLocks
+  Note over CM: records preserved
+  RV ->> CTRL: c.mu RLock
+  RV ->> MACH: m.mu Lock
+  Note over RV: state → RECOVERY_REQUIRED, committed records preserved

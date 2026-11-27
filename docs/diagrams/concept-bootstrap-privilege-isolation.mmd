@@ -1,0 +1,32 @@
+flowchart TB
+  S("gossipgrid-x = SYNCING (epoch-bound, authorized)")
+
+  subgraph MAY["Allowed - bootstrap fetch privilege (M5B Stage 2, implemented)"]
+    direction LR
+    M1("Bootstrap baseline fetch (sync/ids + sync/messages)")
+    M2("Guarded local install (CommitUnderBootstrapAuthorization)")
+  end
+
+  subgraph MAYNOT["Denied - all other privileges"]
+    direction LR
+    N1("Public writes (503)")
+    N2("Ordinary outbound gossip (rejected)")
+    N3("Ordinary inbound replication (rejected)")
+    N4("Authoritative bootstrap source (IsReady() = false)")
+    N5("Unrestricted periodic anti-entropy (needs ready state)")
+  end
+
+  P3("Self-promotion to READY: not authorized by Stage 2")
+  P4("Controlled READY promotion via Stage 3 orchestration (planned)")
+
+  S --> MAY
+  S --> MAYNOT
+  S -. "not authorized by Stage 2" .-> P3
+  P3 -. "planned (Stage 3)" .-> P4
+
+  class S state
+  class M1,M2 may
+  class N1,N2,N3,N4,N5 maynot
+  class P3 planned
+  class P4 planned
+  linkStyle default stroke-width:1.8px

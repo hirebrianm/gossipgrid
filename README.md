@@ -5,9 +5,9 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-**Status:** Milestones 0 through 5A, 5B (Stages 0, 1A, 1B), and 6 are implemented and locally tested (tag
-`v0.1.0-alpha.6`). Milestone 5B Stage 2 (bootstrap replication admission) is implemented and locally tested but
-**under independent architecture review, not yet committed or cluster-verified**. Milestone 7A (Kubernetes
+**Status:** Milestones 0 through 5A, 5B (Stages 0, 1A, 1B, and 2), and 6 are implemented and locally tested (tag
+`v0.1.0-alpha.7`). Milestone 5B Stage 2 (bootstrap replication admission) is **implemented, committed** (commit
+`209cec1`), and locally tested, but **not yet cluster-verified**. Milestone 7A (Kubernetes
 staging) is **deployed and initially smoke-tested in Kubernetes**; the remaining acceptance tests in
 [deploy/STAGING-RUNBOOK.md](deploy/STAGING-RUNBOOK.md) are pending. Lifecycle enforcement is disabled in 7A
 because Milestones 5B (Stage 3) and 5C are not yet implemented.
@@ -78,13 +78,14 @@ deliberate part of the testbed design.
 | Outbound epoch provider (current authorization, not stale) | ✅ |
 | Legacy-peer rejection (response envelope validation; mTLS alone does not prove epoch membership) | ✅ |
 | Kubernetes metadata authority (ConfigMap-backed, atomic resourceVersion update) | ✅ Milestone 5B Stage 0 (read-only provider) |
-| Kubernetes genesis grant (operator-authorized, read-only RBAC) | ✅ Milestone 5B Stage 1A |
+| Kubernetes genesis grant (restricted-RBAC operator grant Job: namespace-scoped create and named-ConfigMap get; only the genesis ServiceAccount has create) | ✅ Milestone 5B Stage 1A |
 | Operator-authorized genesis finalization (one-time, idempotent) | ✅ Milestone 5B Stage 1B |
-| Bootstrap replication admission (narrowly scoped, `SYNCING`-only, epoch-bound) | 🔜 Milestone 5B Stage 2 (implemented, **under independent review, not yet committed**) |
-| Bootstrap baseline fetch and commit (`FetchBootstrapBaseline`, bounded transactional install, pinned-epoch transport) | 🔜 Milestone 5B Stage 2 (implemented, **under independent review, not yet committed**) |
-| Initial snapshot transfer (SYNCING → READY) and operator-controlled one-time genesis | 🔜 Milestone 5B (Stage 3+) |
-| Snapshot-source eligibility (unsynced pods never source snapshots) | 🔜 Milestone 5B (Stage 3+) |
-| Fail-closed behavior when authoritative metadata is unavailable | 🔜 Milestone 5B (Stage 3+) |
+| Bootstrap replication admission (narrowly scoped, `SYNCING`-only, epoch-bound) | ✅ Milestone 5B Stage 2 (implemented, committed `209cec1`, locally tested; not yet cluster-verified) |
+| Bootstrap baseline fetch and commit (`FetchBootstrapBaseline`, bounded transactional install, pinned-epoch transport) | ✅ Milestone 5B Stage 2 (implemented, committed `209cec1`, locally tested; not yet cluster-verified) |
+| Automatic source discovery, selection, and sweep scheduling for initial snapshot transfer | 🔜 Milestone 5B Stage 3 (reconstruction orchestration; transport-and-commit mechanism implemented in Stage 2) |
+| Controlled READY promotion (automatic SYNCING → READY after baseline installed + initial catch-up) | 🔜 Milestone 5B Stage 3 (reconstruction orchestration; `PromoteToReady` not yet implemented) |
+| Snapshot-source eligibility (unsynced pods never source snapshots; `CheckBootstrapSourceInbound` implemented in Stage 2) | ✅ Milestone 5B Stage 2 (admission predicate implemented; automatic source selection is Stage 3) |
+| Fail-closed behavior when authoritative metadata is unavailable (authority `invalid`, 503, no data-loss incident) | ✅ Milestone 5A (implemented; 5B Stage 0 adds the production Kubernetes metadata provider) |
 | Operator recovery/reset authorization (no automatic destructive reset by default) | 🔜 Milestone 5C |
 | Catastrophic data-loss handling and epoch transitions with stale-data fencing | 🔜 Milestone 5C |
 | Incident and recovery audit information (persistent banner, metadata record) | 🔜 Milestone 5C |
@@ -104,78 +105,92 @@ deliberate part of the testbed design.
 
 ## Architecture at a glance
 
+[View full-size SVG](docs/diagrams/generated/system-architecture.svg) · [View PNG](docs/diagrams/generated/system-architecture.png)
+
 <!-- DIAGRAM:system-architecture -->
 ```mermaid
 flowchart TB
-  subgraph EXT["External systems (cluster prerequisites, owned by the cluster operations track)"]
-    direction LR
-    VAULT["Vault - browser CA + workload CA PKI, KV v2 credential authority"]
-    GLCI["GitLab CI - QA, build, publish (M8 delivery)"]
-  end
+  B("Browser")
+  VAULT("Vault PKI + KV v2")
 
-  B["Browser - internal CA HTTPS"]
+  subgraph EXT["External delivery"]
+    direction TB
+    GLCI("GitLab CI: QA + build")
+    MPUB("Manual publish")
+    REG[("Registry")]
+    GOREPO("k8s-gitops")
+
+    GLCI ~~~ MPUB
+    MPUB --> REG
+    REG -->|"Manual digest update"| GOREPO
+  end
 
   subgraph K8S["Kubernetes cluster"]
     direction TB
-    GW["Shared Cilium Gateway - existing, gateway.enabled=false in GossipGrid chart; HTTPRoutes managed in k8s-gitops"]
-    WEB["ClusterIP web Service - ready pods only"]
+    GW("Cilium Gateway")
+    WSVC("Web Service")
 
-    subgraph SS["StatefulSet gossipgrid - 5 replicas, Parallel, no PVCs"]
+    subgraph SS["GossipGrid StatefulSet - five replicas"]
       direction LR
-      APP["Replicas gossipgrid-0..4 - API :8080, peer :8443"]
-      SYNC["Peer discovery, gossip fanout, anti-entropy (implemented, opt-in)"]
-      DB[("Independent SQLite on emptyDir - pod-lifetime")]
+      subgraph R1["gossipgrid-0"]
+        direction TB
+        A1("Replica") --- D1[("SQLite")]
+      end
+      subgraph R5["gossipgrid-4"]
+        direction TB
+        A5("Replica") --- D5[("SQLite")]
+      end
+      R1 <-->|peer mTLS| R5
     end
 
-    B -->|HTTPS| GW
-    GW --> WEB
-    WEB --> APP
-    APP --- SYNC
-    APP --- DB
-
-    subgraph PKI["Peer PKI - separate workload trust domain (M3B implemented)"]
-      direction LR
-      WCA["Vault workload CA"]
-      CM["cert-manager - CSI driver, per-pod mTLS certs + browser TLS Secret"]
-    end
-    WCA --> CM
-    CM -. per-pod mTLS certs .-> APP
-    CM -. browser TLS Secret .-> GW
-
-    subgraph CRED["Browser auth credentials (M6 implemented locally; in-cluster delivery via VSO in M7A)"]
-      direction LR
-      VKV["Vault KV v2 - versioned credential: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key"]
-      VSO["Vault Secrets Operator"]
-      KSEC["Kubernetes Secret - full volume, never subPath, mounted read-only"]
-      VKV --> VSO --> KSEC
-    end
-    KSEC -. mounted credential file .-> APP
-
-    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B: Stages 0, 1A, 1B implemented; Stage 2 under independent review; Stage 3 pending; M5C planned)"]
-      direction LR
-      CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
-      RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]
-    end
-    CMETA --- RRBAC
-    CMETA -. metadata watch .-> APP
+    PEERSVC("Headless Service")
+    CMETA("Lifecycle ConfigMap")
+    CMCMD("cert-manager")
+    VSO("VSO")
+    KSEC("K8s Secret")
+    ARGO("Argo CD")
   end
 
-  subgraph GITOPS["GitOps delivery (M8 partial: immutable image + Argo CD work; automation incomplete)"]
-    direction LR
-    REG["Container registry - immutable image by digest"]
-    GOREPO["k8s-gitops repository - environment-specific Helm values + Argo CD application"]
-    ARGO["Argo CD - reconciles the cluster"]
-    GLCI -->|publish by digest| REG
-    REG -->|record digest| GOREPO
-    GOREPO -->|watch and reconcile| ARGO
-  end
-  ARGO -. deploys GossipGrid .-> SS
+  B -->|HTTPS| GW
+  GW --> WSVC
+  WSVC -->|route| SS
+  PEERSVC -. "discovery" .-> SS
+  CMCMD -. "per-pod certs" .-> SS
+  CMCMD -. "browser TLS" .-> GW
+  VSO --> KSEC
+  KSEC -. "mounted" .-> SS
+  CMETA -. "metadata" .-> SS
+
+  VAULT -->|issue certs| CMCMD
+  VAULT -->|sync secrets| VSO
+  GOREPO -. "desired state" .-> ARGO
+  ARGO -->|reconcile| SS
+
+  class B new
+  class GW,WSVC,PEERSVC push
+  class A1,A5 new
+  class D1,D5 sqlite
+  class CMETA,VSO,KSEC metadata
+  class VAULT,CMCMD metadata
+  class GLCI,MPUB new
+  class REG new
+  class GOREPO,ARGO metadata
+  linkStyle default stroke-width:1.8px
 ```
 
-The diagram above is a logical overview of the whole application. GossipGrid is shown as one StatefulSet of
-five replicas with a single independent SQLite-per-replica storage model (not five repeated pod/database
-drawings). External Vault and GitLab CI are treated as external cluster prerequisites, not components inside
-the cluster. The diagram renders natively on GitHub and GitLab; the
+The diagram above is a logical overview of the whole application. GossipGrid is shown as one StatefulSet
+whose five configured replicas each keep an independent SQLite store; the two illustrated replicas
+(`gossipgrid-0` and `gossipgrid-4`, each in its own compact replica group with its SQLite database
+immediately below) are representative of the five deployed replicas (`gossipgrid-0..4`). The Web
+Service routes to the StatefulSet as a group (not to individual replicas). Peer mTLS is direct and
+bidirectional between the illustrated replicas — it does not flow through the Web Service or the
+headless Service. The external "External delivery" group shows GitLab CI (QA and build), a manual
+publish step, the registry, and the `k8s-gitops` repository, each separate from the automated CI;
+the registry feeds a manual digest update into `k8s-gitops`. The Registry and `k8s-gitops` repository
+sit outside the cluster. Argo CD is declared only inside the Kubernetes cluster. External Vault is
+treated as an external cluster prerequisite. Automated CI-driven image publication and automated
+GitOps updates are not depicted because they are not yet implemented (Milestone 8). The diagram
+renders natively on GitHub and GitLab; the
 [SVG](docs/diagrams/generated/system-architecture.svg) and
 [PNG](docs/diagrams/generated/system-architecture.png) links are fallbacks.
 
@@ -226,6 +241,12 @@ enter the user-facing Service.
 - [Data loss and recovery](docs/recovery.md)
 - [Security, certificates and FIPS](docs/security.md)
 - [Kubernetes and delivery design](docs/kubernetes-deployment.md)
+- [Concept library — how the distributed-systems pieces fit together](docs/concepts/README.md) —
+  the learning progression: how replicas communicate, why they disagree, how they reconcile,
+  how distributed authority constrains operations, how epochs fence stale participants, how
+  concurrency affects correctness, how ephemeral replicas recover.
+- [Visual design system](docs/visual-design.md) — the color, shape, and line-style conventions
+  used in all diagrams and (eventually) the native visualization interface.
 - [Implementation milestones and review protocol](docs/development-plan.md)
 - [Milestone 7A staging runbook](deploy/STAGING-RUNBOOK.md)
 - [Vault and cert-manager provisioning](deploy/vault/PROVISIONING.md)
@@ -244,7 +265,8 @@ daemon.
 ```sh
 make build       # compile the binary into ./bin/gossipgrid (FIPS-enabled by default)
 make run         # build and run locally (default config: :8080, hostname node)
-make qa          # verify fmt, vet, lint, security, unit tests, race detection
+make qa          # validation only: verify fmt, vet, lint, security, unit tests, race detection
+make all         # generate diagrams, build the application, and run QA (sequential)
 make lint        # run golangci-lint (fails on findings)
 make security    # run gosec security scan (fails on actionable findings)
 make test        # unit tests only
@@ -254,6 +276,23 @@ make image       # build the static Docker image
 make version     # show the resolved build version, FIPS module, and image reference
 make clean       # remove build outputs
 ```
+
+Artifact generation and validation are deliberately separated, so a validation run never rewrites
+the repository:
+
+- `make qa` — **validation only**. It verifies formatting, vet, lint, security, unit tests, and
+  race detection; it does not regenerate diagram assets, does not compile the persistent binary,
+  does not build container images, and does not rewrite Go or Markdown sources.
+- `make architecture` — explicit diagram generation: renders each canonical `docs/diagrams/*.mmd`
+  source to the committed SVG/PNG outputs under `docs/diagrams/generated/`.
+- `make diagrams-render` — explicit temporary rendering validation (level 2): renders all
+  `.mmd` sources to a temporary directory to confirm they render without error; it never touches
+  the committed outputs.
+- `make build` — explicit binary compilation into `./bin/gossipgrid`.
+- `make all` — the explicit aggregate workflow: `make architecture`, then `make build`, then
+  `make qa`, run sequentially (not concurrently under `make -j`). It does not include image
+  publication, deployment, contact sheets, `fmt`, or `clean`.
+- `make clean` — explicit build-artifact removal (the persistent binary only).
 
 The `make qa` target runs the following checks (read-only; it never modifies tracked files):
 
@@ -398,11 +437,15 @@ all existing behavior is preserved.
 
 **What it does NOT provide (deferred to Milestone 5B and later):**
 
-- No production Kubernetes metadata provider wired into the running application (Stage 0 implements the read-only
-  `lifecycle.MetadataSource` provider but it is not active in the default build; the controller uses a no-op
-  source that always reports metadata unavailable; replicas with lifecycle enabled fail closed).
-- No automatic cluster genesis (a fresh replica with no binding cannot automatically initialize an empty epoch;
-  the genesis procedure is Stage 3+).
+- The production Kubernetes metadata provider is implemented and wired into the application. It is opt-in and
+  requires both lifecycle enforcement and Kubernetes metadata configuration to be enabled
+  (`GOSSIPGRID_LIFECYCLE_ENABLED=true` and `GOSSIPGRID_LIFECYCLE_METADATA_KUBERNETES=true`); the default
+  configuration does not activate it, in which case the controller uses a no-op source that always reports
+  metadata unavailable. When lifecycle enforcement is enabled without an authoritative metadata source,
+  admission fails closed. The provider is not yet cluster-verified.
+- No **automatic** cluster genesis (a fresh replica with no binding cannot automatically initialize an empty epoch;
+  operator-controlled one-time genesis authorization and finalization are implemented in 5B Stages 1A and 1B;
+  reconstruction orchestration for replacement replicas is Stage 3).
 - No initial snapshot transfer orchestration (the path from `SYNCING` to `READY` via source discovery, sweep
   scheduling, and `PromoteToReady` is Stage 3; Stage 2 provides the transport-and-commit mechanism
   (`FetchBootstrapBaseline`) but not the scheduling or promotion).
@@ -684,7 +727,7 @@ resource is owned by more than one system.
 | **Vault Secrets Operator (VSO)** | Synchronizes Vault KV v2 secrets to Kubernetes Secrets (the GossipGrid authentication Secret). |
 | **Helm** | GossipGrid resource templates (StatefulSet, Services, NetworkPolicy, cert-manager Certificate/Issuers, ServiceAccount/Role/RoleBinding). |
 | **Argo CD** | Application deployment reconciliation (watches the GitOps repository and reconciles the cluster to the recorded desired state). |
-| **GitLab CI** | Build, test, publish, and GitOps revision updates (QA, container build, image publish by digest, GitOps revision commit). |
+| **GitLab CI** | **Current:** QA (fmt, vet, lint, security, tests, race) and binary build; optional manually triggered image build. **Planned (M8):** automated image publication and automated GitOps revision updates. |
 
 The GossipGrid Helm chart does **not** create foundational cluster resources (Cilium, cert-manager, Vault, VSO,
 or the cluster DNS). Those are pre-existing prerequisites owned by the cluster operations track.
@@ -710,7 +753,7 @@ or the cluster DNS). Those are pre-existing prerequisites owned by the cluster o
 | 0–5A | Single replica, local storage, peer discovery, peer mTLS, message exchange, gossip, anti-entropy, lifecycle state machine | ✅ Implemented and locally tested |
 | 6 | Browser UI, single-administrator password authentication, credential reload | ✅ Implemented and locally tested |
 | 7A | Kubernetes staging: 5-replica StatefulSet, shared Cilium Gateway, cert-manager, VSO, Argo CD | ✅ Deployed and smoke-tested; full acceptance tests pending |
-| 5B | Kubernetes metadata authority (ConfigMap), bootstrap replication admission, initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility | 🔜 Partial: Stages 0 (read-only provider), 1A (genesis grant), 1B (genesis finalization) implemented and locally tested; Stage 2 (bootstrap admission, under independent review) implemented and locally tested; Stage 3 (orchestration) designed but not implemented |
+| 5B | Kubernetes metadata authority (ConfigMap), bootstrap replication admission, initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility | 🔜 Partial: Stages 0 (read-only provider), 1A (genesis grant), 1B (genesis finalization), and 2 (bootstrap admission) implemented, committed, and locally tested; Stage 3 (orchestration) designed but not implemented |
 | 6B | Cluster visualization: composed status aggregation, telemetry event buffers, propagation/reconciliation visualization, lifecycle/resilience visualization | 🔜 Designed (4 feature stages); no implementation started |
 | 5C | Operator recovery/reset authorization, catastrophic data-loss handling, epoch transitions, incident audit | 🔜 Designed but not implemented |
 | 7B | Lifecycle-aware staging: enable lifecycle enforcement, in-cluster recovery and partition tests | 🔜 Designed but not implemented |
@@ -720,8 +763,8 @@ or the cluster DNS). Those are pre-existing prerequisites owned by the cluster o
 Milestone 7A has been deployed and initially smoke-tested in the staging cluster. The remaining acceptance tests
 in [deploy/STAGING-RUNBOOK.md](deploy/STAGING-RUNBOOK.md) (cross-replica convergence, recovery after pod
 replacement, live password rotation, fault tolerance) are pending. Milestone 5B is **partially implemented**
-(Stages 0, 1A, 1B implemented and locally tested; Stage 2 implemented and under independent review; Stage 3
-pending) and 5C is designed but not implemented; both are required before lifecycle enforcement can be enabled
+(Stages 0, 1A, 1B, and 2 implemented, committed, and locally tested; Stage 3 pending) and 5C is designed but not
+implemented; both are required before lifecycle enforcement can be enabled
 (Milestone 7B). See [docs/development-plan.md](docs/development-plan.md) for the full milestone breakdown,
 acceptance criteria, and dependencies.
 

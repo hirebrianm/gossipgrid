@@ -9,14 +9,17 @@ transient-versus-catastrophic failure model, the `EverAcceptedMessages` durable 
 readiness barrier. Milestone 5B is **partially implemented**: Stage 0 (read-only Kubernetes
 ConfigMap `MetadataSource` provider) is implemented in `internal/lifecycle/k8smetadata`
 (see [Stage 0 — read-only ConfigMap metadata provider](#stage-0--read-only-configmap-metadata-provider));
+Stages 1A (Kubernetes genesis grant) and 1B (operator-authorized genesis finalization) are implemented;
 Stage 2 (bootstrap replication admission, `FetchBootstrapBaseline` transport-and-commit mechanism)
-is implemented and locally tested but **not yet committed** — it is under independent architecture
-review (see [Bootstrap replication admission](#3-bootstrap-replication-admission)).
+is implemented, committed (`209cec1`), and locally tested (not yet cluster-verified)
+(see [Bootstrap replication admission](#3-bootstrap-replication-admission)).
 Stage 3 (source discovery/selection, sweep scheduling, automatic `READY` promotion) is designed
 but not implemented.
 
 This document supersedes the `Milestone 5B` and `Milestone 5C` sections of
-[architecture.md](architecture.md) where the two disagree.
+[architecture.md](architecture.md) where the two disagree. For a learning-oriented walkthrough of
+the distributed-authority and epoch-fencing concepts that underpin this design, see the
+[concept library](concepts/README.md).
 
 ## Scope of this task
 
@@ -256,6 +259,71 @@ which requires `Initialized=true`.
   `dataLossProtected`), not by the seed. Before the CAS, the seed is in `GENESIS` (or
   `SYNCING`), not `READY`, and the 5A `CheckWrite` admission rejects it.
 
+### Visual example
+
+The diagram below illustrates the *operator-controlled* genesis boundary: the *authoritative*
+metadata (the ConfigMap), the *operator authorization* (the one-time grant), the *one-time
+genesis* (the seed's binding), the *durable binding* (the local `local_metadata` row), and the
+*finalization* (the operator's atomic CAS that consumes the authorization and arms
+`dataLossProtected`). The *Stage 1A/1B contracts* (the grant Job and the finalization Job) are
+*implemented*; the *automatic genesis* is *absent by design*.
+
+[View full-size SVG](diagrams/generated/concept-operator-genesis.svg) · [View PNG](diagrams/generated/concept-operator-genesis.png)
+
+<!-- DIAGRAM:concept-operator-genesis -->
+```mermaid
+flowchart LR
+  subgraph GRANT["Stage 1A: operator grant"]
+    OP1("operator genesis grant Job") --> CM1("ConfigMap: authorized, not initialized")
+  end
+
+  subgraph BIND["Canonical seed binding"]
+    S1(["gossipgrid-0 = GENESIS"]) --> BINDROW[("local_metadata binding (durable)")]
+    BINDROW --> S2(["seed stays GENESIS; no writes"])
+  end
+
+  subgraph FINALIZE["Stage 1B: operator finalization"]
+    OP2("operator finalization Job") --> CAS("atomic CAS: initialized + consumer")
+    CAS --> S3(["gossipgrid-0 -> READY"])
+  end
+
+  GRANT --> BIND
+  BIND --> FINALIZE
+
+  class OP1,OP2 operator
+  class CM1 metadata
+  class S1,S2 seed
+  class BINDROW binding
+  class CAS finalization
+  class S3 ready
+  linkStyle default stroke-width:1.8px
+```
+
+Reading the diagram. The GRANT panel shows the Stage 1A operator grant (implemented): the
+operator runs the genesis grant Job; the Job verifies the preconditions (the ConfigMap is
+absent or `Initialized=false`) and creates the ConfigMap `gossipgrid-cluster-metadata` with
+`clusterId`, `epochId`, `generation 1`, `initialized false`, and `genesisAuthorized true`.
+The BIND panel shows the seed binding (implemented): `gossipgrid-0` (the canonical seed)
+observes the genesis authorization conditions (`GenesisAuthorized=true`, `Initialized=false`,
+empty unbound database, it is `gossipgrid-0`, no other identity has bound) and writes the
+durable `local_metadata` binding row (the epoch-bound state); it remains in `GENESIS` (the
+`SetReady` gate rejects promotion while `Initialized=false`; no public writes are accepted).
+The FINALIZE panel shows the Stage 1B operator finalization (implemented): the operator runs
+the finalization Job; the Job uses peer-status evidence to confirm the seed is bound
+(`/readyz` is not used — it reports 503); the Job performs the atomic CAS on the named
+ConfigMap (`resourceVersion` compare-and-swap): `Initialized=true`, `GenesisAuthorized=false`,
+`GenesisConsumer=gossipgrid-0`, `dataLossProtected=true`; the seed transitions to `READY`
+(public writes are opened). There is no automatic genesis: the application ServiceAccount is
+read-only (get on the named ConfigMap only); the one-time `GenesisAuthorized` token is granted
+by the operator's grant Job, consumed by the operator's finalization Job, and can never be
+written by any application pod. A replacement `gossipgrid-0` after data loss observes
+`GenesisAuthorized=false` and therefore cannot claim genesis — it joins the surviving bound
+peer (if one exists) or fails closed to `RECOVERY_REQUIRED`.
+
+The rendered diagram is available as
+[concept-operator-genesis.svg](diagrams/generated/concept-operator-genesis.svg) and
+[concept-operator-genesis.png](diagrams/generated/concept-operator-genesis.png).
+
 ---
 
 ## 2. Corrected Kubernetes RBAC
@@ -371,7 +439,7 @@ This is a **design commitment** that has been **implemented** in Stage 2 (2026-1
 routes the serving-side check, and `CommitUnderBootstrapAuthorization` revalidates the
 dedicated bootstrap authorization at the local write boundary. The implementation is wired
 into production (`cmd/gossipgrid/main.go`) but is **only active** when lifecycle protection
-is enabled. See [gossip-and-bootstrap.md](gossip-and-bootstrap.md#milestone-5b-stage-2--bootstrap-replication-admission-implemented-2026-11-24-under-independent-review)
+is enabled. See [gossip-and-bootstrap.md](gossip-and-bootstrap.md#milestone-5b-stage-2--bootstrap-replication-admission-implemented-2026-11-24-committed-209cec1)
 for the full admission contract and the 5 contention-boundary tests.
 
 ---

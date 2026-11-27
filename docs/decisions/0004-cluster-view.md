@@ -62,6 +62,10 @@ Key constraints:
   do not depend on a cluster view.
 - Metrics export (Prometheus `/metrics`, OpenTelemetry) is **not** part of 6B. It is a
   candidate for Milestone 9.
+- **Visual design.** The native SVG cluster view must reuse the color and state conventions
+  defined in [visual-design.md](../visual-design.md) — the same semantic accent palette and
+  state-color mapping used across the Mermaid diagram set. This is a design reference only;
+  no redesign or implementation is included in this ADR.
 
 References: [cluster-visualization.md](../cluster-visualization.md),
 [architecture.md](../architecture.md), [M4C anti-entropy limitations](../gossip-and-bootstrap.md#anti-entropy-milestone-4c--implemented-2026-11-20).

@@ -217,11 +217,11 @@ type CommitGuard interface {
 }
 
 // BootstrapGuard is the commit-boundary guard for installing a fetched
-// bootstrap baseline (Milestone 5B, Stage 2). It executes a short,
-// nonblocking commit callback (installing an authenticated, same-epoch
-// bootstrap response into the local store) while holding the lifecycle
-// controller's authorization read lock (c.mu RLock) and the lifecycle state
-// machine's read lock (m.mu RLock), revalidating the DEDICATED bootstrap
+// bootstrap baseline (Milestone 5B, Stage 2). It executes a commit callback
+// (installing an authenticated, same-epoch bootstrap response into the local
+// store) while holding the lifecycle controller's authorization read lock
+// (c.mu RLock) and the lifecycle state machine's read lock (m.mu RLock),
+// retained for the duration of the callback, revalidating the DEDICATED bootstrap
 // authorization decision (bootstrapAuthorized: a bound, epoch-bound SYNCING
 // replica with a fresh, valid, matching authoritative observation and a
 // matching durable binding, not stopped) at the actual local write boundary.
@@ -235,13 +235,16 @@ type CommitGuard interface {
 // a revocation after the callback completes is a normal, permitted revocation
 // (already-committed valid data is preserved).
 //
-// It is the same lock-order and non-recursive contract as CommitGuard
-// (Controller.mu RLock → Machine.mu RLock → Engine.mu Lock): the callback
-// must NOT re-read any method that acquires Controller.mu or Machine.mu,
-// perform network I/O, or execute a blocking SQLite query. The callback
-// performs the idempotent local insert of the fetched baseline records. A nil
-// guard (lifecycle protection disabled) executes the callback directly
-// (legacy behavior preserved).
+// Lock-order contract: Controller.mu (RLock) → Machine.mu (RLock) → callback.
+// The engine's mutex (e.mu) is NOT part of this contract: the engine reads the
+// guard under e.mu, releases it, and then invokes the guard — so the callback
+// (the bounded bootstrap SQLite transaction) never runs under e.mu. The
+// callback must NOT re-read any method that acquires Controller.mu or
+// Machine.mu or perform network I/O. The callback executes the bounded,
+// context-aware bootstrap SQLite transaction (the SQLite busy timeout is a
+// known, accepted limitation, not a linearizability guarantee). A nil guard
+// (lifecycle protection disabled) executes the callback directly with no lock
+// held (legacy behavior preserved).
 //
 // The expected parameter (Milestone 5B, Stage 2, Issue 4) is the RequestContext
 // pinned from the consistent authorized snapshot at the start of the bootstrap
@@ -675,11 +678,13 @@ func (e *Engine) SetBootstrapAuthorizationSource(src BootstrapAuthorizationSourc
 	e.bootstrapAuthSource = src
 }
 
-// commitBootstrap executes a short, nonblocking local insert callback for a
-// fetched bootstrap baseline while holding the lifecycle controller's
-// authorization read lock (c.mu RLock) and machine read lock (m.mu RLock),
-// revalidating the DEDICATED bootstrap authorization (bootstrapAuthorized) at
-// the actual local write boundary (Milestone 5B, Stage 2).
+// commitBootstrap executes the local install callback for a fetched bootstrap
+// baseline. It briefly acquires e.mu to obtain the bootstrap guard, releases
+// e.mu, and then invokes the guard (CommitUnderBootstrapAuthorization), which
+// holds the controller's authorization read lock (c.mu RLock) and machine
+// read lock (m.mu RLock) for the duration of the callback. It revalidates the
+// DEDICATED bootstrap authorization (bootstrapAuthorized) at the actual local
+// write boundary (Milestone 5B, Stage 2).
 //
 // A successful bootstrap HTTP request does not by itself authorize
 // installation of its response. This method is the linearization point: if the
@@ -689,12 +694,15 @@ func (e *Engine) SetBootstrapAuthorizationSource(src BootstrapAuthorizationSourc
 // executed and a rejection error is returned. Already-committed valid data is
 // preserved (this method never deletes or resets the store).
 //
-// Lock-order contract: Controller.mu (RLock) → Machine.mu (RLock) →
-// Engine.mu (Lock). The callback may take the engine's mutex but must NOT
-// re-read any method that acquires Controller.mu or Machine.mu (both RWMutexes
-// are non-reentrant), perform network I/O, or execute a blocking SQLite
-// query. When the bootstrap guard is nil (lifecycle protection disabled), the
-// callback is executed directly under e.mu (legacy behavior preserved).
+// Lock-order contract: Controller.mu (RLock) → Machine.mu (RLock) → callback.
+// e.mu is NOT part of this contract: it is acquired only to read the guard,
+// released, and is not held through the callback (so the callback — the
+// bounded bootstrap SQLite transaction — never runs under e.mu). The callback
+// must NOT re-read any method that acquires Controller.mu or Machine.mu (both
+// RWMutexes are non-reentrant) or perform network I/O. When the bootstrap
+// guard is nil (lifecycle protection disabled), the callback is executed
+// directly, with no lock held at all (disabled-mode passthrough, legacy
+// behavior preserved).
 //
 // The expected parameter is the pinned RequestContext for the bootstrap page
 // (Issue 4); the guard validates it against the current authorization snapshot

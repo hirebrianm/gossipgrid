@@ -1003,8 +1003,10 @@ func (c *Client) FetchInventoryPage(ctx context.Context, dialAddr, expectedIdent
 //
 // pinnedCtx is the pinned epoch context (Milestone 5B, Stage 2, Issue 5):
 // the outbound epoch headers use the pinned cluster/epoch, not the current
-// EpochProvider. A nil pinnedCtx (defensive; the engine always pins) falls
-// back to the current provider (ordinary behavior).
+// EpochProvider. With lifecycle enforcement enabled, a nil or incomplete
+// pinnedCtx is rejected (PeerBlockedError) before network transmission —
+// there is no fallback to the general EpochProvider. With lifecycle
+// disabled, a nil pinnedCtx is a legacy passthrough (no epoch headers set).
 func (c *Client) FetchBootstrapInventoryPage(ctx context.Context, dialAddr, expectedIdentity, after string, limit int, pinnedCtx *lifecycle.RequestContext) (*InventoryPageResponse, error) {
 	return c.fetchInventoryPage(ctx, dialAddr, expectedIdentity, after, limit, lifecycle.PurposeBootstrapBaseline, pinnedCtx)
 }
@@ -1151,8 +1153,10 @@ func (c *Client) FetchMessages(ctx context.Context, dialAddr, expectedIdentity s
 //
 // pinnedCtx is the pinned epoch context (Milestone 5B, Stage 2, Issue 5):
 // the outbound epoch headers use the pinned cluster/epoch, not the current
-// EpochProvider. A nil pinnedCtx (defensive; the engine always pins) falls
-// back to the current provider (ordinary behavior).
+// EpochProvider. With lifecycle enforcement enabled, a nil or incomplete
+// pinnedCtx is rejected (PeerBlockedError) before network transmission —
+// there is no fallback to the general EpochProvider. With lifecycle
+// disabled, a nil pinnedCtx is a legacy passthrough (no epoch headers set).
 func (c *Client) FetchBootstrapMessages(ctx context.Context, dialAddr, expectedIdentity string, ids []string, pinnedCtx *lifecycle.RequestContext) ([]SyncMessageWire, error) {
 	return c.fetchMessages(ctx, dialAddr, expectedIdentity, ids, lifecycle.PurposeBootstrapBaseline, pinnedCtx)
 }

@@ -182,6 +182,12 @@ and native SVG are used throughout. Bounded polling is acceptable; WebSockets, S
 observability systems, frontend frameworks, and Kubernetes API access are **not** required. The
 visualization must support both lifecycle-enabled and lifecycle-disabled operation.
 
+**Visual design:** the native SVG visualization must reuse the color and state conventions
+defined in [visual-design.md](visual-design.md) — the same semantic accent palette, shape
+conventions, and state-color mapping used across the Mermaid diagram set. This ensures an
+operator reads the live cluster view with the same mental model as the static diagrams. The
+visual design document is the reference; no redesign or new palette is introduced by M6B.
+
 #### Stage 1 — Cluster status and interactive topology
 
 - **Depends on:** M6 (web UI, authentication), M4A (peer status endpoint), M5A (lifecycle state

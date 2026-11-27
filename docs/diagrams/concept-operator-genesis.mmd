@@ -1,0 +1,25 @@
+flowchart LR
+  subgraph GRANT["Stage 1A: operator grant"]
+    OP1("operator genesis grant Job") --> CM1("ConfigMap: authorized, not initialized")
+  end
+
+  subgraph BIND["Canonical seed binding"]
+    S1(["gossipgrid-0 = GENESIS"]) --> BINDROW[("local_metadata binding (durable)")]
+    BINDROW --> S2(["seed stays GENESIS; no writes"])
+  end
+
+  subgraph FINALIZE["Stage 1B: operator finalization"]
+    OP2("operator finalization Job") --> CAS("atomic CAS: initialized + consumer")
+    CAS --> S3(["gossipgrid-0 -> READY"])
+  end
+
+  GRANT --> BIND
+  BIND --> FINALIZE
+
+  class OP1,OP2 operator
+  class CM1 metadata
+  class S1,S2 seed
+  class BINDROW binding
+  class CAS finalization
+  class S3 ready
+  linkStyle default stroke-width:1.8px

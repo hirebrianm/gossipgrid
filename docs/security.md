@@ -3,7 +3,8 @@
 This document describes the peer mTLS security architecture (implemented in Milestone 3B), the lifecycle and
 epoch fencing architecture (implemented in Milestone 5A), and the broader target design for the rest of the
 system (Milestones 5B, 5C, 6, 7A, 7B, 8, and 9). It is not an assertion of deployed security or formal
-certification.
+certification. For a learning-oriented walkthrough of the distributed-authority and epoch-fencing
+concepts that underpin the security architecture, see the [concept library](concepts/README.md).
 
 **Status classification:** Peer mTLS (3B), message exchange (4A), gossip (4B), anti-entropy (4C),
 lifecycle/epoch fencing (5A), and browser authentication (M6) are **implemented and locally tested**.
@@ -16,10 +17,10 @@ The **remaining acceptance tests** (cross-replica convergence, recovery after po
 password rotation, fault tolerance) are pending. The M5A lifecycle functionality is implemented in code but
 **intentionally disabled** in the current M7A Kubernetes staging deployment
 (`GOSSIPGRID_LIFECYCLE_ENABLED=false`) because the required 5B implementation is incomplete. Milestone 5B is
-**partially implemented**: Stage 0 (read-only Kubernetes metadata provider) and Stage 2 (bootstrap replication
-admission) are implemented and locally tested but not yet committed or cluster-verified; Stage 3 (orchestration,
-automatic `READY` promotion) is designed but not implemented. The operator recovery procedure (5C) is **designed
-but not implemented**.
+**partially implemented**: Stages 0 (read-only Kubernetes metadata provider), 1A (Kubernetes genesis grant),
+1B (operator-authorized genesis finalization), and 2 (bootstrap replication admission) are implemented,
+committed, and locally tested (not yet cluster-verified); Stage 3 (orchestration, automatic `READY` promotion) is
+designed but not implemented. The operator recovery procedure (5C) is **designed but not implemented**.
 
 ## Threat model and trust boundaries
 
@@ -261,43 +262,58 @@ the correction below and the
 ([PNG](diagrams/generated/security-credentials.png)) diagram, which shows the browser-auth path and the
 eventual (not instantaneous) credential-rotation flow.
 
-The full credential-rotation and browser-authentication sequence is shown below (the authoritative
-`security-credentials.mmd` source embedded natively). External Vault appears as a distinct participant,
-separate from cert-manager (peer PKI), the Vault Secrets Operator, and the mounted Kubernetes Secret — the
-trust boundaries are preserved.
+The browser-authentication flow is shown below (the authoritative `security-credentials.mmd` source
+embedded natively). All replicas share the same credential file (mounted from one K8s Secret); the
+credential record contains the algorithm, format version, PBKDF2 parameters, per-credential salt,
+password verifier, credential generation, and the common session-signing key.
+
+[View full-size SVG](diagrams/generated/security-credentials.svg) · [View PNG](diagrams/generated/security-credentials.png)
 
 <!-- DIAGRAM:security-credentials -->
 ```mermaid
 sequenceDiagram
-  participant ADMIN as Operator
-  participant VKV as Vault KV v2 (gossipgrid/admin)
-  participant VSO as Vault Secrets Operator
-  participant SEC as K8s Secret (full volume, never subPath)
-  participant P0 as Replica gossipgrid-0
-  participant PX as Replica gossipgrid-x
-  participant BROWSER as Browser user
+  participant B as Browser
+  participant P0 as Replica 0
+  participant PX as Replica x
 
-  Note over VKV: versioned credential file: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key
-  BROWSER->>P0: POST /login (password)
-  P0->>P0: read credential file, PBKDF2-HMAC-SHA-256 verify (constant-time)
-  P0-->>BROWSER: signed session cookie (identifier, expiry, generation)
-  Note over P0: HttpOnly, Secure, SameSite=Strict. No password or verifier in the cookie
-  BROWSER->>PX: GET /api/messages (load-balanced to a different replica)
-  PX->>PX: verify cookie signature with the common signing key
-  PX-->>BROWSER: 200 (single login valid across all replicas, no server-side store)
+  Note over P0,PX: Shared credential file
+  B->>P0: POST /login (password)
+  P0->>P0: PBKDF2 verify (constant-time)
+  P0-->>B: signed session cookie
+  B->>PX: GET /api/messages
+  PX->>PX: verify cookie (common signing key)
+  PX-->>B: 200 (stateless)
 
-  ADMIN->>VKV: rotate password (new salt, new verifier, new generation, new key)
-  VKV->>VSO: secret changed
-  VSO->>SEC: atomically update the Kubernetes Secret
-  SEC-->>P0: kubelet swaps the mounted credential file (atomic)
-  P0->>P0: poll detects change, validate, publish new immutable snapshot
-  Note over P0: propagation across replicas is eventual (each loads on its own poll cycle), but there is no overlap window
-  SEC-->>PX: PX loads the new credential on a later poll
-  P0->>P0: old-generation sessions fail verification (no overlap window — generation binding)
-  BROWSER->>PX: request with an old-generation session cookie
-  PX-->>BROWSER: 401 (previously issued session rejected once this replica loaded the new generation)
-  Note over PX: no pod or process restart. No overlap window. Eventual propagation across replicas
-  Note over P0: Peer security is independent: per-pod mTLS 1.3 via cert-manager CSI, separate trust domain
+  Note over B,PX: Generation checked locally
+```
+
+The credential-rotation flow (Vault → VSO → K8s Secret → per-replica poll) is shown below.
+Rotation is eventual: each replica loads the new credential on its own poll cycle, so there is
+a brief window in which different replicas may be verifying with different generations. Per
+replica, however, a new generation invalidates all prior sessions on that replica (generation
+binding). No pod or process restart occurs. Peer security is independent: per-pod mTLS 1.3 via
+cert-manager CSI, a separate trust domain.
+
+[View full-size SVG](diagrams/generated/security-credential-rotation.svg) · [View PNG](diagrams/generated/security-credential-rotation.png)
+
+<!-- DIAGRAM:security-credential-rotation -->
+```mermaid
+sequenceDiagram
+  participant OP as Operator
+  participant VK as Vault KV
+  participant VSO as VSO
+  participant SEC as K8s Secret
+  participant P0 as Replica 0
+  participant PX as Replica x
+
+  OP->>VK: rotate (salt, verifier, generation)
+  VK->>VSO: secret changed
+  VSO->>SEC: update K8s Secret
+  SEC-->>P0: kubelet swaps mounted file
+  P0->>P0: poll detects change, validate, publish snapshot
+  SEC-->>PX: PX loads on later poll
+  P0->>P0: old-gen sessions fail (generation binding)
+  Note over P0,PX: Asynchronous reload
 ```
 
 ### Credential flow

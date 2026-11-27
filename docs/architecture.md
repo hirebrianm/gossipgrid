@@ -12,7 +12,9 @@ diagrams-check` verifies the embedded block matches the `.mmd` source. Detailed 
 [lifecycle state machine and recovery](diagrams/generated/lifecycle-recovery.svg),
 [replacement-pod/recovery sequence](diagrams/generated/lifecycle-recovery-sequence.svg),
 [security and credentials](diagrams/generated/security-credentials.svg), and
-[GitOps delivery](diagrams/generated/gitops-delivery.svg).
+[GitOps delivery](diagrams/generated/gitops-delivery.svg). For a learning-oriented walkthrough of the
+distributed-systems concepts that underpin this architecture (gossip, anti-entropy, epoch fencing,
+concurrency, recovery), see the [concept library](concepts/README.md).
 
 ## Purpose
 
@@ -48,16 +50,15 @@ convergence, recovery after pod replacement, live password rotation, fault toler
 [staging runbook](../deploy/STAGING-RUNBOOK.md). Milestone 5B is **partially implemented**: Stages 0 (read-only
 Kubernetes metadata provider), 1A (Kubernetes genesis grant), and 1B (operator-authorized genesis finalization)
 are implemented and locally tested; Stage 2 (bootstrap replication admission, bounded insert, pinned-epoch
-transport validation) is implemented and locally tested but **under independent architecture review, not yet
-committed or cluster-verified**; Stage 3 (orchestration, automatic `READY` promotion) is designed but not
-implemented. Milestones 5C, 6B, 7B, and 9 are **designed but not implemented**. Milestone 8 is **partially
-implemented**: immutable image publishing and Argo CD digest-pinned reconciliation work, but automated delivery
-and promotion are not complete.
+transport validation) is implemented, committed (`209cec1`), and locally tested (not yet cluster-verified);
+Stage 3 (orchestration, automatic `READY` promotion) is designed but not implemented. Milestones 5C, 6B, 7B,
+and 9 are **designed but not implemented**. Milestone 8 is **partially implemented**: immutable image
+publishing and Argo CD digest-pinned reconciliation work, but automated delivery and promotion are not complete.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | 5A | Lifecycle state machine, epoch fencing, fail-closed admission, durable binding | ✅ Implemented and locally tested |
-| 5B | Kubernetes metadata authority, bootstrap replication admission (Stage 2), initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility (Stage 3) | 🔜 Stages 0, 1A, 1B implemented and locally tested; Stage 2 (bootstrap admission, bounded insert, pinned-epoch transport) implemented and locally tested, **under independent review, not yet committed or cluster-verified**; Stage 3 (orchestration) designed but not implemented |
+| 5B | Kubernetes metadata authority, bootstrap replication admission (Stage 2), initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility (Stage 3) | 🔜 Stages 0, 1A, 1B, and 2 implemented, committed, and locally tested; Stage 3 (orchestration) designed but not implemented |
 | 5C | Operator recovery/reset authorization, catastrophic data-loss handling, epoch transitions, incident audit | 🔜 Designed but not implemented |
 | 6 | Web UI, single-administrator password authentication, credential reload (local; in-cluster Vault → VSO → mounted Secret is M7A) | ✅ Implemented and locally tested; in-cluster delivery deployed and verified in M7A |
 | 6B | Cluster visualization: authenticated diagnostics, interactive SVG topology, native telemetry, replication/lifecycle visualization (4 feature stages) | 🔜 Designed; no implementation started. See [cluster-visualization.md](cluster-visualization.md) |
@@ -310,81 +311,98 @@ by the `gossipgrid credential` CLI.
 
 ## Logical components
 
+[View full-size SVG](diagrams/generated/system-architecture.svg) · [View PNG](diagrams/generated/system-architecture.png)
+
 <!-- DIAGRAM:system-architecture -->
 ```mermaid
 flowchart TB
-  subgraph EXT["External systems (cluster prerequisites, owned by the cluster operations track)"]
-    direction LR
-    VAULT["Vault - browser CA + workload CA PKI, KV v2 credential authority"]
-    GLCI["GitLab CI - QA, build, publish (M8 delivery)"]
-  end
+  B("Browser")
+  VAULT("Vault PKI + KV v2")
 
-  B["Browser - internal CA HTTPS"]
+  subgraph EXT["External delivery"]
+    direction TB
+    GLCI("GitLab CI: QA + build")
+    MPUB("Manual publish")
+    REG[("Registry")]
+    GOREPO("k8s-gitops")
+
+    GLCI ~~~ MPUB
+    MPUB --> REG
+    REG -->|"Manual digest update"| GOREPO
+  end
 
   subgraph K8S["Kubernetes cluster"]
     direction TB
-    GW["Shared Cilium Gateway - existing, gateway.enabled=false in GossipGrid chart; HTTPRoutes managed in k8s-gitops"]
-    WEB["ClusterIP web Service - ready pods only"]
+    GW("Cilium Gateway")
+    WSVC("Web Service")
 
-    subgraph SS["StatefulSet gossipgrid - 5 replicas, Parallel, no PVCs"]
+    subgraph SS["GossipGrid StatefulSet - five replicas"]
       direction LR
-      APP["Replicas gossipgrid-0..4 - API :8080, peer :8443"]
-      SYNC["Peer discovery, gossip fanout, anti-entropy (implemented, opt-in)"]
-      DB[("Independent SQLite on emptyDir - pod-lifetime")]
+      subgraph R1["gossipgrid-0"]
+        direction TB
+        A1("Replica") --- D1[("SQLite")]
+      end
+      subgraph R5["gossipgrid-4"]
+        direction TB
+        A5("Replica") --- D5[("SQLite")]
+      end
+      R1 <-->|peer mTLS| R5
     end
 
-    B -->|HTTPS| GW
-    GW --> WEB
-    WEB --> APP
-    APP --- SYNC
-    APP --- DB
-
-    subgraph PKI["Peer PKI - separate workload trust domain (M3B implemented)"]
-      direction LR
-      WCA["Vault workload CA"]
-      CM["cert-manager - CSI driver, per-pod mTLS certs + browser TLS Secret"]
-    end
-    WCA --> CM
-    CM -. per-pod mTLS certs .-> APP
-    CM -. browser TLS Secret .-> GW
-
-    subgraph CRED["Browser auth credentials (M6 implemented locally; in-cluster delivery via VSO in M7A)"]
-      direction LR
-      VKV["Vault KV v2 - versioned credential: algorithm, version, PBKDF2 params, salt, verifier, generation, signing key"]
-      VSO["Vault Secrets Operator"]
-      KSEC["Kubernetes Secret - full volume, never subPath, mounted read-only"]
-      VKV --> VSO --> KSEC
-    end
-    KSEC -. mounted credential file .-> APP
-
-    subgraph LIFE["Authoritative lifecycle metadata and recovery (M5B: Stages 0, 1A, 1B implemented; Stage 2 under independent review; Stage 3 pending; M5C planned)"]
-      direction LR
-      CMETA["ConfigMap - cluster ID, epoch ID, generation, Initialized, reset incident (metadata only)"]
-      RRBAC["ServiceAccount + Role + RoleBinding - get + update on the named ConfigMap"]
-    end
-    CMETA --- RRBAC
-    CMETA -. metadata watch .-> APP
+    PEERSVC("Headless Service")
+    CMETA("Lifecycle ConfigMap")
+    CMCMD("cert-manager")
+    VSO("VSO")
+    KSEC("K8s Secret")
+    ARGO("Argo CD")
   end
 
-  subgraph GITOPS["GitOps delivery (M8 partial: immutable image + Argo CD work; automation incomplete)"]
-    direction LR
-    REG["Container registry - immutable image by digest"]
-    GOREPO["k8s-gitops repository - environment-specific Helm values + Argo CD application"]
-    ARGO["Argo CD - reconciles the cluster"]
-    GLCI -->|publish by digest| REG
-    REG -->|record digest| GOREPO
-    GOREPO -->|watch and reconcile| ARGO
-  end
-  ARGO -. deploys GossipGrid .-> SS
+  B -->|HTTPS| GW
+  GW --> WSVC
+  WSVC -->|route| SS
+  PEERSVC -. "discovery" .-> SS
+  CMCMD -. "per-pod certs" .-> SS
+  CMCMD -. "browser TLS" .-> GW
+  VSO --> KSEC
+  KSEC -. "mounted" .-> SS
+  CMETA -. "metadata" .-> SS
+
+  VAULT -->|issue certs| CMCMD
+  VAULT -->|sync secrets| VSO
+  GOREPO -. "desired state" .-> ARGO
+  ARGO -->|reconcile| SS
+
+  class B new
+  class GW,WSVC,PEERSVC push
+  class A1,A5 new
+  class D1,D5 sqlite
+  class CMETA,VSO,KSEC metadata
+  class VAULT,CMCMD metadata
+  class GLCI,MPUB new
+  class REG new
+  class GOREPO,ARGO metadata
+  linkStyle default stroke-width:1.8px
 ```
 
 The diagram above is the full system architecture (the same authoritative
-`system-architecture.mmd` source embedded in the README). It is shown as one
-StatefulSet of five replicas with a single independent SQLite-per-replica
-storage model. External Vault and GitLab CI are treated as external cluster
-prerequisites, not components inside the cluster. All peer gossip paths are
-independent of the public HTTP Service. The diagram renders natively on GitHub
-and GitLab; the [SVG](diagrams/generated/system-architecture.svg) and
+`system-architecture.mmd` source embedded in the README). GossipGrid is shown
+as one StatefulSet whose five configured replicas each keep an independent
+SQLite store; the two illustrated replicas (`gossipgrid-0` and `gossipgrid-4`,
+each in its own compact replica group with its SQLite database immediately
+below) are representative of the five deployed replicas (`gossipgrid-0..4`).
+The Web Service routes to the StatefulSet as a group. Peer mTLS is direct and
+bidirectional between the illustrated replicas — it does not flow through the
+Web Service or the headless Service. The external "External delivery" group
+shows GitLab CI (QA and build), a manual publish step, the registry, and the
+`k8s-gitops` repository, each separate from the automated CI; the registry
+feeds a manual digest update into `k8s-gitops`. The Registry and `k8s-gitops`
+repository sit outside the cluster; Argo CD is declared only inside the
+Kubernetes cluster. External Vault is treated as an external cluster
+prerequisite. Automated CI-driven image publication and automated GitOps
+updates are not depicted because they are not yet implemented (Milestone 8).
+All peer gossip paths are independent of the public HTTP Service. The diagram
+renders natively on GitHub and GitLab; the
+[SVG](diagrams/generated/system-architecture.svg) and
 [PNG](diagrams/generated/system-architecture.png) links are fallbacks.
 
 ## Processes, storage, identity

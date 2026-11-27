@@ -1,0 +1,24 @@
+flowchart TB
+  G1("Acquire guard")
+  G2{"Guard valid?"}
+  G1 --> G2
+  G2 -->|revoked| FAIL("Rejected (no DB access)")
+
+  subgraph GUARD["Lifecycle guard (acquired before BEGIN, held through COMMIT)"]
+    direction TB
+    subgraph TX["SQLite transaction"]
+      direction TB
+      BEGIN("BEGIN") --> WACC("Write access") --> RET("Retention clock") --> INST("Install batch") --> CONFL{"Batch valid?"}
+      CONFL -->|valid| COMMIT("COMMIT (linearization point)")
+      CONFL -->|invalid| ROLLBACK("Rollback (batch; prior commits intact)")
+    end
+  end
+
+  G2 -->|valid| BEGIN
+  COMMIT --> OK("Publish committed accounting (only on successful COMMIT)")
+
+  class G1,G2 guard
+  class BEGIN,WACC,RET,INST,CONFL tx
+  class COMMIT,OK commit
+  class FAIL,ROLLBACK failure
+  linkStyle default stroke-width:1.8px

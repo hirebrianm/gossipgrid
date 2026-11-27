@@ -1,0 +1,26 @@
+flowchart TB
+  subgraph STALE["Stale-epoch peer (E1)"]
+    direction TB
+    S("gossipgrid-z<br/>binding: E1 (stale)")
+    SB[("SQLite: E1 messages")]
+    S --> SB
+  end
+
+  subgraph CURRENT["Current-epoch replica (E2)"]
+    direction TB
+    C("gossipgrid-0<br/>binding: E2 (authorized)")
+    CB[("SQLite: E2 messages")]
+    C --> CB
+    CHECK{"Caller epoch<br/>matches local binding?"}
+  end
+
+  S -->|"mTLS: valid certificate<br/>(identity PASSES)"| M{"mTLS handshake"}
+  M -->|"request carries<br/>X-GossipGrid-Epoch-ID: E1"| CHECK
+  CHECK -->|"E1 != E2 (mismatch)"| R("409 epoch mismatch<br/>(permanent, no retry,<br/>data NOT merged)")
+  S <-. "peer marked permanently<br/>rejected (no retry for E1)" .-> R
+
+  class S,SB push
+  class C,CB new
+  class M guard
+  class R failure
+  linkStyle default stroke-width:1.8px

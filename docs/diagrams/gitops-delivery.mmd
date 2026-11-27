@@ -1,45 +1,35 @@
-flowchart LR
-  DEV["Developer commit / tag (v0.1.0-alpha.N)"]
-  DEV --> CI
-
-  subgraph CILAB["GitLab CI (implemented)"]
-    direction TB
-    CI["QA + security checks (make qa: fmt, vet, golangci-lint, gosec, docs-lint, tests, race, version-injection)"]
-    IMG["Container image build (multistage static musl, scratch, non-root 65534) - currently manual: make image"]
-    PUBLISH["Publish immutable image by commit SHA / digest - currently manual push"]
-    CI --> IMG --> PUBLISH
+flowchart TB
+  subgraph S1["1. Development and validation"]
+    direction LR
+    DEV("Commit or tag") --> CI("GitLab CI") --> QA("QA and security")
   end
 
-  subgraph M8["GitOps delivery (M8, partial)"]
-    direction TB
-    REG["Container registry - private GitLab, immutable image by SHA256 digest (operational)"]
-    GOREPO["GitOps repository - Helm values + Argo CD application manifest (digest updated manually today)"]
-    ARGO["Argo CD - reconciles the cluster to the recorded revision (operational)"]
-    PUBLISH -->|manual publish by digest| REG
-    REG -->|manual digest update| GOREPO
-    GOREPO -->|watch and reconcile| ARGO
+  subgraph S2["2. Publish and record"]
+    direction LR
+    PUB("Manual publish") --> REG[("Image digest")]
+    REG --> DIG("Manual digest update")
+    DIG --> REPO("k8s-gitops")
   end
 
-  ARGO --> K8S["StatefulSet gossipgrid rollout (5 replicas, Parallel)"]
-
-  subgraph PLANNED["Still planned (M8 automation)"]
-    direction TB
-    AUTO["Automated image publishing - CI commits digest to k8s-gitops"]
-    AUTOREV["Automated GitOps revision updates"]
-    PROMOTE["Automated promotion and delivery workflows"]
-    AUTO --- AUTOREV --- PROMOTE
+  subgraph S3["3. Kubernetes reconciliation"]
+    direction LR
+    ARGO("Argo CD") --> STS("StatefulSet")
+    STS --> PODS("Five replicas")
   end
 
-  subgraph BOUND["Promotion / rollback / validation boundaries (target)"]
-    direction TB
-    PROMO["Promotion = tag push: a full pipeline (QA, build, publish, GitOps update)"]
-    ROLLBACK["Rollback = revert of the GitOps revision; Argo CD reconciles back to the previous digest"]
-    VALIDATE["Validation = on-cluster tests (M7A/M7B); a failed Argo CD sync is observable and reversible"]
-    PROMO --- ROLLBACK --- VALIDATE
+  subgraph S4["M8 automation - planned"]
+    direction LR
+    AUTO("CI build and publish") --> UPDATE("Update GitOps")
+    UPDATE --> PROMOTE("Release promotion")
   end
-  GOREPO -.-> BOUND
-  GOREPO -.-> PLANNED
 
-  NOTE["Ownership boundary: GitLab CI builds and publishes only - it NEVER deploys directly to the cluster. Argo CD owns deployment reconciliation. No overlapping deployment ownership."]
-  CI -.-> NOTE
-  ARGO -.-> NOTE
+  S1 --> S2
+  S2 --> S3
+  S3 -.-> S4
+
+  class DEV,CI,STS,PODS,REG new
+  class QA new
+  class PUB,DIG missed
+  class REPO,ARGO metadata
+  class AUTO,UPDATE,PROMOTE planned
+  linkStyle default stroke-width:1.8px
