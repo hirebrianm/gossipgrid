@@ -2,22 +2,22 @@ stateDiagram-v2
   [*] --> STARTING
   STARTING --> DISCOVERING: SQLite + credentials initialized
   STARTING --> RECOVERY_REQUIRED: no safe path
-  DISCOVERING --> SYNCING: eligible peer found (5B)
-  DISCOVERING --> GENESIS: authorized initial cluster creation (5C)
-  DISCOVERING --> READY: initialized cluster metadata available
-  DISCOVERING --> RECOVERY_REQUIRED: known cluster, no safe sync source
-  GENESIS --> READY: authorized epoch established
-  GENESIS --> RECOVERY_REQUIRED: authorization lost
-  SYNCING --> READY: snapshot ingested + initial catch-up (5B Stage 3)
-  SYNCING --> DISCOVERING: source unavailable
-  SYNCING --> RECOVERY_REQUIRED: authority lost
+  DISCOVERING --> SYNCING: AuthorizeJoin succeeds (3A–3B)
+  DISCOVERING --> GENESIS: Authorized genesis (1A–1B)
+  DISCOVERING --> READY: Authorized seed restoration (1B)
+  DISCOVERING --> RECOVERY_REQUIRED: Confirmed authorization lockout
+  GENESIS --> READY: Genesis finalized (1B)
+  GENESIS --> RECOVERY_REQUIRED: Confirmed authorization lockout
+  SYNCING --> READY: Sync complete (3D, planned)
+  SYNCING --> DISCOVERING: Retry orchestration (planned)
+  SYNCING --> RECOVERY_REQUIRED: Binding mismatch
   READY --> DEGRADED: peer partition / sync failure
-  READY --> RECOVERY_REQUIRED: epoch mismatch (fenced, data preserved)
+  READY --> RECOVERY_REQUIRED: epoch mismatch (fenced)
   DEGRADED --> READY: reconciliation recovers
-  DEGRADED --> RECOVERY_REQUIRED: authority lost
-  RECOVERY_REQUIRED --> DISCOVERING: operator recovery (5C) / epoch changes
+  DEGRADED --> RECOVERY_REQUIRED: Binding mismatch
+  RECOVERY_REQUIRED --> DISCOVERING: Matching authority restored
   note right of READY
-      READY and DEGRADED return 200 from /readyz.
-      RECOVERY_REQUIRED returns 503.
-      Existing data is preserved.
+      Legal transitions only; not all exercised in production code (3D
+      promotion is planned). READY and DEGRADED are readiness-eligible.
+      M5C operator recovery (planned) re-enters DISCOVERING.
   end note

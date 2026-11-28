@@ -5,12 +5,20 @@
 A Go-based distributed systems testbed for evaluating Kubernetes orchestration, service discovery, gossip protocols,
 mTLS, fault tolerance, and automated deployments.
 
-**Status:** Milestones 0 through 5A, 5B (Stages 0, 1A, 1B, and 2), and 6 are implemented and locally tested (tag
-`v0.1.0-alpha.7`). Milestone 5B Stage 2 (bootstrap replication admission) is **implemented, committed** (commit
-`209cec1`), and locally tested, but **not yet cluster-verified**. Milestone 7A (Kubernetes
+**Status:** Milestones 0 through 5A, 6, and 7A are implemented, committed, and
+locally tested (the tagged release is `v0.1.0-alpha.7` — commit `9412044`, "gate Kubernetes readiness on initial
+anti-entropy sync"; M5B work is not included in that tag). Subsequent development on `main` beyond that tag is
+unreleased. Milestone 5B Stages 0 (read-only Kubernetes metadata provider), 1A (Kubernetes genesis grant), and 1B
+(operator-authorized genesis finalization) are **implemented, committed, and locally tested**, but **not yet
+cluster-verified**. Milestone 5B Stage 2 (bootstrap replication admission) is **implemented,
+committed** (commit `209cec1`), and locally tested, but **not yet cluster-verified**. Milestone 5B Stage 3A
+(authorized replica joining and durable binding provenance) is **implemented, committed** (commit `e4d09f6`),
+and locally tested, but **not yet cluster-verified**. Milestone 5B Stage 3B (deterministic bootstrap-source
+discovery and selection) is **implemented and locally tested**, but **uncommitted pending operator review**
+and **not yet cluster-verified**. Milestone 7A (Kubernetes
 staging) is **deployed and initially smoke-tested in Kubernetes**; the remaining acceptance tests in
 [deploy/STAGING-RUNBOOK.md](deploy/STAGING-RUNBOOK.md) are pending. Lifecycle enforcement is disabled in 7A
-because Milestones 5B (Stage 3) and 5C are not yet implemented.
+because Milestones 5B (Stages 3C–3E) and 5C are not yet implemented.
 
 **Verified in the cluster** (operator-confirmed, 2026-11-22): five StatefulSet replicas running and ready with
 zero restarts; replicas distributed across two worker nodes; Kubernetes DNS peer discovery (4 remote peers + local
@@ -82,9 +90,14 @@ deliberate part of the testbed design.
 | Operator-authorized genesis finalization (one-time, idempotent) | ✅ Milestone 5B Stage 1B |
 | Bootstrap replication admission (narrowly scoped, `SYNCING`-only, epoch-bound) | ✅ Milestone 5B Stage 2 (implemented, committed `209cec1`, locally tested; not yet cluster-verified) |
 | Bootstrap baseline fetch and commit (`FetchBootstrapBaseline`, bounded transactional install, pinned-epoch transport) | ✅ Milestone 5B Stage 2 (implemented, committed `209cec1`, locally tested; not yet cluster-verified) |
-| Automatic source discovery, selection, and sweep scheduling for initial snapshot transfer | 🔜 Milestone 5B Stage 3 (reconstruction orchestration; transport-and-commit mechanism implemented in Stage 2) |
-| Controlled READY promotion (automatic SYNCING → READY after baseline installed + initial catch-up) | 🔜 Milestone 5B Stage 3 (reconstruction orchestration; `PromoteToReady` not yet implemented) |
-| Snapshot-source eligibility (unsynced pods never source snapshots; `CheckBootstrapSourceInbound` implemented in Stage 2) | ✅ Milestone 5B Stage 2 (admission predicate implemented; automatic source selection is Stage 3) |
+| Authorized replica joining (`AuthorizeJoin` with final authorization guard) | ✅ Milestone 5B Stage 3A (implemented, committed `e4d09f6`, locally tested; not yet cluster-verified) |
+| Durable binding provenance (the binding records its creation origin — genesis or join — not the authenticated source observation; it does not persist the source peer's identity or observation) | ✅ Milestone 5B Stage 3A (implemented, committed `e4d09f6`, locally tested; not yet cluster-verified) |
+| Authenticated bootstrap-source eligibility (`CheckBootstrapSourceInbound`; unsynced pods never source snapshots) | ✅ Milestone 5B Stage 3A (implemented, committed `e4d09f6`, locally tested; not yet cluster-verified) |
+| Deterministic bootstrap-source discovery and selection (`BootstrapSourceSelector`; selects an eligible authenticated source from the current discovery membership) | ✅ Milestone 5B Stage 3B (implemented, locally tested; uncommitted pending operator review; not yet cluster-verified) |
+| Baseline sweep scheduling (when and how the bootstrap sweep is triggered and coordinated) | 🔜 Milestone 5B Stage 3C (planned; transport-and-commit mechanism implemented in Stage 2) |
+| Bounded retries and initial catch-up (retry coordination; initial synchronization pass after baseline installed) | 🔜 Milestone 5B Stage 3C (planned) |
+| Controlled READY promotion (automatic SYNCING → READY after baseline installed + initial catch-up) | 🔜 Milestone 5B Stage 3D (planned; `PromoteToReady` not yet implemented) |
+| Automatic reconstruction orchestration (end-to-end replacement-pod recovery to READY) | 🔜 Milestone 5B Stages 3C–3D (planned; no automatic reconstruction worker is operational) |
 | Fail-closed behavior when authoritative metadata is unavailable (authority `invalid`, 503, no data-loss incident) | ✅ Milestone 5A (implemented; 5B Stage 0 adds the production Kubernetes metadata provider) |
 | Operator recovery/reset authorization (no automatic destructive reset by default) | 🔜 Milestone 5C |
 | Catastrophic data-loss handling and epoch transitions with stale-data fencing | 🔜 Milestone 5C |
@@ -445,10 +458,11 @@ all existing behavior is preserved.
   admission fails closed. The provider is not yet cluster-verified.
 - No **automatic** cluster genesis (a fresh replica with no binding cannot automatically initialize an empty epoch;
   operator-controlled one-time genesis authorization and finalization are implemented in 5B Stages 1A and 1B;
-  reconstruction orchestration for replacement replicas is Stage 3).
-- No initial snapshot transfer orchestration (the path from `SYNCING` to `READY` via source discovery, sweep
-  scheduling, and `PromoteToReady` is Stage 3; Stage 2 provides the transport-and-commit mechanism
-  (`FetchBootstrapBaseline`) but not the scheduling or promotion).
+  automatic reconstruction orchestration for replacement replicas is Stages 3C–3D).
+- No initial snapshot transfer orchestration (the path from `SYNCING` to `READY` via sweep scheduling and
+  `PromoteToReady` is Stages 3C–3D; Stage 2 provides the transport-and-commit mechanism
+  (`FetchBootstrapBaseline`), Stage 3B provides deterministic source selection, but neither the scheduling
+  nor the promotion is implemented).
 - No automatic epoch reset or operator reset endpoints (Milestone 5C).
 - mTLS alone does **not** prove a peer's epoch membership; the response envelope is a second, independent check.
 - 5A alone does **not** make GossipGrid safe for catastrophic cluster recovery.
@@ -753,7 +767,7 @@ or the cluster DNS). Those are pre-existing prerequisites owned by the cluster o
 | 0–5A | Single replica, local storage, peer discovery, peer mTLS, message exchange, gossip, anti-entropy, lifecycle state machine | ✅ Implemented and locally tested |
 | 6 | Browser UI, single-administrator password authentication, credential reload | ✅ Implemented and locally tested |
 | 7A | Kubernetes staging: 5-replica StatefulSet, shared Cilium Gateway, cert-manager, VSO, Argo CD | ✅ Deployed and smoke-tested; full acceptance tests pending |
-| 5B | Kubernetes metadata authority (ConfigMap), bootstrap replication admission, initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility | 🔜 Partial: Stages 0 (read-only provider), 1A (genesis grant), 1B (genesis finalization), and 2 (bootstrap admission) implemented, committed, and locally tested; Stage 3 (orchestration) designed but not implemented |
+| 5B | Kubernetes metadata authority (ConfigMap), bootstrap replication admission, initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility | 🔜 Partial: Stages 0 (read-only provider), 1A (genesis grant), 1B (genesis finalization), 2 (bootstrap admission), 3A (authorized joining, durable binding provenance, authenticated source eligibility — committed `e4d09f6`), and 3B (deterministic bootstrap-source discovery and selection — uncommitted pending operator review) implemented and locally tested; Stages 3C (sweep scheduling, bounded retries, initial catch-up), 3D (synchronization-completion READY promotion), and 3E (end-to-end Kubernetes reconstruction verification) planned, not implemented |
 | 6B | Cluster visualization: composed status aggregation, telemetry event buffers, propagation/reconciliation visualization, lifecycle/resilience visualization | 🔜 Designed (4 feature stages); no implementation started |
 | 5C | Operator recovery/reset authorization, catastrophic data-loss handling, epoch transitions, incident audit | 🔜 Designed but not implemented |
 | 7B | Lifecycle-aware staging: enable lifecycle enforcement, in-cluster recovery and partition tests | 🔜 Designed but not implemented |
@@ -763,7 +777,7 @@ or the cluster DNS). Those are pre-existing prerequisites owned by the cluster o
 Milestone 7A has been deployed and initially smoke-tested in the staging cluster. The remaining acceptance tests
 in [deploy/STAGING-RUNBOOK.md](deploy/STAGING-RUNBOOK.md) (cross-replica convergence, recovery after pod
 replacement, live password rotation, fault tolerance) are pending. Milestone 5B is **partially implemented**
-(Stages 0, 1A, 1B, and 2 implemented, committed, and locally tested; Stage 3 pending) and 5C is designed but not
+(Stages 0, 1A, 1B, 2, 3A, and 3B implemented and locally tested; Stages 3C–3E pending) and 5C is designed but not
 implemented; both are required before lifecycle enforcement can be enabled
 (Milestone 7B). See [docs/development-plan.md](docs/development-plan.md) for the full milestone breakdown,
 acceptance criteria, and dependencies.

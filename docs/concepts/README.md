@@ -43,8 +43,9 @@ Read the documents in this order. Each step builds on the previous one.
 
 - **Concept vs. implementation.** Each document has a "How GossipGrid currently implements it" section.
   That section describes *implemented, committed, and locally tested* behavior. Sections marked
-  *planned* or *proposed* describe behavior that is **not yet implemented** (e.g. Milestone 5B Stage 3,
-  Milestone 5C, Milestone 6B). Do not read a planned section as a description of current behavior.
+  *planned* or *proposed* describe behavior that is **not yet implemented** (e.g. Milestone 5B Stages 3C–3E,
+  Milestone 5C, Milestone 6B). Stages 3A and 3B of Milestone 5B are implemented and locally tested; do not read
+  a planned section as a description of current behavior.
 - **Conceptual examples are illustrative.** Diagrams and examples that show a "typical" gossip spread or
   a "typical" partition are *illustrative*; they are not a record of a specific observed run. Where a
   diagram reflects actual application behavior (e.g. the bootstrap admission sequence, the transactional

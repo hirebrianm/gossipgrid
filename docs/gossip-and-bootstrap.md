@@ -10,14 +10,19 @@ Stage 1B (operator-authorized genesis finalization, one-time idempotent) is impl
 bootstrap replication admission and guarded `FetchBootstrapBaseline` installation, transport-and-commit
 mechanism) is implemented, committed, and locally tested (not yet cluster-verified); Stage 3A (durable binding
 provenance, `AuthorizeJoin` with final authorization guard, trusted source-observation boundary,
-context-aware binding operations, and seed-restart privilege isolation) is implemented and locally tested (not yet
-cluster-verified, uncommitted pending operator review); Stage 3B–3D (reconstruction orchestration: source
-discovery/selection, sweep scheduling, synchronization-completion `READY` promotion) are designed but not
-implemented. Milestone 5C
+context-aware binding operations, and seed-restart privilege isolation) is implemented and locally tested
+(committed `e4d09f6`, not yet cluster-verified); Stage 3B (deterministic bootstrap-source discovery and
+selection: the `BootstrapSourceSelector` that selects an eligible, authenticated bootstrap-source candidate from
+the current discovery membership, reusing the existing discovery manager and the production
+`peertls.BootstrapSourceObserver`, with bounded execution, typed selection outcomes, production discovery adapter,
+and real-mTLS integration tests) is implemented and locally tested (not yet cluster-verified, uncommitted pending
+operator review); Stages 3C–3D (sweep scheduling,
+synchronization-completion `READY` promotion) are designed but not implemented. Milestone 5C
 (operator recovery) is designed but not implemented. Milestone 5B overall is **incomplete and not yet
 cluster-verified**: the one-time genesis authorization and finalization (Stages 1A/1B), the dedicated bootstrap
-admission and fail-closed authority handling (Stages 0, 2), and the authorized joining and durable binding
-foundation with final guard (Stage 3A) are implemented; the reconstruction orchestration (Stages 3B–3D) and
+admission and fail-closed authority handling (Stages 0, 2), the authorized joining and durable binding
+foundation with final guard (Stage 3A), and the deterministic bootstrap-source discovery and selection
+(Stage 3B) are implemented; the reconstruction orchestration (Stages 3C–3D) and
 operator recovery (5C) remain planned.
 
 **Replication diagram:** The implemented distributed messaging mechanism (local persistence, gossip fanout,
@@ -207,28 +212,55 @@ stateDiagram-v2
   [*] --> STARTING
   STARTING --> DISCOVERING: SQLite + credentials initialized
   STARTING --> RECOVERY_REQUIRED: no safe path
-  DISCOVERING --> SYNCING: eligible peer found
-  DISCOVERING --> GENESIS: authorized initial cluster creation
-  DISCOVERING --> READY: metadata available, no local binding, cluster initialized
-  DISCOVERING --> RECOVERY_REQUIRED: known cluster, no safe sync source
-  GENESIS --> READY: authorized epoch established (operator action, 5B)
-  GENESIS --> RECOVERY_REQUIRED: authorization lost
-  SYNCING --> READY: snapshot ingested + initial catch-up
-  SYNCING --> DISCOVERING: source unavailable
-  SYNCING --> RECOVERY_REQUIRED: authority lost
+  DISCOVERING --> SYNCING: AuthorizeJoin succeeds (3A)
+  DISCOVERING --> GENESIS: Authorized genesis (1A)
+  DISCOVERING --> READY: Authorized seed restoration (1B)
+  DISCOVERING --> RECOVERY_REQUIRED: Confirmed authorization lockout
+  GENESIS --> READY: Genesis finalized (1B)
+  GENESIS --> RECOVERY_REQUIRED: Confirmed authorization lockout
+  SYNCING --> READY: Sync complete (3D, planned)
+  SYNCING --> DISCOVERING: Retry orchestration (planned)
+  SYNCING --> RECOVERY_REQUIRED: Binding mismatch
   READY --> DEGRADED: peer partition / sync failure
-  READY --> RECOVERY_REQUIRED: epoch mismatch (fenced, data preserved)
+  READY --> RECOVERY_REQUIRED: epoch mismatch (fenced)
   DEGRADED --> READY: reconciliation recovers
-  DEGRADED --> RECOVERY_REQUIRED: authority lost
-  RECOVERY_REQUIRED --> DISCOVERING: peer recovers / epoch changes
+  DEGRADED --> RECOVERY_REQUIRED: Binding mismatch
+  RECOVERY_REQUIRED --> DISCOVERING: Matching authority restored
   note right of READY
-      READY and DEGRADED return 200 from /readyz.
-      RECOVERY_REQUIRED returns 503.
-      The 5C operator recovery procedure
-      returns RECOVERY_REQUIRED to DISCOVERING.
-      Existing data is preserved.
+      Legal transitions only; not all exercised in production code (3D
+      promotion is planned). READY and DEGRADED are readiness-eligible.
+      M5C operator recovery (planned) re-enters DISCOVERING.
   end note
 ```
+
+**Transition conditions (not restated in the diagram).** The diagram keeps the
+transition labels short for readability; the authorization and lockout conditions
+behind each transition are:
+
+- **Stage 3B selection is advisory and does not change lifecycle state.** The
+  `BootstrapSourceSelector` (Stage 3B) picks an eligible, authenticated bootstrap
+  source from the current discovery membership; selecting one does not move the
+  replica between states. A source's absence alone does not cause a recovery
+  lockout — `SYNCING → DISCOVERING` is the retry path (Stage 3C, planned), and
+  `RECOVERY_REQUIRED` is reached only on a *confirmed* lockout, not on temporary
+  metadata unavailability.
+- **Genesis-seed restoration** (`DISCOVERING → READY`, Stage 1B) requires
+  recognized genesis provenance, a matching durable binding, and complete
+  authoritative finalization.
+- **Genesis finalization** (`GENESIS → READY`, Stage 1B) requires observation of
+  the complete authoritative finalization; a confirmed genesis-authorization
+  revocation (`GENESIS → RECOVERY_REQUIRED`) locks the replica out.
+- **Recovery re-evaluation** (`RECOVERY_REQUIRED → DISCOVERING`) requires
+  matching restored authority. It must not clear a confirmed genesis-revocation
+  lockout merely because cluster/epoch IDs match, and a new epoch alone cannot
+  clear a conflicting durable binding.
+- **`SYNCING → READY`** (synchronization complete) is Stage 3D, planned — not
+  automatic; the retry orchestration (`SYNCING → DISCOVERING`) is Stage 3C, planned.
+- **`READY` and `DEGRADED` are readiness-eligible states**, but actual HTTP
+  readiness (`/readyz`) also requires the applicable authorization and
+  initial-sync gates; `RECOVERY_REQUIRED` returns 503.
+- **M5C operator-controlled recovery** (returning `RECOVERY_REQUIRED` to
+  `DISCOVERING`) remains planned.
 
 **Transition table** (all other transitions are rejected with `ErrInvalidTransition`):
 
@@ -387,10 +419,12 @@ implements operator-authorized genesis finalization (the mechanism that atomical
 the ConfigMap via CAS, consumes the
 authorization, arms `DataLossProtected`, and promotes the seed to `READY` via seed-restart reconciliation). The 5A
 state machine's `GENESIS` state and transition are defined and used by these stages. **What remains planned:**
-Stage 3 implements reconstruction orchestration (source discovery/selection, sweep scheduling,
-synchronization-completion `READY` promotion for replacement replicas that join an already-initialized cluster —
-distinct from one-time genesis) and 5C implements operator recovery. The full `SYNCING` → `READY` reconstruction
-path for replacement replicas is **not yet complete** (Milestone 5B, Stage 3; Milestone 5C).
+Stage 3C implements the reconstruction sweep scheduling (the bootstrap baseline fetch orchestration) and
+Stage 3D implements synchronization-completion `READY` promotion for replacement replicas that join an
+already-initialized cluster — distinct from one-time genesis — and 5C implements operator recovery. Stage 3B
+(deterministic bootstrap-source discovery and selection) is implemented (see below). The full `SYNCING` →
+`READY` reconstruction path for replacement replicas is **not yet complete** (Milestone 5B, Stages 3C–3D;
+Milestone 5C).
 
 ## Milestone 5B — Authoritative metadata and initial synchronization (partially implemented)
 
@@ -526,7 +560,7 @@ A bootstrap-authorized `SYNCING` replica:
 - **May not** access unrelated endpoints (the sync endpoints are the only ones the bootstrap privilege
   reaches).
 - **May not** self-promote to `READY` (the bootstrap commit path is not a promotion mechanism; only the full
-  synchronization completion in Stage 3 can do that).
+  synchronization completion in Stage 3D can do that).
 - **May not** enable unrestricted periodic anti-entropy (the anti-entropy engine's admission check is
   `CheckReplicationOutbound`, not `CheckBootstrapFetch`; a `SYNCING` replica is not authorized for periodic
   anti-entropy).
@@ -609,9 +643,9 @@ by the client (it is set whenever `requestPurpose != ""` in `doRequest`), but it
 serving-side check (lifecycle disabled → all checks pass). This preserves the M4 anti-entropy behavior
 for a 7A cluster that has no authoritative epoch.
 
-### Remaining Stage 3 requirements (not yet implemented)
+### Remaining Stage 3 requirements (3A and 3B implemented; 3C–3D not yet implemented)
 
-Milestone 5B, Stage 3A (implemented, locally tested, uncommitted) provides the **authorized joining and
+Milestone 5B, Stage 3A (implemented, locally tested, committed `e4d09f6`) provides the **authorized joining and
 durable binding foundation** with a final authorization guard:
 
 - **Durable binding provenance** — every `local_metadata` binding row carries a `provenance` column
@@ -676,10 +710,46 @@ durable binding foundation** with a final authorization guard:
   Stage 3A, but a valid `DEGRADED` recovery remains allowed. `SetSyncingForTest` is a test-only
   method (the production path for entering SYNCING is `AuthorizeJoin`).
 
-Milestone 5B, Stages 3B–3D will implement the full bootstrap orchestration:
+Milestone 5B, Stage 3B (implemented, locally tested, uncommitted) provides **deterministic bootstrap-source
+discovery and selection**: the `BootstrapSourceSelector` selects an eligible, authenticated bootstrap-source
+candidate from the current discovery membership. It is used by (a) an unbound replica preparing to call
+`AuthorizeJoin`, (b) a replica with an incomplete, matching join binding resuming joining, and (c) an
+authorized `SYNCING` replica seeking a bootstrap source. The selector:
 
-- **Source discovery and selection** (3B) — a `SYNCING` replica must discover eligible sources (peers in
-  `READY` or `DEGRADED` state with a matching epoch) and select one deterministically.
+- **Reuses the existing discovery manager** — it does NOT create a new DNS resolver, membership manager, or
+  refresh loop. It reads the discovery snapshot through a narrow, read-only adapter
+  (`DiscoverySnapshotFunc` → `DiscoverySnapshotView`), mirroring the existing
+  `antientropy.PeerSourceSnapshot` pattern to avoid an import cycle.
+- **Builds the candidate list from one coherent, immutable snapshot** — it rejects stale DNS membership,
+  preserves static mode, treats discovery-disabled as waiting/unavailable, filters to valid expected replica
+  identities, excludes the local replica, excludes unexpected ordinals, rejects invalid pod identities and
+  unusable addresses, derives the expected certificate DNS identity via the configured suffix, and
+  deduplicates equivalent identity/address pairs.
+- **Selects deterministically** — candidates are ordered by canonical replica identity (lexicographic) with
+  a network-address tie-breaker. They are observed sequentially; the first candidate passing the complete
+  authenticated source-observation contract is selected. Both `READY` and `DEGRADED` sources are eligible
+  (no `READY` preference). No further observations are performed after a valid selection.
+- **Reuses the production observer** — it uses `lifecycle.BootstrapSourceObserver` /
+  `peertls.NewBootstrapSourceObserver` (no second transport).
+- **Pins the authoritative target from the controller** — the target (cluster/epoch) is never derived from a
+  peer response. Narrow, read-only authorization/membership validation helpers are used, and the authority
+  and membership are revalidated after the network observation before the result is returned.
+  Authorization-changed and membership-changed are explicit, typed outcomes.
+- **Runs with bounded execution** — a finite, positive `SelectionBudget` is subordinate to the caller's
+  context deadline; a bounded `ObservationBudget` is applied per candidate. There is no backoff, no worker
+  pool, no parallel fanout. The selection is context-aware and leaks no goroutines.
+- **Returns structured, typed outcomes** — `OutcomeSelected`, `OutcomeNoEligibleSource`,
+  `OutcomeDiscoveryUnavailable`, `OutcomeDiscoveryStale`, `OutcomeNoInitialRefresh`, `OutcomeNoCandidates`,
+  `OutcomeAuthorizationUnavailable`, `OutcomeAuthorizationChanged`, `OutcomeMembershipChanged`,
+  `OutcomeBudgetExhausted`, and `OutcomeCancelled`. A no-source result does NOT transition the replica to
+  `RECOVERY_REQUIRED`, trigger genesis, modify the binding/lifecycle/metadata, or promote the replica.
+- **Preserves Stage 3A / Stage 2 authorization** — selection is advisory only; it does not perform the
+  joining operation, create a binding, transfer messages, or promote the replica. The selected candidate
+  must pass the complete `AuthorizeJoin` authorization sequence (or the Stage 2 bootstrap-fetch
+  authorization for a `SYNCING` replica) before any operation is performed.
+
+Milestone 5B, Stages 3C–3D will implement the remaining bootstrap orchestration:
+
 - **Sweep scheduling** (3C) — the bootstrap baseline fetch is a single, bounded transfer (not the periodic
   anti-entropy loop). Stage 3C defines when and how the sweep is scheduled (e.g., on transition to `SYNCING`,
   with a bounded retry budget).
@@ -689,12 +759,13 @@ Milestone 5B, Stages 3B–3D will implement the full bootstrap orchestration:
 - **Complete sweep accounting** (3D) — the bootstrap sweep must track progress (per-peer cursor, completed
   passes) and handle partial sweeps (page-budget exhaustion) correctly.
 
-**Milestone 5B is NOT complete.** Stages 0, 1A, 1B, 2, and 3A are implemented and locally tested (Stage 2
+**Milestone 5B is NOT complete.** Stages 0, 1A, 1B, 2, 3A, and 3B are implemented and locally tested (Stage 2
 provides the admission and transport-and-commit mechanism; Stage 3A provides the authorized joining and
-durable binding foundation with final guard, trusted observation boundary, and context-aware binding);
-Stages 3B–3D provide the orchestration (source discovery, sweep scheduling, synchronization-completion
-`READY` promotion) that uses it. The initial snapshot transfer orchestration (the `SYNCING` → `READY`
-promotion path) is the remaining work (Stages 3B–3D).
+durable binding foundation with final guard, trusted observation boundary, and context-aware binding;
+Stage 3B provides the deterministic bootstrap-source discovery and selection); Stages 3C–3D provide the
+remaining orchestration (sweep scheduling, synchronization-completion `READY` promotion, sweep accounting)
+that uses it. The initial snapshot transfer orchestration (the `SYNCING` → `READY` promotion path) is the
+remaining work (Stages 3C–3D).
 
 ### Visual example: the bootstrap admission sequence
 
@@ -706,10 +777,11 @@ predicate) and *pinned* cluster/epoch context, the source's *dedicated* admissio
 (`CheckBootstrapSourceInbound`) applied per request for both the *inventory* page and the *bounded
 message batches*, the requester's *response-consumption* authorization and *envelope* validation,
 and the *guarded* *transactional* *install* (the guard is acquired and validated before the SQLite
-transaction and held through `COMMIT`). The requester *stays `SYNCING`*. The *Stage 3*
-orchestration (source discovery, sweep scheduling, synchronization-completion `READY` promotion) is *not
-implemented* and is *labeled as such* in the diagram; long method names, the `X-GossipGrid-Request-Purpose`
-header, the lock-ordering details, and the Stage 3 limitations are described in the prose below.
+transaction and held through `COMMIT`). The requester *stays `SYNCING`*. The *Stages 3C–3D*
+orchestration (sweep scheduling, bounded retries, initial catch-up, synchronization-completion `READY`
+promotion) is *not implemented* and is *labeled as such* in the diagram; source discovery and selection
+(Stages 3A–3B) are implemented. Long method names, the `X-GossipGrid-Request-Purpose`
+header, the lock-ordering details, and the Stages 3C–3D limitations are described in the prose below.
 
 [View full-size SVG](diagrams/generated/concept-bootstrap-admission.svg) · [View PNG](diagrams/generated/concept-bootstrap-admission.png)
 
@@ -766,10 +838,12 @@ records, install retained records (`ON CONFLICT DO NOTHING`), check immutable-co
 then `COMMIT` (the linearization point) with the guard still held; (7) the requester remains in
 `SYNCING`. Stage 3A (authorized joining and durable binding foundation: `AuthorizeJoin` with final
 authorization guard, trusted source-observation boundary, binding provenance, context-aware
-binding, seed-restart privilege isolation) is implemented and locally tested (uncommitted).
-Stages 3B–3D (discovery, source selection, sweep scheduling, catch-up orchestration,
-synchronization-completion `READY` promotion) are planned, not implemented. The bootstrap commit is
-not a promotion mechanism; there is no `PromoteToReady` method in the current code.
+binding, seed-restart privilege isolation) is implemented, locally tested, and committed
+(`e4d09f6`). Stage 3B (deterministic bootstrap-source discovery and selection) is implemented and
+locally tested (uncommitted pending operator review). Stages 3C–3D (sweep scheduling, catch-up
+orchestration, synchronization-completion `READY` promotion) are planned, not implemented. The
+bootstrap commit is not a promotion mechanism; there is no `PromoteToReady` method in the current
+code.
 
 The rendered diagram is available as
 [concept-bootstrap-admission.svg](diagrams/generated/concept-bootstrap-admission.svg) and
@@ -777,7 +851,9 @@ The rendered diagram is available as
 
 ## Joining an existing epoch
 
-**Stage 3A (implemented, locally tested, uncommitted):** The authorization is
+**Stage 3A (implemented, locally tested, committed `e4d09f6`) and
+Stage 3B (implemented, locally tested, uncommitted pending operator review):**
+The authorization is
 implemented by `Controller.AuthorizeJoin` in the following steps: (1) pre-binding
 validation (no I/O, no locks: caller context live, lifecycle enabled, not stopped,
 metadata present/fresh/valid/initialized, finalization complete, state permits
@@ -856,7 +932,73 @@ source observation expired. A separate regression covers the metadata-staleness
 gate. The observer is an explicitly trusted in-process dependency; the Go type is
 an engineering control, not a security boundary against an in-process attacker.
 
-The remaining steps (sweep, catch-up, `READY` promotion) are Stages 3B–3D (designed, not implemented):
+**Stage 3B (implemented, locally tested, uncommitted):** The `BootstrapSourceSelector`
+(`internal/lifecycle/bootstrap_source_selector.go`) provides the deterministic,
+authenticated mechanism that selects an eligible bootstrap-source candidate from
+the current discovery membership. It is the production mechanism by which:
+an unbound replica preparing to call `AuthorizeJoin` (the pre-join case),
+a replica with an incomplete, matching join binding resuming joining, and an
+authorized `SYNCING` replica seeking a bootstrap source, obtain a candidate to
+observe. The selector:
+
+- reads the discovery snapshot through a narrow, read-only adapter
+  (`DiscoverySnapshotFunc` → `DiscoverySnapshotView`) — mirroring the existing
+  `antientropy.PeerSourceSnapshot` pattern to avoid an import cycle — and does
+  NOT create a new DNS resolver, membership manager, or refresh loop;
+- builds the candidate list from one coherent, immutable snapshot: it rejects
+  stale DNS membership, preserves static mode, treats discovery-disabled as
+  waiting/unavailable, filters to valid expected replica identities, excludes
+  the local replica, excludes unexpected ordinals, rejects invalid pod
+  identities and unusable addresses, derives the expected certificate DNS
+  identity via the configured suffix, and deduplicates equivalent
+  identity/address pairs;
+- orders candidates by canonical replica identity (lexicographic) with a
+  network-address tie-breaker, observes them sequentially, and selects the first
+  candidate passing the complete authenticated source-observation contract;
+  both `READY` and `DEGRADED` sources are eligible (no `READY` preference), and
+  no further observations are performed after a valid selection;
+- reuses the production `peertls.BootstrapSourceObserver` (no second transport);
+- pins the authoritative target from the controller (the cluster/epoch is never
+  derived from a peer response), revalidates the authority and membership after
+  the network observation, and returns explicit, typed outcomes for
+  authorization-changed and membership-changed conditions;
+- runs with bounded execution (a finite `SelectionBudget` subordinate to the
+  caller's context deadline; a bounded `ObservationBudget` per candidate; no
+  backoff, no worker pool, no parallel fanout) and is context-aware with no
+  goroutine leaks;
+- returns structured, typed outcomes (`OutcomeSelected`,
+  `OutcomeNoEligibleSource`, `OutcomeDiscoveryUnavailable`,
+  `OutcomeDiscoveryStale`, `OutcomeNoInitialRefresh`, `OutcomeNoCandidates`,
+  `OutcomeAuthorizationUnavailable`, `OutcomeAuthorizationChanged`,
+  `OutcomeMembershipChanged`, `OutcomeBudgetExhausted`, `OutcomeCancelled`)
+  rather than error-string parsing.
+
+The selection is **advisory only**: it does not perform the joining operation,
+create a binding, transfer messages, or promote the replica. A no-source result
+does NOT transition the replica to `RECOVERY_REQUIRED`, trigger genesis, modify
+the binding/lifecycle/metadata, or promote the replica. The selected candidate
+must pass the complete `AuthorizeJoin` authorization sequence (or the Stage 2
+bootstrap-fetch authorization for a `SYNCING` replica) before any operation is
+performed.
+
+The Stage 3B integration regression is in
+`internal/peertls/selector_integration_test.go`
+(`TestSelectorIntegration_RealMTLS`): an unbound requester in `DISCOVERING` with
+fresh, finalized metadata receives a discovery snapshot containing an eligible
+candidate (`gossipgrid-0`, `READY`, eligible) and an ineligible candidate
+(`gossipgrid-2`, `DEGRADED`, not eligible); the selector selects the eligible
+same-epoch source through the production observer (a real mTLS handshake); the
+selection alone leaves the replica unbound and in `DISCOVERING`;
+`AuthorizeJoin` then succeeds via the normal observation path and the requester
+reaches `SYNCING` (with ordinary replication and public writes denied, and
+bootstrap fetch permitted); the selector can then select a bootstrap source for
+that `SYNCING` requester; and a fully-unsuccessful selection (all candidates
+ineligible) leaves the replica unbound and in `DISCOVERING`.
+
+The remaining steps (sweep, catch-up, `READY` promotion) are Stages 3C–3D (designed, not implemented). Stage 3B
+(deterministic bootstrap-source discovery and selection) is implemented and provides the mechanism by which a
+`SYNCING` replica or an unbound replica preparing to join selects an eligible, authenticated bootstrap source
+from the current discovery membership.
 
 1. Transfer message IDs/records in bounded, deterministic pages. Preserve IDs, origin, timestamps; upsert
    idempotently.
@@ -864,8 +1006,14 @@ The remaining steps (sweep, catch-up, `READY` promotion) are Stages 3B–3D (des
 3. Mark locally ready when a consistent baseline is installed and initial catch-up succeeds; continue reconciliation
    in background.
 
-If no valid source can be found, do **not** silently initialize an empty epoch. Report `RECOVERY_REQUIRED` or a more
-specific waiting status.
+If no eligible source can be found (Stage 3B selection returns a no-source outcome such as
+`OutcomeNoEligibleSource`), the replica does **not** silently initialize an empty epoch and the selection
+does **not** by itself transition the replica to `RECOVERY_REQUIRED`, trigger genesis, modify the
+binding, or promote the replica. The local lifecycle state remains governed by the existing controller
+(a `DISCOVERING` or `SYNCING` replica with no eligible source stays in its current state and waits for
+membership or authority to recover). The controller's own authorization evaluation (a conflicting binding
+or an epoch mismatch) is the mechanism that drives `RECOVERY_REQUIRED`; an unavailable or unready peer is
+not evidence that its retained records are permanently lost.
 
 ## Authenticated peer message exchange (Milestone 4A — implemented)
 

@@ -198,12 +198,12 @@ flowchart TB
   end
 
   P3("Self-promotion to READY: not authorized by Stage 2")
-  P4("Controlled READY promotion via Stage 3 orchestration (planned)")
+  P4("Controlled READY promotion via Stage 3D orchestration (planned)")
 
   S --> MAY
   S --> MAYNOT
   S -. "not authorized by Stage 2" .-> P3
-  P3 -. "planned (Stage 3)" .-> P4
+  P3 -. "planned (Stage 3D)" .-> P4
 
   class S state
   class M1,M2 may
@@ -222,8 +222,9 @@ source (never a bootstrap source), cannot access unrelated endpoints, cannot run
 periodic anti-entropy (the anti-entropy admission requires a ready state). Self-promotion to
 `READY` is **not authorized by Stage 2**: there is no `PromoteToReady` path in the current
 code, and a `SYNCING` replica cannot move itself to `READY`. A controlled `READY` promotion
-through authorized Stage 3 orchestration (the operator's finalization and lifecycle coordination)
-is planned, not implemented; Stage 3 does not imply unrestricted self-promotion. The
+through authorized Stage 3D orchestration (synchronization-completion promotion; the operator's
+finalization and lifecycle coordination) is planned, not implemented; Stages 3C–3D do not imply
+unrestricted self-promotion. The
 request-purpose header is untrusted — it only selects which admission check the serving replica
 applies; it never grants a privilege. mTLS and epoch validation apply regardless of the header.
 

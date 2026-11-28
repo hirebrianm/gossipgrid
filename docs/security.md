@@ -19,7 +19,11 @@ password rotation, fault tolerance) are pending. The M5A lifecycle functionality
 (`GOSSIPGRID_LIFECYCLE_ENABLED=false`) because the required 5B implementation is incomplete. Milestone 5B is
 **partially implemented**: Stages 0 (read-only Kubernetes metadata provider), 1A (Kubernetes genesis grant),
 1B (operator-authorized genesis finalization), and 2 (bootstrap replication admission) are implemented,
-committed, and locally tested (not yet cluster-verified); Stage 3 (orchestration, automatic `READY` promotion) is
+committed, and locally tested (not yet cluster-verified); Stage 3A (authorized joining, durable binding
+provenance, authenticated source eligibility — committed `e4d09f6`) and Stage 3B (deterministic
+bootstrap-source discovery and selection — uncommitted pending operator review) are implemented and locally tested
+(not yet cluster-verified); Stages 3C (sweep scheduling, bounded retries, initial catch-up), 3D
+(synchronization-completion `READY` promotion), and 3E (end-to-end Kubernetes reconstruction verification) are
 designed but not implemented. The operator recovery procedure (5C) is **designed but not implemented**.
 
 ## Threat model and trust boundaries
@@ -220,13 +224,15 @@ integration tests (all run under the FIPS build and the race detector):
   sync source, epoch change, startup without metadata) use real TLS 1.3 mutual TLS with generated certificates,
   not mock-only HTTP. Security-negative results (409 rejection, data preservation, no merge) are verified under
   the race detector.
-- **No production metadata provider.** The Kubernetes ConfigMap-backed metadata provider is not yet implemented.
-  The production path uses a no-op source that always reports metadata unavailable, so replicas with lifecycle
-  enabled fail closed. No security guarantee is claimed for cluster recovery until the 5B provider is deployed.
+- **The production metadata provider is opt-in and inactive by default.** The Kubernetes
+  ConfigMap-backed metadata provider (5B Stage 0) is implemented and wired into the application;
+  it is opt-in and inactive by default, in which case the controller uses a no-op source that
+  always reports metadata unavailable. No security guarantee is claimed for cluster recovery
+  until the remaining 5B orchestration (Stages 3C–3E) is implemented and cluster-verified.
 - **No automatic genesis or reset.** 5A does not implement automatic cluster initialization, automatic epoch reset,
   or operator reset endpoints. A fresh replica with no binding cannot automatically become ready. A
   `RECOVERY_REQUIRED` replica cannot automatically return to `READY`. Operator-controlled one-time genesis is
-  deferred to 5B (Stage 3+).
+  implemented in 5B Stages 1A and 1B; automatic reconstruction orchestration is 5B Stages 3C–3D.
 - **Commit authorization (lock-order guarantee).** The anti-entropy cursor commit
   (`Controller.CommitUnderAuthorization`) evaluates the complete authorization decision — ready state,
   not stopped, fresh valid metadata with `Initialized=true`, and a matching durable binding with no

@@ -8,11 +8,13 @@ document, see the [concept library](concepts/README.md).
 epoch binding, epoch fencing, and fail-closed admission). Milestone 5B is **partially implemented**: Stages 0
 (read-only Kubernetes metadata provider), 1A (Kubernetes genesis grant), 1B (operator-authorized genesis
 finalization), and 2 (bootstrap replication admission,
-`FetchBootstrapBaseline` transport-and-commit) are implemented, committed, and locally tested (not yet
-cluster-verified); Stage 3 (source discovery/selection, sweep scheduling, automatic `READY` promotion) is
-designed but not implemented.
+`FetchBootstrapBaseline` transport-and-commit), 3A (authorized joining, durable binding provenance,
+authenticated source eligibility — committed `e4d09f6`), and 3B (deterministic bootstrap-source discovery and
+selection — uncommitted pending operator review) are implemented and locally tested (not yet cluster-verified);
+Stages 3C (sweep scheduling, bounded retries, initial catch-up), 3D (synchronization-completion `READY`
+promotion), and 3E (end-to-end Kubernetes reconstruction verification) are designed but not implemented.
 Milestone 5C (operator recovery/reset authorization, catastrophic data-loss handling) is **designed but not
-implemented**. The recovery protocol described below is the **target design** that 5B Stage 3 and 5C will
+implemented**. The recovery protocol described below is the **target design** that 5B Stages 3C–3E and 5C will
 implement.
 
 ## Why this matters
@@ -23,8 +25,10 @@ Recovery of *availability* is not recovery of *lost data*.
 
 Milestone 5A (implemented 2026-11-21) adds the lifecycle state machine, durable epoch binding, epoch fencing, and
 fail-closed admission that underpin the recovery model described below. The Kubernetes metadata provider (5B
-Stage 0) is implemented and inactive; the bootstrap replication admission (5B Stage 2) is implemented, committed,
-and locally tested; initial snapshot transfer orchestration (5B Stage 3) and operator recovery/reset (5C) are
+Stage 0) is implemented and inactive; the bootstrap replication admission (5B Stage 2), authorized joining and
+durable binding provenance (5B Stage 3A), and deterministic bootstrap-source discovery and selection (5B Stage 3B)
+are implemented and locally tested; initial snapshot transfer orchestration (5B Stages 3C–3D), end-to-end
+Kubernetes reconstruction verification (5B Stage 3E), and operator recovery/reset (5C) are
 designed but not yet implemented. A replaced pod does **not** automatically bind its local metadata or
 reconstruct from a peer: with no durable binding, fresh initialized metadata only moves the replica to
 `DISCOVERING` (no binding is created), and a metadata read failure invalidates authority and fails closed without
@@ -44,26 +48,55 @@ stateDiagram-v2
   [*] --> STARTING
   STARTING --> DISCOVERING: SQLite + credentials initialized
   STARTING --> RECOVERY_REQUIRED: no safe path
-  DISCOVERING --> SYNCING: eligible peer found (5B)
-  DISCOVERING --> GENESIS: authorized initial cluster creation (5C)
-  DISCOVERING --> READY: initialized cluster metadata available
-  DISCOVERING --> RECOVERY_REQUIRED: known cluster, no safe sync source
-  GENESIS --> READY: authorized epoch established
-  GENESIS --> RECOVERY_REQUIRED: authorization lost
-  SYNCING --> READY: snapshot ingested + initial catch-up (5B Stage 3)
-  SYNCING --> DISCOVERING: source unavailable
-  SYNCING --> RECOVERY_REQUIRED: authority lost
+  DISCOVERING --> SYNCING: AuthorizeJoin succeeds (3A–3B)
+  DISCOVERING --> GENESIS: Authorized genesis (1A–1B)
+  DISCOVERING --> READY: Authorized seed restoration (1B)
+  DISCOVERING --> RECOVERY_REQUIRED: Confirmed authorization lockout
+  GENESIS --> READY: Genesis finalized (1B)
+  GENESIS --> RECOVERY_REQUIRED: Confirmed authorization lockout
+  SYNCING --> READY: Sync complete (3D, planned)
+  SYNCING --> DISCOVERING: Retry orchestration (planned)
+  SYNCING --> RECOVERY_REQUIRED: Binding mismatch
   READY --> DEGRADED: peer partition / sync failure
-  READY --> RECOVERY_REQUIRED: epoch mismatch (fenced, data preserved)
+  READY --> RECOVERY_REQUIRED: epoch mismatch (fenced)
   DEGRADED --> READY: reconciliation recovers
-  DEGRADED --> RECOVERY_REQUIRED: authority lost
-  RECOVERY_REQUIRED --> DISCOVERING: operator recovery (5C) / epoch changes
+  DEGRADED --> RECOVERY_REQUIRED: Binding mismatch
+  RECOVERY_REQUIRED --> DISCOVERING: Matching authority restored
   note right of READY
-      READY and DEGRADED return 200 from /readyz.
-      RECOVERY_REQUIRED returns 503.
-      Existing data is preserved.
+      Legal transitions only; not all exercised in production code (3D
+      promotion is planned). READY and DEGRADED are readiness-eligible.
+      M5C operator recovery (planned) re-enters DISCOVERING.
   end note
 ```
+
+**Transition conditions (not restated in the diagram).** The diagram keeps the
+transition labels short for readability; the authorization and lockout conditions
+behind each transition are:
+
+- **Stage 3B selection is advisory and does not change lifecycle state.** The
+  `BootstrapSourceSelector` (Stage 3B) picks an eligible, authenticated bootstrap
+  source from the current discovery membership; selecting one does not move the
+  replica between states. A source's absence alone does not cause a recovery
+  lockout — `SYNCING → DISCOVERING` is the retry path (Stage 3C, planned), and
+  `RECOVERY_REQUIRED` is reached only on a *confirmed* lockout, not on temporary
+  metadata unavailability.
+- **Genesis-seed restoration** (`DISCOVERING → READY`, Stage 1B) requires
+  recognized genesis provenance, a matching durable binding, and complete
+  authoritative finalization.
+- **Genesis finalization** (`GENESIS → READY`, Stage 1B) requires observation of
+  the complete authoritative finalization; a confirmed genesis-authorization
+  revocation (`GENESIS → RECOVERY_REQUIRED`) locks the replica out.
+- **Recovery re-evaluation** (`RECOVERY_REQUIRED → DISCOVERING`) requires
+  matching restored authority. It must not clear a confirmed genesis-revocation
+  lockout merely because cluster/epoch IDs match, and a new epoch alone cannot
+  clear a conflicting durable binding.
+- **`SYNCING → READY`** (synchronization complete) is Stage 3D, planned — not
+  automatic; the retry orchestration (`SYNCING → DISCOVERING`) is Stage 3C, planned.
+- **`READY` and `DEGRADED` are readiness-eligible states**, but actual HTTP
+  readiness (`/readyz`) also requires the applicable authorization and
+  initial-sync gates; `RECOVERY_REQUIRED` returns 503.
+- **M5C operator-controlled recovery** (returning `RECOVERY_REQUIRED` to
+  `DISCOVERING`) remains planned.
 
 ## Failure cases
 
@@ -186,8 +219,9 @@ reconstruction workflow: the three parts are independent examples.
   authoritative-data loss; the local database and durable binding are preserved. With fresh initialized
   metadata and no durable binding, the replica enters `DISCOVERING` — no binding is created, no source is
   selected, no READY promotion. A matching authoritative observation can permit re-evaluation to
-  `DISCOVERING`; an unchanged, revoked genesis-authorization observation does not. The authorized join and
-  reconstruction orchestration is **Stage 3 (planned)**.
+  `DISCOVERING`; an unchanged, revoked genesis-authorization observation does not. Authorized joining is
+  **Stage 3A (implemented)**; the full reconstruction orchestration (sweep scheduling, catch-up,
+  `READY` promotion) is **Stages 3C–3D (planned)**.
 - **Independent Stage 2 example (implemented, explicit prerequisites).** This assumes a caller-supplied
   eligible source and all required authorization prerequisites: the requester is already durably bound and
   `SYNCING`, the source is `READY` or `DEGRADED`, and the cluster and epoch match. The two private bootstrap
@@ -222,7 +256,7 @@ sequenceDiagram
     Note over N: No automatic binding
   end
 
-  Note over N,M: Authorized join - Stage 3 planned
+  Note over N,M: Authorized join - Stage 3A, implemented
 
   Note over N,P: Independent Stage 2 example
   Note over N: Bound, SYNCING
@@ -304,13 +338,15 @@ testbed intentionally provides.
   admission fails closed. The provider is not yet cluster-verified.
 - No automatic genesis: a fresh replica with no binding cannot automatically initialize an empty epoch.
   *(5B Stages 1A and 1B already implement operator-controlled genesis authorization and finalization.
-  Stage 3 adds reconstruction orchestration and controlled READY promotion; 5C adds operator recovery.)*
+  Stages 3C–3D add reconstruction orchestration and controlled READY promotion; 5C adds operator recovery.)*
 - No automatic epoch reset: a `RECOVERY_REQUIRED` replica cannot automatically return to `READY`; operator
   intervention is required. *(5C adds the explicit operator recovery procedure.)*
 - No snapshot transfer orchestration: the initial data baseline (the path from `SYNCING` to `READY`) is not yet
   implemented as a scheduled sweep; `SetReady` is provided for test purposes. The transport-and-commit mechanism
-  (`FetchBootstrapBaseline`) is implemented, committed, and locally tested in 5B Stage 2. *(5B Stage 3 adds
-  source discovery, sweep scheduling, and automatic `READY` promotion.)*
+  (`FetchBootstrapBaseline`) is implemented, committed, and locally tested in 5B Stage 2; authorized joining
+  (Stage 3A) and deterministic bootstrap-source discovery and selection (Stage 3B) are also implemented and
+  locally tested. *(Stages 3C–3D add sweep scheduling, bounded retries, initial catch-up, and
+  synchronization-completion `READY` promotion.)*
 - 5A alone does **not** make GossipGrid safe for catastrophic cluster recovery. It provides the fencing and
   admission framework; the full recovery protocol requires the 5B metadata provider (wired into the running
   application), snapshot transfer orchestration, and the 5C operator recovery procedures.

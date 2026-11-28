@@ -17,8 +17,8 @@ flowchart TB
     FETCH --> INSTALL --> SYNC
   end
 
-  SURV -. "Stage 3 orchestration planned" .-> BOOT
-  BOOT -.-> READY(["Controlled READY promotion - planned"])
+  SURV -. "Stages 3C–3D orchestration planned" .-> BOOT
+  BOOT -.-> READY(["Controlled READY promotion - Stage 3D, planned"])
   UNKNOWN --> WAIT("No loss conclusion")
   LOST -.-> RECOVERY("Operator recovery - M5C planned")
 

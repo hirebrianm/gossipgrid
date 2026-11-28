@@ -17,8 +17,14 @@ Stage 3A (durable binding provenance, `AuthorizeJoin` with final authorization g
 trusted source-observation boundary, context-aware binding, and seed-restart privilege
 isolation) is implemented and locally tested
 (see [Stage 3A — authorized joining and durable binding foundation](#stage-3a--authorized-joining-and-durable-binding-foundation));
-Stage 3B–3D (source discovery/selection, sweep scheduling, synchronization-completion
-`READY` promotion) are designed but not implemented.
+Stage 3B (deterministic bootstrap-source discovery and selection: the `BootstrapSourceSelector`
+that selects an eligible, authenticated bootstrap-source candidate from the current discovery
+membership, reusing the existing discovery manager and the production
+`peertls.BootstrapSourceObserver`, with bounded execution and typed selection outcomes) is
+implemented and locally tested
+(see [Stage 3B — deterministic bootstrap-source discovery and selection](#stage-3b--deterministic-bootstrap-source-discovery-and-selection));
+Stages 3C–3D (sweep scheduling, synchronization-completion `READY` promotion) are designed
+but not implemented.
 
 This document supersedes the `Milestone 5B` and `Milestone 5C` sections of
 [architecture.md](architecture.md) where the two disagree. For a learning-oriented walkthrough of
@@ -469,16 +475,19 @@ A metadata problem is classified by **evidence**, not by the mere fact that a re
 | A peer is temporarily unavailable, or the Kubernetes API is briefly unreachable | **Transient metadata unavailability** | Authority becomes `invalid`; admission fails closed (503). The replica does **not** enter `RECOVERY_REQUIRED` and does **not** record a data-loss incident. The metadata worker retries on the next interval; when the read succeeds again, authority returns to `fresh` and the replica resumes. **No operator action, no reset.** |
 | No eligible `READY`/`DEGRADED` synchronization source is currently reachable (peers down, or DNS stale) | **Transient absence of eligible sources** | The replica stays in `SYNCING` or `DISCOVERING` (or `DEGRADED` if it was `READY`). It waits; anti-entropy retries. **Not** a data-loss event. If a source later appears, it syncs. |
 | The authoritative ConfigMap is **corrupted** (malformed JSON, wrong types, or an unsupported `schemaVersion`) | **Corrupted authoritative metadata** | The provider returns a distinct error (`ErrMetadataMalformed` / `ErrMetadataUnsupportedVersion`). The controller marks authority `invalid` and fails closed. This is a **configuration/administrative incident**, not a data-loss incident. The operator repairs the ConfigMap; the replica recovers when the read succeeds. **No automatic reset.** |
-| The local durable binding **does not match** the authoritative metadata (different `ClusterID` or `EpochID`) | **Proven epoch or binding mismatch** | This is the **only** condition that transitions to `RECOVERY_REQUIRED` (a lockout, not a data-loss event). The local database is **preserved**; the binding row is intact. The replica stays `RECOVERY_REQUIRED` until an operator recovery procedure (5C) or a matching epoch is restored. **The epoch is never silently reset.** |
+| The local durable binding **does not match** the authoritative metadata (different `ClusterID` or `EpochID`) | **Proven epoch or binding mismatch** | A condition that transitions to `RECOVERY_REQUIRED` (a lockout, not a data-loss event). The local database is **preserved**; the binding row is intact. The replica stays `RECOVERY_REQUIRED` until an operator recovery procedure (5C) or a matching epoch is restored. **The epoch is never silently reset.** |
+| A designated seed's outstanding genesis authorization is **revoked** (fresh, same-epoch record with `Initialized=false`, `GenesisAuthorized=false`, `GenesisConsumer=""`, `DataLossProtected=false`) | **Genesis authorization revocation** | A condition that transitions to `RECOVERY_REQUIRED` (a lockout, not a data-loss event). The operator revoked the one-time authorization before the seed bound. The local database is **preserved**; the binding row is intact. The seed stays `RECOVERY_REQUIRED` until the operator restores a valid authorization or resets the epoch. **The epoch is never silently reset.** |
 | Every expected identity **conclusively** reports that all eligible data sources are gone, **and** the control-plane metadata permits a reset | **Confirmed catastrophic loss** | Handled by **5C** (operator-authorized reset), not by 5B. A 5B replica **never** attempts an automatic reset; it fails closed and waits for 5C. |
 
 ### Reconciling the architecture claim with the actual controller
 
 - **The controller does not silently reset an epoch.** `reevaluateState` transitions to
-  `RECOVERY_REQUIRED` **only** on a binding/metadata mismatch, and it transitions **back** to
-  `DISCOVERING` when a matching epoch is restored (the "metadata restored with matching
-  epoch; re-evaluation" path). There is no code path that overwrites the binding or invents a
-  new epoch.
+  `RECOVERY_REQUIRED` on a binding/metadata mismatch (different `ClusterID` or `EpochID`)
+  or on a confirmed genesis-authorization revocation (a fresh, same-epoch record with
+  `GenesisAuthorized=false` on an unbound or un-finalized seed), and it transitions **back**
+  to `DISCOVERING` when a matching epoch is restored (the "metadata restored with matching
+  epoch; re-evaluation" path). There is no code path that overwrites the binding or invents
+  a new epoch.
 - **A transient API outage is not `RECOVERY_REQUIRED`.** `handleMetadataError` sets
   `authorityState=invalid` (admission fails closed) but does not call `SetRecoveryRequired`.
   The architecture's phrasing "stays in DISCOVERING or transitions to RECOVERY_REQUIRED" is
@@ -583,9 +592,16 @@ public writes are closed.
 
 The recovery policy is **fail-closed**: a replica with an empty `emptyDir` and
 `dataLossProtected=true` (or `GenesisAuthorized=false`) **never** re-enters `GENESIS`
-automatically. It must join an existing epoch (if a bound, `READY` peer exists) or go to
-`RECOVERY_REQUIRED` (if no eligible source exists). Only an operator reset (5C) on a
-**confirmed** catastrophic loss, with an explicit operator action, can re-arm the cluster.
+automatically. It must join an existing epoch (if a bound, `READY` peer exists). The
+deterministic bootstrap-source selection (Stage 3B) provides the mechanism by which the
+replica discovers and selects an eligible source from the current discovery membership;
+a no-source result (an unavailable, unready, stale, mismatched, or unreachable peer) does
+**not** by itself transition the replica to `RECOVERY_REQUIRED` — it leaves the replica in
+its current state (`DISCOVERING` or `SYNCING`) and waits for membership or authority to
+recover. `RECOVERY_REQUIRED` is driven by the controller's own authorization evaluation
+(a conflicting durable binding or an epoch mismatch), not by the absence of an eligible
+source. Only an operator reset (5C) on a **confirmed** catastrophic loss, with an explicit
+operator action, can re-arm the cluster.
 
 ### Trust implications
 
@@ -1294,5 +1310,142 @@ through the migration).
   verifies ACTUAL READY restoration through production reconciliation (reading
   provenance alone is insufficient; the binding must be valid, the finalization
   invariant must hold, and the state must permit promotion).
+
+All tests are deterministic and run under `go test` and `go test -race` as part of `make qa`.
+
+## Stage 3B — deterministic bootstrap-source discovery and selection
+
+**Status:** Implemented and locally tested. The stage is uncommitted at the time of writing
+(pending operator review). It is **not** cluster-verified.
+
+### What Stage 3B implements
+
+Stage 3B provides the **deterministic, authenticated mechanism that selects an eligible
+bootstrap-source candidate from the current discovery membership**. It is the production
+mechanism by which an unbound replica preparing to call `AuthorizeJoin` (the pre-join
+case), a replica with an incomplete, matching join binding resuming joining, and an
+authorized `SYNCING` replica seeking a bootstrap source, obtain a candidate to observe.
+
+The `BootstrapSourceSelector` (`internal/lifecycle/bootstrap_source_selector.go`):
+
+- **Reuses the existing discovery manager** — it does NOT create a new DNS resolver,
+  membership manager, or refresh loop. It reads the discovery snapshot through a narrow,
+  read-only adapter (`DiscoverySnapshotFunc` → `DiscoverySnapshotView`), mirroring the
+  existing `antientropy.PeerSourceSnapshot` pattern to avoid an import cycle. A nil
+  discovery manager produces an empty, usable view (the selector's own validation decides
+  the outcome) rather than panicking.
+- **Builds the candidate list from one coherent, immutable snapshot** — it rejects stale
+  DNS membership, preserves static mode, treats discovery-disabled as waiting/unavailable,
+  filters to valid expected replica identities, excludes the local replica, excludes
+  unexpected ordinals, validates and normalizes dial addresses (DNS-name normalization:
+  lowercase, trailing dot stripped; IPv6 bracket preservation; port range 1–65535;
+  whitespace rejection), derives the expected certificate DNS identity via the configured
+  suffix, and deduplicates equivalent identity/address pairs using the normalized address.
+  The same normalization is used for both construction and membership revalidation.
+- **Selects deterministically** — candidates are ordered by canonical replica identity
+  (lexicographic) with a normalized-address tie-breaker. They are observed sequentially; the
+  first candidate passing the complete authenticated source-observation contract is
+  selected. Both `READY` and `DEGRADED` sources are eligible (no `READY` preference). No
+  further observations are performed after a valid selection.
+- **Reuses the production observer** — it uses `lifecycle.BootstrapSourceObserver` /
+  `peertls.NewBootstrapSourceObserver` (no second transport). A nominally successful
+  observation returned after its individual deadline is rejected (a late result is not
+  eligible); the next candidate is attempted when the budgets permit.
+- **Pins the authoritative target from the controller** — the target (cluster/epoch) is
+  never derived from a peer response. The authorization target is read from a coherent
+  `AuthorizationSnapshot`; for pre-join selection, a 3-way binding distinction is applied
+  (absent vs. present vs. read-failed): a binding-read error is a distinct, fail-closed
+  condition that is NOT conflated with an absent binding. The binding-read error is
+  captured in the `AuthorizationSnapshot` during the existing read-through inside
+  `Controller.authorization()` under the established lock order (the `BindingReadError`
+  field), so no supplementary, incoherent second read is performed. After the network
+  observation, the membership is revalidated first, then the ORIGINAL pinned authorization
+  target is revalidated (a changed or unavailable authorization is a terminal
+  `OutcomeAuthorizationChanged`; a membership change is a terminal
+  `OutcomeMembershipChanged`; a binding-read error during final revalidation is a local
+  authorization failure and returns `OutcomeAuthorizationUnavailable`). The caller context
+  and selector-owned deadline are checked immediately after revalidation returns and
+  before classifying its result (cancellation and budget expiration take precedence over
+  membership-changed and authorization-changed outcomes). A final recheck verifies the
+  caller context, selector-owned deadline, and the observation's bounded lifetime as close
+  as practical to the successful return.
+- **Runs with bounded execution** — a finite, positive `SelectionBudget` is applied as a
+  derived context deadline; a bounded `ObservationBudget` is applied per candidate. The
+  caller context is checked before and after every observation and before every terminal
+  return; the selector-owned deadline is checked after the caller context (a simultaneous
+  caller cancellation is reported as `OutcomeCancelled`, not `OutcomeBudgetExhausted`).
+  There is no backoff, no worker pool, no parallel fanout. The selection is context-aware
+  and leaks no goroutines.
+- **Reuses the shared observation validator** — the selector's observation validation
+  delegates to the shared `validateSourceObservation` function (the same strict,
+  fail-closed contract used by the controller's join path), then applies the
+  selector-specific PodID agreement check. The shared validator checks: observation
+  validity (bounded lifetime, not future-dated), eligible lifecycle state,
+  `BootstrapSourceEligible` and readiness, cluster/epoch agreement, peer identity
+  non-empty, local self-exclusion, pinned target agreement, and authenticated peer
+  identity agreement.
+- **Returns structured, typed outcomes** — `OutcomeSelected`, `OutcomeNoEligibleSource`,
+  `OutcomeDiscoveryUnavailable`, `OutcomeDiscoveryStale`, `OutcomeNoInitialRefresh`,
+  `OutcomeNoCandidates`, `OutcomeAuthorizationUnavailable`, `OutcomeAuthorizationChanged`,
+  `OutcomeMembershipChanged`, `OutcomeBudgetExhausted`, and `OutcomeCancelled`. A no-source
+  result does NOT transition the replica to `RECOVERY_REQUIRED`, trigger genesis, modify
+  the binding/lifecycle/metadata, or promote the replica.
+- **Preserves Stage 3A / Stage 2 authorization** — selection is advisory only; it does not
+  perform the joining operation, create a binding, transfer messages, or promote the
+  replica. The selected candidate must pass the complete `AuthorizeJoin` authorization
+  sequence (or the Stage 2 bootstrap-fetch authorization for a `SYNCING` replica) before
+  any operation is performed.
+
+### A no-source result is not `RECOVERY_REQUIRED`
+
+A no-source outcome (an unavailable, unready, stale, mismatched, or unreachable peer) is
+**not** evidence that the peer's retained records are permanently lost. The local
+lifecycle state remains governed by the existing controller: a `DISCOVERING` or `SYNCING`
+replica with no eligible source stays in its current state and waits for membership or
+authority to recover. `RECOVERY_REQUIRED` is driven by the controller's own authorization
+evaluation (a conflicting durable binding, a proven epoch mismatch, or a confirmed
+genesis-authorization revocation), not by the absence of an eligible source. The
+selector's no-source result is a typed, structured outcome that the
+future Stage 3C orchestration layer can act on without parsing error-string strings.
+
+### Stage 3B tests
+
+- `internal/lifecycle/bootstrap_source_selector_test.go`: ~40 unit tests for candidate
+  construction and determinism (fresh DNS, static, stale, no-initial-refresh, disabled,
+  empty, unexpected, invalid, local exclusion, duplicates, stable ordering,
+  normalization), eligibility and fallback (first eligible, first unavailable/second
+  eligible, ineligible state, mismatched epoch, READY/DEGRADED, all rejected, expired
+  observation), authorization and membership changes (authority invalidated during
+  observation, epoch change, controller stopped, caller cancelled, local state change,
+  DNS stale, candidate removed, membership changed after observation, binding-read
+  error), bounded execution (observation timeout, budget exhaustion,
+  candidate-attempt budget, caller deadline shorter than budget, cancellation
+  before/during observation, internal deadline exhaustion), and that selection alone
+  does not create a binding or alter lifecycle state. Includes focused
+  trusted-observer result validation tests (epoch mismatch, target mismatch, identity
+  mismatch, PodID mismatch, future timestamp, readiness inconsistency, valid
+  observation) for the shared `validateSourceObservation` function.
+- `internal/peertls/selector_integration_test.go`:
+  `TestSelectorIntegration_RealMTLS` — a real-mTLS integration test using a real
+  SQLite-backed binding store (`store.New`): an unbound requester in `DISCOVERING`
+  with fresh, finalized metadata receives a discovery snapshot containing an
+  ineligible candidate (`gossipgrid-0`, `DEGRADED`, not eligible) and an eligible
+  candidate (`gossipgrid-2`, `READY`, eligible); the selector rejects the first
+  candidate for ineligibility (not a certificate-identity mismatch) through the
+  production observer (a real mTLS handshake); the selection alone leaves the replica
+  unbound and in `DISCOVERING` (the real store reports no binding); `AuthorizeJoin`
+  then succeeds via the normal observation path and the requester reaches `SYNCING`
+  (with ordinary replication and public writes denied, bootstrap fetch permitted,
+  premature `SetReady` denied, and a durable join binding in the real store); the
+  selector can then select a bootstrap source for that `SYNCING` requester; and a
+  fully-unsuccessful selection (all candidates ineligible) leaves the durable
+  binding and `SYNCING` state unchanged.
+  `TestSelectorIntegration_UnsuccessfulUnbound` — a fully-unsuccessful selection
+  (all candidates ineligible) for a new, unbound replica leaves it unbound and in
+  `DISCOVERING`.
+  `TestSelectorIntegration_IdentityMismatch` — a real TLS handshake with a
+  certificate-identity mismatch (the peer presents a certificate for a different
+  identity than expected) is a distinct negative case from an
+  ineligible-but-authenticated peer.
 
 All tests are deterministic and run under `go test` and `go test -race` as part of `make qa`.

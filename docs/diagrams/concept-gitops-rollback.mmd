@@ -6,7 +6,7 @@ flowchart TB
   DATA -->|Surviving source| SURV(["Retained records survive"])
   DATA -->|Unknown| UNKNOWN("Investigate availability")
   DATA -->|"Confirmed loss (verified)"| LOST(["Complete authoritative loss"])
-  SURV -.->|Stage 3, planned| REBUILD("Reconstruction (Stage 3, planned)")
+  SURV -.->|Stages 3C–3D, planned| REBUILD("Reconstruction (Stages 3C–3D, planned)")
   UNKNOWN --> WAIT("No loss conclusion")
   LOST -.->|M5C, planned| RECOVERY("Operator recovery (M5C, planned)")
 

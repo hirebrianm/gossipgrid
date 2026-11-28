@@ -1729,6 +1729,17 @@ type AuthorizationSnapshot struct {
 	Stale bool
 	// Binding is the durable local database binding, or nil when none exists.
 	Binding *DatabaseBinding
+	// BindingReadError is non-nil when the read-through in the authorization
+	// snapshot failed to read the durable binding from the store (the cache
+	// was nil and the direct store read returned an error). When non-nil,
+	// Binding is nil but the absence is NOT confirmed: the store read failed.
+	// This field is the coherent 3-way distinction:
+	//   - Binding != nil: a valid binding was observed.
+	//   - Binding == nil, BindingReadError == nil: an absent binding was
+	//     successfully observed (the database is genuinely unbound).
+	//   - Binding == nil, BindingReadError != nil: the binding observation
+	//     failed (a fail-closed condition, NOT an absent binding).
+	BindingReadError error
 	// Stopped reports whether the controller has been stopped. A stopped
 	// controller must not authorize any operation.
 	Stopped bool
@@ -2049,12 +2060,17 @@ func (c *Controller) authorization() AuthorizationSnapshot {
 	// the store here keeps the authorization snapshot faithful to the durable
 	// binding. We do NOT mutate the cache under a read lock (that would be a
 	// data race); the cache is updated only by the write-lock evaluation path.
+	// The binding-read error is captured in the snapshot (BindingReadError)
+	// so callers can distinguish "absent binding" from "failed store read"
+	// without a supplementary, incoherent second read.
+	var bindingReadErr error
 	if binding == nil && c.binding != nil {
 		b, err := c.binding.GetBinding()
 		if err != nil {
 			c.logger.Warn("reading local database binding failed",
 				slog.Any("error", err),
 			)
+			bindingReadErr = err
 		} else {
 			binding = b
 		}
@@ -2072,16 +2088,17 @@ func (c *Controller) authorization() AuthorizationSnapshot {
 	}
 
 	return AuthorizationSnapshot{
-		State:          state,
-		Reason:         reason,
-		Metadata:       metaCopy,
-		AuthorityState: authorityState,
-		FreshAt:        freshAt,
-		Stale:          stale,
-		Binding:        bindingCopy,
-		Stopped:        stopped,
-		Generation:     generation,
-		SeedIdentity:   c.cfg.SeedIdentity,
+		State:            state,
+		Reason:           reason,
+		Metadata:         metaCopy,
+		AuthorityState:   authorityState,
+		FreshAt:          freshAt,
+		Stale:            stale,
+		Binding:          bindingCopy,
+		BindingReadError: bindingReadErr,
+		Stopped:          stopped,
+		Generation:       generation,
+		SeedIdentity:     c.cfg.SeedIdentity,
 	}
 }
 

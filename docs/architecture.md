@@ -51,14 +51,18 @@ convergence, recovery after pod replacement, live password rotation, fault toler
 Kubernetes metadata provider), 1A (Kubernetes genesis grant), and 1B (operator-authorized genesis finalization)
 are implemented and locally tested; Stage 2 (bootstrap replication admission, bounded insert, pinned-epoch
 transport validation) is implemented, committed (`209cec1`), and locally tested (not yet cluster-verified);
-Stage 3 (orchestration, automatic `READY` promotion) is designed but not implemented. Milestones 5C, 6B, 7B,
+Stage 3A (authorized joining, durable binding provenance, authenticated source eligibility — committed
+`e4d09f6`) and Stage 3B (deterministic bootstrap-source discovery and selection — uncommitted pending operator
+review) are implemented and locally tested (not yet cluster-verified); Stages 3C (sweep scheduling, bounded
+retries, initial catch-up), 3D (synchronization-completion `READY` promotion), and 3E (end-to-end Kubernetes
+reconstruction verification) are designed but not implemented. Milestones 5C, 6B, 7B,
 and 9 are **designed but not implemented**. Milestone 8 is **partially implemented**: immutable image
 publishing and Argo CD digest-pinned reconciliation work, but automated delivery and promotion are not complete.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | 5A | Lifecycle state machine, epoch fencing, fail-closed admission, durable binding | ✅ Implemented and locally tested |
-| 5B | Kubernetes metadata authority, bootstrap replication admission (Stage 2), initial snapshot transfer, operator-controlled one-time genesis, snapshot-source eligibility (Stage 3) | 🔜 Stages 0, 1A, 1B, and 2 implemented, committed, and locally tested; Stage 3 (orchestration) designed but not implemented |
+| 5B | Kubernetes metadata authority, bootstrap replication admission (Stage 2), authorized joining (Stage 3A), deterministic source selection (Stage 3B), initial snapshot transfer orchestration (Stages 3C–3D), end-to-end Kubernetes verification (Stage 3E), operator-controlled one-time genesis | 🔜 Stages 0, 1A, 1B, 2, 3A, and 3B implemented and locally tested; Stages 3C, 3D, and 3E designed but not implemented |
 | 5C | Operator recovery/reset authorization, catastrophic data-loss handling, epoch transitions, incident audit | 🔜 Designed but not implemented |
 | 6 | Web UI, single-administrator password authentication, credential reload (local; in-cluster Vault → VSO → mounted Secret is M7A) | ✅ Implemented and locally tested; in-cluster delivery deployed and verified in M7A |
 | 6B | Cluster visualization: authenticated diagnostics, interactive SVG topology, native telemetry, replication/lifecycle visualization (4 feature stages) | 🔜 Designed; no implementation started. See [cluster-visualization.md](cluster-visualization.md) |
@@ -147,8 +151,11 @@ publishing and Argo CD digest-pinned reconciliation work, but automated delivery
   `FetchBootstrapBaseline` (the transport-and-commit mechanism for a joining `SYNCING` replica). The
   mechanism is wired into the production code path (`cmd/gossipgrid/main.go`) but is **only active** when
   lifecycle protection is enabled (`GOSSIPGRID_LIFECYCLE_ENABLED=true`); the default Helm build has
-  lifecycle disabled, so the bootstrap admission is a passthrough (legacy behavior preserved). Stage 3
-  (source discovery/selection, sweep scheduling, automatic `READY` promotion) is **not yet implemented**.
+  lifecycle disabled, so the bootstrap admission is a passthrough (legacy behavior preserved). Stage 3A
+  (authorized joining, durable binding provenance, authenticated source eligibility) and Stage 3B
+  (deterministic bootstrap-source discovery and selection) are implemented and locally tested; Stages 3C–3D
+  (sweep scheduling, bounded retries, initial catch-up, synchronization-completion `READY` promotion) are
+  **not yet implemented**.
   See [gossip-and-bootstrap.md](gossip-and-bootstrap.md#milestone-5b-stage-2--bootstrap-replication-admission-implemented-2026-11-24)
   for the full admission contract.
 

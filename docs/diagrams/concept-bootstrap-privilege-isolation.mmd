@@ -17,12 +17,12 @@ flowchart TB
   end
 
   P3("Self-promotion to READY: not authorized by Stage 2")
-  P4("Controlled READY promotion via Stage 3 orchestration (planned)")
+  P4("Controlled READY promotion via Stage 3D orchestration (planned)")
 
   S --> MAY
   S --> MAYNOT
   S -. "not authorized by Stage 2" .-> P3
-  P3 -. "planned (Stage 3)" .-> P4
+  P3 -. "planned (Stage 3D)" .-> P4
 
   class S state
   class M1,M2 may

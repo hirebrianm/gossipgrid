@@ -29,12 +29,25 @@ type fakeBindingStoreWithMessages struct {
 	binding      *DatabaseBinding
 	messageCount int64
 	bindErr      error
+	getErr       error
 }
 
 func (s *fakeBindingStoreWithMessages) GetBinding() (*DatabaseBinding, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
 	return s.binding, nil
+}
+
+// SetGetErr sets a custom error to be returned by GetBinding (for testing
+// the 3-way binding distinction: a failed store read is not an absent
+// binding).
+func (s *fakeBindingStoreWithMessages) SetGetErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.getErr = err
 }
 
 func (s *fakeBindingStoreWithMessages) Bind(_ context.Context, clusterID, epochID string, generation int, provenance BindingProvenance) (*DatabaseBinding, error) {

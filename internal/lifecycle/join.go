@@ -576,8 +576,10 @@ func (c *Controller) revalidateJoinPreBind(ctx context.Context, obs SourceObserv
 
 // validateSourceObservationResult applies the strict, fail-closed validation
 // to an authenticated observation outside the final guard's lock pair (used
-// in the pre-binding revalidation before the durable Bind). It is the
-// unlocked counterpart of validateSourceObservationResultLocked.
+// in the pre-binding revalidation before the durable Bind). It delegates to
+// the shared validateSourceObservation function (bootstrap_source_selector.go),
+// which is the single consistent observation contract used by both the
+// controller's join path and the bootstrap-source selector.
 //
 // target is the pinned join target (the expected cluster/epoch) and
 // expectedIdentity is the authenticated peer identity the observation was
@@ -586,46 +588,7 @@ func (c *Controller) revalidateJoinPreBind(ctx context.Context, obs SourceObserv
 // target check; see the SourceObservationResult.Valid future-timestamp and
 // bounded-lifetime checks for the temporal policy).
 func (c *Controller) validateSourceObservationResult(r SourceObservationResult, meta *ClusterMetadata, target RequestContext, expectedIdentity string) error {
-	if meta == nil {
-		return errors.New("source observation: no target metadata to validate against")
-	}
-	if !r.Valid(c.now()) {
-		return fmt.Errorf("source observation is not valid or is outside its bounded lifetime (peer=%s)", r.peerIdentity)
-	}
-	if r.lifecycleState != "READY" && r.lifecycleState != "DEGRADED" {
-		return fmt.Errorf("source observation: peer %q reported state %q (must be READY or DEGRADED to be an eligible bootstrap source)", r.peerNodeID, r.lifecycleState)
-	}
-	if !r.bootstrapSourceEligible {
-		return fmt.Errorf("source observation: peer %q does not report bootstrap source eligibility", r.peerNodeID)
-	}
-	if !r.readiness {
-		return fmt.Errorf("source observation: peer %q reported readiness=false (inconsistent with an eligible READY/DEGRADED source)", r.peerNodeID)
-	}
-	if r.clusterID != meta.ClusterID || r.epochID != meta.EpochID {
-		return fmt.Errorf("source observation: peer %q reported cluster/epoch %s/%s does not match the current metadata %s/%s", r.peerNodeID, r.clusterID, r.epochID, meta.ClusterID, meta.EpochID)
-	}
-	if r.peerIdentity == "" || r.peerNodeID == "" {
-		return errors.New("source observation: peer identity is missing (authenticated identity or self-reported node ID is empty)")
-	}
-	if c.cfg.NodeID != "" && r.peerNodeID == c.cfg.NodeID {
-		return fmt.Errorf("source observation: the observed peer %q is the local replica; self-observation is not a bootstrap source", r.peerNodeID)
-	}
-	// The observation's pinned target must match the requested target
-	// (cluster/epoch), and its authenticated peer identity must match the
-	// expected identity the observation was requested for. The
-	// production observer records these from the request, but the
-	// controller revalidates them here so a trusted-boundary result that
-	// carries a mismatched target or identity is rejected (a single
-	// consistent controller-side check; the temporal policy — future
-	// timestamps, invalid/expired lifetimes, the maximum lifetime — is
-	// enforced in SourceObservationResult.Valid).
-	if r.expected.ClusterID != target.ClusterID || r.expected.EpochID != target.EpochID {
-		return fmt.Errorf("source observation: pinned target %s/%s does not match the requested target %s/%s", r.expected.ClusterID, r.expected.EpochID, target.ClusterID, target.EpochID)
-	}
-	if r.peerIdentity != expectedIdentity {
-		return fmt.Errorf("source observation: authenticated peer identity %q does not match the expected identity %q", r.peerIdentity, expectedIdentity)
-	}
-	return nil
+	return validateSourceObservation(c, r, meta, target, expectedIdentity)
 }
 
 // joinTransitionReason builds the transition reason for the join path.

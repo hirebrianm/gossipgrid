@@ -3,8 +3,11 @@
 **One-line summary:** Ephemeral state and recovery is the model for what happens when a pod's local
 SQLite (an emptyDir volume) is lost. Stage 2 (M5B, implemented) provides the authorized bootstrap
 inventory retrieval, bounded message retrieval, and guarded local installation while the requester
-remains SYNCING. Stage 3 (M5B, planned) supplies the reconstruction orchestration: source
-selection, scheduling, retry coordination, catch-up, and controlled READY promotion. Ordinary
+remains SYNCING. Stage 3A (M5B, implemented, committed `e4d09f6`) provides authorized joining,
+durable binding provenance, and authenticated source eligibility; Stage 3B (M5B, implemented,
+uncommitted) provides deterministic bootstrap-source discovery and selection. Stages 3C–3D (M5B,
+planned) supply the reconstruction orchestration: sweep scheduling, bounded retries, initial
+catch-up, and controlled READY promotion. Ordinary
 periodic anti-entropy is a separate replication path and is **not** authorized for a
 lifecycle-enabled SYNCING replica. Unknown, unreachable, ineligible, or unbound peers do **not**
 establish complete authoritative-data loss; confirmed complete loss requires independent evidence
@@ -25,8 +28,10 @@ emptyDir volume), a pod can lose its local state:
 The recovery problem: how does a replaced pod (with a fresh, empty emptyDir) reconstruct its
 retained state from surviving replicas? Stage 2 (implemented) provides the mechanism — an
 authorized bootstrap inventory retrieval, bounded message retrieval, and guarded local
-installation while the requester remains SYNCING. Stage 3 (planned) supplies the orchestration —
-source selection, scheduling, retry coordination, catch-up, and controlled READY promotion.
+installation while the requester remains SYNCING. Stage 3A (implemented) provides authorized joining
+and durable binding provenance; Stage 3B (implemented) provides deterministic bootstrap-source
+discovery and selection. Stages 3C–3D (planned) supply the orchestration — sweep scheduling, bounded
+retries, initial catch-up, and controlled READY promotion.
 Ordinary periodic anti-entropy is a **separate** replication path and is **not** authorized for a
 lifecycle-enabled SYNCING replica.
 
@@ -52,16 +57,18 @@ complete loss**:
   persistent storage provisioning), it matches the testbed purpose (a testbed for Kubernetes
   orchestration, service discovery, and fault tolerance; not a production message service), and it
   forces the system to rely on peer-to-peer replication (not local persistence) for recovery.
-- **Reconstruction from surviving replicas (Stage 2 mechanism, Stage 3 orchestration).** Stage 2
+- **Reconstruction from surviving replicas (Stage 2 mechanism, Stages 3C–3D orchestration).** Stage 2
   (M5B, implemented) provides the authorized baseline retrieval and guarded installation
   mechanism: a SYNCING replica (the requester) sends a bootstrap fetch to an eligible source (a
   READY or DEGRADED replica in the same epoch, not revoked, not stopped); the source validates the
   requester's pinned context; the source serves a bounded batch of records from its local store;
   the requester validates the response envelope; the requester commits the records in a single
   SQLite transaction. The requester **remains SYNCING** — it does not self-promote to READY. The
-  transition to READY is orchestrated by the lifecycle controller (Stage 3, planned). Stage 3
-  (planned) supplies the reconstruction orchestration: source selection, scheduling, retry
-  coordination, catch-up, and controlled READY promotion. Ordinary periodic anti-entropy is a
+  transition to READY is orchestrated by the lifecycle controller (Stages 3C–3D, planned).
+  Stage 3A (implemented) provides authorized joining and durable binding provenance; Stage 3B
+  (implemented) provides deterministic bootstrap-source discovery and selection. Stages 3C–3D
+  (planned) supply the orchestration: sweep scheduling, bounded retries, initial catch-up, and
+  controlled READY promotion. Ordinary periodic anti-entropy is a
   **separate** replication path and is **not** authorized for a lifecycle-enabled SYNCING
   replica. See the admission vs. orchestration distinction in §4.
 - **Confirmed complete loss requires operator recovery (M5C, planned).** Confirmed complete
@@ -72,7 +79,7 @@ complete loss**:
   yet defined; it is deliberately operator-controlled rather than automated.
 - **Distinguish three cases of source unavailability — do not equate them with confirmed total
   loss.** (1) A **temporarily unreachable or ineligible source** (the eligible source is
-  partitioned, stopped, or momentarily unready) is a transient condition: the Stage 3
+  partitioned, stopped, or momentarily unready) is a transient condition: the Stages 3C–3D
   orchestration (planned) would retry on a later cycle and drive the Stage 2 mechanism once the
   source is reachable again. A currently unreachable or ineligible peer does **not** establish
   complete authoritative-data loss. (2) **Unknown authoritative-data availability** (the new pod
@@ -84,10 +91,12 @@ complete loss**:
   loss.
 - **The complete new-pod reconstruction workflow is not yet fully implemented.** Stage 2
   (M5B) provides the baseline retrieval and installation *mechanism* (the bootstrap fetch +
-  guarded single-transaction install). Stage 3 (M5B, planned) supplies the *orchestration*
-  (discovery, source selection, sweep scheduling, initial catch-up) and the READY promotion. M5C
-  (operator recovery) remains planned. The mechanism exists; the full orchestration-to-READY
-  workflow does not.
+  guarded single-transaction install). Stage 3A (M5B, implemented) provides authorized joining
+  and durable binding provenance; Stage 3B (M5B, implemented) provides deterministic
+  bootstrap-source discovery and selection. Stages 3C–3D (M5B, planned) supply the *orchestration*
+  (sweep scheduling, bounded retries, initial catch-up) and the controlled READY promotion. M5C
+  (operator recovery) remains planned. The mechanism and source selection exist; the full
+  orchestration-to-READY workflow does not.
 - **A GitOps rollback restores configuration, not data.** A rollback to an old Kubernetes
   workload revision (an Argo or Helm rollback) restores the workload configuration (the Helm chart
   values, the Argo application spec). If the rollback replaces a pod, that pod gets a fresh,
@@ -103,9 +112,14 @@ must rely on peer-to-peer replication (not local persistence) for recovery. The 
 that:
 
 - A replaced pod can reconstruct its retained state from surviving replicas (the bootstrap
-  admission (M5B Stage 2, implemented) enables the baseline fetch and guarded installation; Stage
-  3, planned, supplies the orchestration — source selection, scheduling, retry coordination,
-  catch-up, and controlled READY promotion).
+  admission (M5B Stage 2, implemented) enables the baseline fetch and guarded installation;
+  Stage 3A (M5B, implemented, committed `e4d09f6`) provides authorized joining and durable
+  binding provenance; Stage 3B (M5B, implemented) provides deterministic bootstrap-source
+  discovery and selection — the selector chooses an eligible, authenticated source from the
+  current discovery membership, rejecting a stale discovery snapshot outright; a fresh snapshot
+  can still contain an address that becomes unreachable; the selection itself is advisory and
+  changes no lifecycle state. Stages 3C–3D (M5B, planned) supply the remaining orchestration —
+  automatic retry coordination, scheduling, initial catch-up, and controlled READY promotion).
 - A confirmed complete authoritative-data loss is handled by operator recovery (M5C, planned).
   The procedure is not yet defined; it is deliberately operator-controlled.
 - A GitOps rollback is independent of the SQLite contents: a rollback restores the workload
@@ -136,7 +150,7 @@ Key implemented behavior (verify against the code, not this summary):
   records, and install them through a guarded local commit. It does not permit ordinary inbound
   or outbound replication, periodic anti-entropy sweeps, public writes, authoritative source
   privileges, or self-promotion to READY. The orchestration of the full initial catch-up and the
-  transition from SYNCING to READY is Stage 3 (planned, not implemented). Distinguish this from
+  transition from SYNCING to READY is Stages 3C–3D (planned, not implemented). Distinguish this from
   the lifecycle-disabled initial sync (M4C), which is a separate mechanism that gates readiness
   on a completed anti-entropy pass without any lifecycle state.
 
@@ -149,7 +163,7 @@ Key implemented behavior (verify against the code, not this summary):
   lifecycle-enabled SYNCING replica**: the bootstrap admission (Stage 2) is the narrow mechanism
   that permits a SYNCING requester to fetch and install a baseline; the discovery, scheduling,
   retry coordination, catch-up, and `READY` promotion that make that a complete reconstruction
-  *workflow* are Stage 3 (planned). The bootstrap admission (Stage 2) does **not** authorize
+  *workflow* are Stages 3C–3D (planned). The bootstrap admission (Stage 2) does **not** authorize
   ordinary periodic anti-entropy sweeps.
 
 - **The lifecycle state machine (M5A, implemented): the state transitions.** The lifecycle state
@@ -164,9 +178,12 @@ Key implemented behavior (verify against the code, not this summary):
   binding: a replica whose binding does not match the authoritative metadata, or whose genesis
   authorization has been revoked, transitions to the fail-closed RECOVERY_REQUIRED lockout. The
   absence of a surviving bound peer is not itself a proven binding/metadata mismatch, so it does
-  not by itself necessarily move every replica to RECOVERY_REQUIRED. The source selection, the
-  baseline reconstruction, and the transition from SYNCING to READY are orchestrated by the
-  lifecycle controller (M5B Stage 3, planned) and are not yet implemented end to end.
+  not by itself necessarily move every replica to RECOVERY_REQUIRED. The deterministic source
+  selection is implemented (M5B Stage 3B; advisory — it selects an eligible, authenticated
+  source from the current discovery membership, rejects a stale discovery snapshot, and changes
+  no lifecycle state on its own). The baseline reconstruction and the transition from SYNCING
+  to READY are orchestrated by the lifecycle controller (M5B Stages 3C–3D, planned) and are not
+  yet implemented end to end.
 
 - **The operator recovery procedure (M5C, planned): the complete loss recovery.** Confirmed
   complete authoritative-data loss requires **independent evidence** that authoritative retained
@@ -188,7 +205,7 @@ Key implemented behavior (verify against the code, not this summary):
 
 The diagrams below illustrate the ephemeral state and recovery model: a replaced pod (losing its
 SQLite, obtaining a fresh, empty emptyDir) reconstructing from surviving replicas (the bootstrap
-admission (M5B Stage 2, implemented) and the Stage 3 orchestration (planned)), and a confirmed
+admission (M5B Stage 2, implemented) and the Stages 3C–3D orchestration (planned)), and a confirmed
 complete loss requiring operator recovery (M5C, planned).
 
 ### 5a. A replaced pod reconstructing from surviving replicas
@@ -216,8 +233,8 @@ flowchart TB
     FETCH --> INSTALL --> SYNC
   end
 
-  SURV -. "Stage 3 orchestration planned" .-> BOOT
-  BOOT -.-> READY(["Controlled READY promotion - planned"])
+  SURV -. "Stages 3C–3D orchestration planned" .-> BOOT
+  BOOT -.-> READY(["Controlled READY promotion - Stage 3D, planned"])
   UNKNOWN --> WAIT("No loss conclusion")
   LOST -.-> RECOVERY("Operator recovery - M5C planned")
 
@@ -241,10 +258,10 @@ retrieval, and its three outcomes must not be conflated.
 
 - **Eligible source survives** (a surviving bound peer in the same epoch is reachable and
   eligible): the retained records are available. The dashed edge to the "Bootstrap mechanism -
-  Stage 2" panel indicates that the **Stage 3 orchestration** (source selection, scheduling,
+  Stage 2" panel indicates that the **Stages 3C–3D orchestration** (sweep scheduling, catch-up,
   retry coordination) is what would drive the requester to use the Stage 2 mechanism; the
   Stage 2 mechanism itself (authorized baseline fetch + guarded installation) is **implemented**,
-  but the requester **remains SYNCING** — the controlled READY promotion is Stage 3 (planned).
+  but the requester **remains SYNCING** — the controlled READY promotion is Stage 3D (planned).
 - **Unknown** (the new pod has not yet established whether any surviving bound peer is
   reachable): this is a state of **not-yet-knowing**. It leads to **no loss conclusion** — a
   currently unreachable or ineligible peer does **not** establish complete authoritative-data
@@ -258,7 +275,7 @@ fetch (the requester, a SYNCING replica, sends a bootstrap fetch to an eligible 
 validates the requester's pinned context and serves a bounded batch of records) followed by a
 guarded installation (a single SQLite transaction). The requester **remains SYNCING** — it does
 not self-promote to READY. The dashed edge to "Controlled READY promotion - planned" indicates
-that the READY transition is orchestrated by the lifecycle controller (Stage 3, planned).
+that the READY transition is orchestrated by the lifecycle controller (Stages 3C–3D, planned).
 
 ### 5b. A GitOps rollback restores configuration, not data
 
@@ -274,7 +291,7 @@ flowchart TB
   DATA -->|Surviving source| SURV(["Retained records survive"])
   DATA -->|Unknown| UNKNOWN("Investigate availability")
   DATA -->|"Confirmed loss (verified)"| LOST(["Complete authoritative loss"])
-  SURV -.->|Stage 3, planned| REBUILD("Reconstruction (Stage 3, planned)")
+  SURV -.->|Stages 3C–3D, planned| REBUILD("Reconstruction (Stages 3C–3D, planned)")
   UNKNOWN --> WAIT("No loss conclusion")
   LOST -.->|M5C, planned| RECOVERY("Operator recovery (M5C, planned)")
 
@@ -297,7 +314,7 @@ not restored. The decision `Authoritative data availability?` splits the outcome
 cases that must not be conflated. A **surviving eligible source** (a pod not replaced by the
 rollback) retains its records under the same cluster/epoch, so the retained data **survives**; a
 replaced pod can reconstruct it via the Stage 2 bootstrap mechanism (implemented) driven by the
-Stage 3 orchestration (planned, shown as the dashed `Reconstruction` path). **Unknown**
+Stages 3C–3D orchestration (planned, shown as the dashed `Reconstruction` path). **Unknown**
 availability (the replaced pods' `emptyDir` is gone but it is not yet established whether any
 surviving bound peer exists) is a state of *not-yet-knowing*: it leads to **no loss conclusion**
 and to an availability investigation. Only an **independently confirmed** loss — independent
@@ -315,7 +332,7 @@ authoritative-data loss. A workload rollback and the M9 controlled rollback expe
 - A node failure (the emptyDir is lost). A node failure (a hardware failure, a software failure,
   a cloud provider failure) loses the emptyDir volume; the pod is rescheduled to a new node; the
   new pod starts with a fresh, empty emptyDir volume; the SQLite contents are lost. The recovery
-  path is the Stage 2 bootstrap mechanism (implemented) driven by the Stage 3 orchestration
+  path is the Stage 2 bootstrap mechanism (implemented) driven by the Stages 3C–3D orchestration
   (planned).
 - A rolling update (the emptyDir is lost). A rolling update (a Helm upgrade, an Argo sync)
   replaces the pods; the old pods' emptyDir volumes are lost; the new pods start with fresh,
@@ -335,7 +352,7 @@ authoritative-data loss. A workload rollback and the M9 controlled rollback expe
   discovery manager refreshes the DNS snapshot on a schedule, so a later cycle can present a fresh
   snapshot with a surviving bound peer; a successful bootstrap from that survivor is the
   mechanism Stage 2 provides. Automatic retry, source selection, and eventual bootstrap completion
-  are **not** current lifecycle-enabled behavior — they belong to the Stage 3 orchestration
+  are **not** current lifecycle-enabled behavior — they belong to the Stages 3C–3D orchestration
   (planned), which is what would schedule and coordinate the retry-and-converge loop.
 - A GitOps rollback without a snapshot backup. An Argo or Helm rollback to an old revision
   restores the workload configuration. If the rollback replaces a pod, that pod gets a fresh,
@@ -357,7 +374,7 @@ are satisfied):**
   SQLite transaction. This is a **narrow, explicit, mechanism-level** guarantee: it applies to a
   fetch that is actually sent to an eligible source; it does **not** by itself guarantee that a
   replaced pod will automatically locate a source, complete a bootstrap, or reach `READY` (that
-  orchestration is Stage 3, planned — see below).
+  orchestration is Stages 3C–3D, planned — see below).
 - The bootstrap admission is a narrow authorization: a `SYNCING` replica may fetch a bootstrap
   inventory, fetch the corresponding records, and install them through a guarded commit. It may
   not write to the public API, it may not send ordinary gossip, it may not accept ordinary
@@ -369,15 +386,15 @@ are satisfied):**
   in `STARTING`, transitions to `DISCOVERING`, and — depending on the authoritative metadata and
   the durable epoch binding — to `GENESIS`, `SYNCING`, or the fail-closed `RECOVERY_REQUIRED`).
   The `SYNCING` to `READY` transition is **not** currently automatic: it is orchestrated by the
-  lifecycle controller (M5B Stage 3, planned).
+  lifecycle controller (M5B Stages 3C–3D, planned).
 
 **Not guaranteed / limitations (by design):**
 
 - **Full lifecycle-enabled reconstruction to READY is planned, not currently executable end to
   end.** The complete workflow — a newly restarted lifecycle-enabled replica automatically
   discovers an eligible surviving bound peer, selects it as a bootstrap source, completes a
-  guarded baseline install, catches up, and is promoted to `READY` — is driven by the Stage 3
-  orchestration (M5B, planned) and is **not** implemented end to end. What **is** implemented is
+  guarded baseline install, catches up, and is promoted to `READY` — is driven by the Stages
+  3C–3D orchestration (M5B, planned) and is **not** implemented end to end. What **is** implemented is
   the Stage 2 *mechanism*: an authorized, guarded install when a bootstrap fetch is explicitly
   sent to an eligible source whose prerequisites are satisfied (see the guaranteed list above).
   Do not read the Stage 2 mechanism as a claim that a replaced pod will automatically
@@ -395,12 +412,12 @@ are satisfied):**
   authoritative retained records have been lost) requires operator recovery (M5C, planned). The
   procedure is not yet defined; it is deliberately operator-controlled. A pod emptyDir loss is
   not the same as the loss of all surviving authoritative data: if surviving replicas exist, the
-  Stage 2 bootstrap mechanism (driven by the Stage 3 orchestration) can reconstruct the retained
+  Stage 2 bootstrap mechanism (driven by the Stages 3C–3D orchestration) can reconstruct the retained
   state.
 - A GitOps rollback restores the workload configuration, not the SQLite contents. If the
   rollback replaces a pod, that pod gets a fresh, empty emptyDir. The M9 experiment is planned,
   not performed.
-- The lifecycle controller (Stage 3, planned) orchestrates the SYNCING to READY transition. The
+- The lifecycle controller (Stages 3C–3D, planned) orchestrates the SYNCING to READY transition. The
   requester remains SYNCING until the orchestration completes catch-up. The bootstrap admission
   (Stage 2) is a narrow authorization; it does not orchestrate the transition.
 
@@ -438,15 +455,15 @@ are satisfied):**
 This section distinguishes two experiments: **Experiment A** is currently executable end to end
 with the implemented, committed behavior (lifecycle enforcement **disabled**); **Experiment B**
 is the lifecycle-enabled reconstruction-to-`READY` experiment, which is **planned** and not yet
-executable end to end (it depends on the Stage 3 orchestration, M5B).
+executable end to end (it depends on the Stages 3C–3D orchestration, M5B).
 
 ### Experiment A — Executable integration test: initial-sync replacement recovery
 
 This is the [TestIntegrationInitialSyncReplacementRecoversBeforeReady](../../cmd/gossipgrid/initial_sync_integration_test.go)
 integration test in `cmd/gossipgrid/initial_sync_integration_test.go`. It is an executable
 demonstration of the **lifecycle-disabled** initial-sync mechanism (Milestone 7A enhancement,
-synchronization-aware Kubernetes readiness) — not the M5B Stage 3 lifecycle-aware READY
-promotion. It requires no manual setup, no database deletion, and no Kubernetes cluster.
+synchronization-aware Kubernetes readiness) — not the M5B Stages 3C–3D lifecycle-aware
+READY promotion. It requires no manual setup, no database deletion, and no Kubernetes cluster.
 
 Run it with:
 
@@ -489,7 +506,7 @@ GOFIPS140=v1.0.0 CGO_ENABLED=1 go test \
   enforcement disabled).
 - It does **not** prove that this is an actual Kubernetes rollback or an M9 experiment.
 - It does **not** demonstrate the lifecycle-enabled Stage 2 bootstrap mechanism or the
-  Stage 3 lifecycle-aware READY promotion (M5B, planned).
+  Stages 3C–3D lifecycle-aware READY promotion (M5B, planned).
 - It does not require readers to delete databases manually; the test creates and tears down
   its own temporary SQLite databases via `t.TempDir()`.
 
@@ -549,8 +566,8 @@ GOFIPS140=v1.0.0 CGO_ENABLED=1 go test \
 
 **What the test does not prove:**
 
-- It does **not** demonstrate automatic reconstruction orchestration (source selection,
-  scheduling, retry coordination, catch-up) — that is Stage 3 (M5B, planned).
+- It does **not** demonstrate automatic reconstruction orchestration (sweep scheduling,
+  bounded retries, initial catch-up, `READY` promotion) — that is Stages 3C–3D (M5B, planned).
 - It does **not** demonstrate a replaced pod automatically discovering a source or reaching
   `READY`. The fetch is explicitly invoked by the test against a known, eligible source.
 
@@ -560,10 +577,12 @@ The full lifecycle-enabled workflow — a newly restarted lifecycle-enabled repl
 (`GOSSIPGRID_LIFECYCLE_ENABLED=true`) automatically discovering an eligible surviving bound
 peer, selecting it as a bootstrap source, completing a guarded baseline install, catching up,
 and being promoted to `READY` — is **planned** and **not currently executable end to end**. It
-depends on the **Stage 3 orchestration (M5B)**, which is designed but not implemented: source
-selection, sweep scheduling, retry coordination, initial catch-up, and controlled `READY`
-promotion. Do **not** claim that a newly restarted lifecycle-enabled replica will automatically
-discover a source, complete bootstrap, or become `READY` with the current implementation.
+depends on the **Stages 3C–3D orchestration (M5B)**, which is designed but not implemented:
+sweep scheduling, bounded retries, initial catch-up, and controlled `READY` promotion. Source
+discovery and selection (Stages 3A–3B) are implemented; the orchestration that schedules and
+coordinates the sweep and drives the `READY` promotion is not. Do **not** claim that a newly
+restarted lifecycle-enabled replica will automatically complete the full reconstruction
+workflow with the current implementation.
 
 **What is already implemented and locally tested (Stage 2, M5B).** The Stage 2 *mechanism*
 is implemented: an authorized bootstrap inventory retrieval, a bounded message retrieval, and
@@ -579,10 +598,10 @@ retention/epoch authorization. See:
   `internal/peertls/bootstrap_transport_test.go` (pinned-context validation) and
   `internal/lifecycle/admission_test.go` (the bootstrap authorization predicates).
 
-**Stage 3 prerequisites (to make Experiment B executable):** source selection (choose an
-eligible `READY`/`DEGRADED` peer in the same epoch), scheduling and retry coordination, initial
-catch-up, and the controlled `SYNCING` → `READY` promotion — all orchestrated by the lifecycle
-controller (M5B Stage 3, planned). Until that orchestration is implemented, the Stage 2
+**Stages 3C–3D prerequisites (to make Experiment B executable):** sweep scheduling, bounded
+retries, initial catch-up, and the controlled `SYNCING` → `READY` promotion — all orchestrated
+by the lifecycle controller (M5B Stages 3C–3D, planned). Source discovery and selection
+(Stages 3A–3B) are already implemented. Until the orchestration is implemented, the Stage 2
 mechanism can be exercised by an explicitly sent bootstrap fetch to an eligible source, but it
 will not by itself drive a replaced replica to `READY`.
 

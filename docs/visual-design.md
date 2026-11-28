@@ -153,7 +153,7 @@ semantic mapping in GossipGrid diagrams.
 | mTLS transport | dotted | violet `#8b5cf6` | peer mTLS, browser HTTPS-to-workload |
 | Observed relationship (measured, verified) | solid | the plane color | a verified edge |
 | Inferred / potential relationship | dashed | the plane color, lighter | a relationship that is designed but not yet wired |
-| Planned / not implemented | dashed, labeled `planned` | slate `#64748b` | Stage 3, M5C, M6B, M9 features |
+| Planned / not implemented | dashed, labeled `planned` | slate `#64748b` | Stages 3C–3E, M5C, M6B, M9 features |
 | Asynchronous event | dotted, arrow head | blue `#3b82f6` | callback re-enqueue, poll detection |
 | Rejection / failure path | solid, red | red `#dc2626` | 409, 403, 503, permanent rejection |
 | Success path | solid, green | green `#16a34a` | 200, authorized, committed |
@@ -305,8 +305,8 @@ the diamond.
   observation.
 - **Inferred / potential** (dashed, lighter): the relationship is part of the design but depends on a
   not-yet-implemented stage, or is a conditional path.
-- **Planned** (dashed, slate, labeled `planned`): the relationship belongs to a future milestone (Stage 3,
-  M5C, M6B, M9). Always label planned edges so a reader does not mistake them for implemented behavior.
+- **Planned** (dashed, slate, labeled `planned`): the relationship belongs to a future milestone (Stages
+  3C–3E, M5C, M6B, M9). Always label planned edges so a reader does not mistake them for implemented behavior.
 
 ## Planned vs. implemented functionality
 
